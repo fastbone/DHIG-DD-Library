@@ -1,0 +1,743 @@
+"use strict";
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+const $ = (id) => document.getElementById(id);
+const qs = (sel, root = document) => root.querySelector(sel);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const esc = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const nfmt = (n) => (n == null ? "—" : Number(n).toLocaleString());
+const bytes = (b) => {
+  if (!b) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
+  return `${(b / 1024 ** i).toFixed(i ? 1 : 0)} ${u[i]}`;
+};
+const money = (v) => {
+  v = Number(v || 0);
+  return `$${v.toFixed(v < 0.01 ? 4 : v < 1 ? 3 : 2)}`;
+};
+const compact = (n) => {
+  n = Number(n || 0);
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}K`;
+  return String(n);
+};
+const clock = (ts) => new Date((ts || Date.now() / 1000) * 1000).toLocaleTimeString();
+
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (isErr ? " err" : "");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => (t.className = "toast"), 4200);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+  return data;
+}
+
+const state = {
+  status: null,
+  docOffset: 0,
+  docLimit: 60,
+  docTotal: 0,
+  history: [],
+  running: false,
+  pickerPath: null,
+};
+
+/* ── theme ───────────────────────────────────────────────────────────── */
+const savedTheme = localStorage.getItem("dd-theme");
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$("themeToggle").onclick = () => {
+  const cur = document.documentElement.dataset.theme;
+  const next = cur === "dark" ? "light" : cur === "light" ? "" : "dark";
+  if (next) document.documentElement.dataset.theme = next;
+  else delete document.documentElement.dataset.theme;
+  localStorage.setItem("dd-theme", next);
+};
+
+/* ── tabs ────────────────────────────────────────────────────────────── */
+$("tabs").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-tab]");
+  if (!btn) return;
+  for (const b of $("tabs").children) b.classList.toggle("active", b === btn);
+  for (const s of document.querySelectorAll(".tab")) s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab);
+  if (btn.dataset.tab === "deliverables") { loadArtifacts(); loadQaLog(); }
+  if (btn.dataset.tab === "sweep") loadManifestPreview();
+});
+
+/* ── status ──────────────────────────────────────────────────────────── */
+async function refreshStatus() {
+  let s;
+  try { s = await api("/api/status"); } catch (e) { toast("status: " + e.message, true); return; }
+  state.status = s;
+  $("corpusRoot").textContent = s.corpus_root || "not set";
+  if (s.corpus_root && !$("ingestPath").value) $("ingestPath").value = s.corpus_root;
+  $("carderModel").textContent = s.models.carder;
+
+  const st = s.stats;
+  const pills = [
+    ["docs", nfmt(st.documents)],
+    ["indexed", nfmt(st.by_status?.carded || 0)],
+    ["map", `${nfmt(s.manifest.approx_tokens)} tok`],
+    ["map/turn", money(s.manifest_cost_per_turn_usd)],
+    ["spent", money(s.lifetime_usage.cost_usd)],
+  ];
+  $("headPills").innerHTML =
+    pills.map(([k, v]) => `<span class="pill"><span class="muted">${k}</span><b>${v}</b></span>`).join("") +
+    (s.has_api_key
+      ? `<span class="pill ok">${esc(s.models.analyst)}</span>`
+      : `<span class="pill warn">no API key</span>`);
+
+  $("statGrid").innerHTML = [
+    ["files seen", nfmt(st.files_seen)],
+    ["unique docs", nfmt(st.documents)],
+    ["indexed", nfmt(st.by_status?.carded || 0)],
+    ["citable units", nfmt(st.units)],
+    ["extracted chars", compact(st.chars)],
+    ["on disk", bytes(st.bytes)],
+    ["exact copies", nfmt(st.exact_duplicates)],
+    ["version families", nfmt(st.near_dupe_groups)],
+    ["flagged", nfmt(st.flagged)],
+  ].map(([k, v]) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`).join("");
+
+  renderBars("workstreamBars", st.by_workstream.map((r) => [r.workstream, r.n]));
+  renderBars("familyBars", st.by_family.map((r) => [r.family, r.n]));
+
+  const wsSel = $("docWorkstream");
+  if (wsSel.options.length <= 1) {
+    for (const w of s.workstreams) wsSel.append(new Option(w, w));
+  }
+
+  $("manifestStats").innerHTML = [
+    ["mode", s.manifest.mode],
+    ["indexed docs", nfmt(s.manifest.n_indexed)],
+    ["not indexed", nfmt(s.manifest.n_unindexed)],
+    ["map size", `${nfmt(s.manifest.approx_tokens)} tok`],
+    ["cached read / turn", money(s.manifest_cost_per_turn_usd)],
+    ["uncached", money((s.manifest.approx_tokens * 5) / 1e6)],
+  ].map(([k, v]) => `<div class="stat"><div class="v">${esc(String(v))}</div><div class="k">${k}</div></div>`).join("");
+  const modeNote =
+    s.manifest.mode === "rollup"
+      ? "The catalogue is too large to list inline, so the analyst gets a coverage rollup and pages through it with list_documents."
+      : s.manifest.mode === "compact"
+        ? "Card lines without summaries, to stay inside the context budget."
+        : "Full card lines with summaries — the analyst sees a one-line description of every document.";
+  // Below the model's minimum cacheable prefix, cache_control is a silent no-op.
+  const tooSmall = s.manifest.approx_tokens > 0 && s.manifest.approx_tokens < 512;
+  $("manifestNote").textContent =
+    modeNote +
+    (tooSmall
+      ? "  Note: the map is under ~512 tokens, which is below the minimum cacheable prefix — prompt caching will not engage until the catalogue is larger."
+      : "");
+
+  const jobs = Object.keys(s.jobs_running || {});
+  if (!jobs.some((j) => j.startsWith("ingest-"))) hideProgress("ingest");
+  if (!jobs.some((j) => j.startsWith("sweep-"))) hideProgress("sweep");
+  $("sweepStats").innerHTML = (s.recent_jobs || [])
+    .filter((j) => j.kind === "sweep")
+    .slice(0, 2)
+    .map((j) => `<div class="stat"><div class="v">${j.done}/${j.total}</div><div class="k">${esc(j.status)} · ${esc((j.message || "").slice(0, 46))}</div></div>`)
+    .join("") || `<div class="stat"><div class="v">—</div><div class="k">no sweep yet</div></div>`;
+}
+
+function renderBars(target, pairs) {
+  const max = Math.max(1, ...pairs.map((p) => p[1]));
+  $(target).innerHTML = pairs.length
+    ? pairs.map(([k, n]) => `
+      <div class="barrow">
+        <span class="muted">${esc(k)}</span>
+        <span class="track"><span class="fill" style="width:${(n / max) * 100}%"></span></span>
+        <span class="n">${nfmt(n)}</span>
+      </div>`).join("")
+    : `<span class="muted small">nothing ingested yet</span>`;
+}
+
+/* ── live events ─────────────────────────────────────────────────────── */
+let statsTimer = null;
+function connectEvents() {
+  const src = new EventSource("/api/events");
+  src.onmessage = (m) => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.kind === "log") appendLog(ev);
+    else if (ev.kind === "job") onJob(ev);
+    else if (ev.kind === "stats_dirty") {
+      clearTimeout(statsTimer);
+      statsTimer = setTimeout(() => { refreshStatus(); loadDocs(); }, 400);
+    }
+  };
+  src.onerror = () => { src.close(); setTimeout(connectEvents, 2500); };
+}
+
+function appendLog(ev) {
+  const log = $("log");
+  const row = el("div", ev.level || "info");
+  row.append(el("span", "t", clock(ev.ts)), el("span", "m", ev.message));
+  log.append(row);
+  while (log.children.length > 600) log.firstChild.remove();
+  if ($("logAutoscroll").checked) log.scrollTop = log.scrollHeight;
+}
+$("logClear").onclick = () => ($("log").innerHTML = "");
+
+function onJob(ev) {
+  const which = ev.job_kind === "ingest" ? "ingest" : "sweep";
+  const wrap = $(which + "Progress");
+  wrap.classList.remove("hidden");
+  const pct = ev.total ? Math.round((ev.done / ev.total) * 100) : 0;
+  $(which + "Bar").style.width = pct + "%";
+  const bits = [`${nfmt(ev.done)} / ${nfmt(ev.total)}`, `${pct}%`];
+  if (ev.skipped) bits.push(`${ev.skipped} unchanged`);
+  if (ev.failed) bits.push(`${ev.failed} failed`);
+  if (ev.bytes_done) bits.push(bytes(ev.bytes_done));
+  if (ev.usage?.cost_usd != null) bits.push(money(ev.usage.cost_usd));
+  if (ev.message) bits.push(ev.message);
+  $(which + "Meta").textContent = bits.join(" · ");
+  $(which + "Cancel").dataset.job = ev.job_id;
+  if (ev.status !== "running") {
+    $(which === "ingest" ? "ingestBtn" : "sweepBtn").disabled = false;
+    setTimeout(() => { refreshStatus(); loadDocs(); }, 300);
+    setTimeout(() => hideProgress(which), 12000);
+  }
+}
+function hideProgress(which) {
+  const btn = $(which === "ingest" ? "ingestBtn" : "sweepBtn");
+  if (btn) btn.disabled = false;
+}
+
+for (const which of ["ingest", "sweep"]) {
+  $(which + "Cancel").onclick = async (e) => {
+    const job = e.target.dataset.job;
+    if (!job) return;
+    try { await api(`/api/jobs/${job}/cancel`, { method: "POST" }); } catch (err) { toast(err.message, true); }
+  };
+}
+
+/* ── ingest ──────────────────────────────────────────────────────────── */
+$("ingestBtn").onclick = async () => {
+  const path = $("ingestPath").value.trim();
+  if (!path) return toast("Pick a folder first", true);
+  $("ingestBtn").disabled = true;
+  $("ingestProgress").classList.remove("hidden");
+  $("ingestMeta").textContent = "starting…";
+  try {
+    await api("/api/ingest", { method: "POST", body: { path, ocr: $("ocrToggle").checked } });
+  } catch (e) {
+    toast(e.message, true);
+    $("ingestBtn").disabled = false;
+  }
+};
+$("dedupeBtn").onclick = async () => {
+  try {
+    const r = await api("/api/dedupe", { method: "POST" });
+    toast(`${r.exact_duplicates} exact, ${r.near_duplicate_extras} near duplicates`);
+    refreshStatus(); loadDocs();
+  } catch (e) { toast(e.message, true); }
+};
+$("sweepBtn").onclick = async () => {
+  $("sweepBtn").disabled = true;
+  $("sweepProgress").classList.remove("hidden");
+  $("sweepMeta").textContent = "starting…";
+  try {
+    const r = await api("/api/sweep", { method: "POST", body: { redo: $("sweepRedo").checked } });
+    if (!r.pending) toast("Nothing to index");
+  } catch (e) {
+    toast(e.message, true);
+    $("sweepBtn").disabled = false;
+  }
+};
+
+async function loadManifestPreview() {
+  try {
+    const m = await api("/api/manifest?full=true");
+    $("manifestPreview").textContent = (m.text || "—").slice(0, 20000);
+  } catch { /* ignore */ }
+}
+
+/* ── folder picker ───────────────────────────────────────────────────── */
+$("browseBtn").onclick = () => openPicker($("ingestPath").value || "/");
+$("pickerClose").onclick = () => $("picker").classList.remove("open");
+$("pickerUp").onclick = () => openPicker(state.pickerParent);
+$("pickerUse").onclick = () => {
+  $("ingestPath").value = state.pickerPath;
+  $("picker").classList.remove("open");
+};
+async function openPicker(path) {
+  try {
+    const r = await api(`/api/browse?path=${encodeURIComponent(path || "/")}`);
+    state.pickerPath = r.path;
+    state.pickerParent = r.parent;
+    $("pickerPath").textContent = r.path;
+    const counts = Object.entries(r.supported_files_here);
+    $("pickerHere").textContent = counts.length
+      ? "here: " + counts.map(([k, v]) => `${v}× ${k}`).join(", ")
+      : "no supported files directly in this folder (subfolders are still scanned)";
+    $("pickerList").innerHTML = r.dirs.length
+      ? r.dirs.map((d) => `<div data-path="${esc(d.path)}">${esc(d.name)}/</div>`).join("")
+      : `<div class="muted">no subfolders</div>`;
+    for (const d of $("pickerList").children) {
+      if (d.dataset.path) d.onclick = () => openPicker(d.dataset.path);
+    }
+    $("picker").classList.add("open");
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ── documents table ─────────────────────────────────────────────────── */
+let docDebounce;
+for (const id of ["docQuery", "docWorkstream", "docStatus", "docDupes", "docFlagged"]) {
+  $(id).addEventListener("input", () => {
+    clearTimeout(docDebounce);
+    docDebounce = setTimeout(() => { state.docOffset = 0; loadDocs(); }, 220);
+  });
+}
+$("docPrev").onclick = () => { state.docOffset = Math.max(0, state.docOffset - state.docLimit); loadDocs(); };
+$("docNext").onclick = () => {
+  if (state.docOffset + state.docLimit < state.docTotal) { state.docOffset += state.docLimit; loadDocs(); }
+};
+
+async function loadDocs() {
+  const p = new URLSearchParams({
+    limit: state.docLimit, offset: state.docOffset,
+    duplicates: $("docDupes").value,
+  });
+  if ($("docQuery").value.trim()) p.set("query", $("docQuery").value.trim());
+  if ($("docWorkstream").value) p.set("workstream", $("docWorkstream").value);
+  if ($("docStatus").value) p.set("status", $("docStatus").value);
+  if ($("docFlagged").checked) p.set("flagged", "true");
+
+  let r;
+  try { r = await api("/api/documents?" + p); } catch (e) { return toast(e.message, true); }
+  state.docTotal = r.total;
+  const tb = qs("#docTable tbody");
+  tb.innerHTML = "";
+  for (const d of r.documents) {
+    const tr = el("tr");
+    tr.onclick = () => openDoc(d.id);
+    const badge =
+      d.status === "carded" ? "" :
+      d.status === "extracted" ? `<span class="tag dupe">not indexed</span>` :
+      `<span class="tag bad">${esc(d.status)}</span>`;
+    tr.innerHTML = `
+      <td><div class="doc-title">${esc(d.title || d.filename)}</div>
+          <div class="doc-path">${esc(d.rel_path)}</div>
+          ${d.summary ? `<div class="muted small">${esc(d.summary.slice(0, 150))}</div>` : ""}</td>
+      <td>${d.workstream ? `<span class="tag">${esc(d.workstream)}</span>` : badge}</td>
+      <td class="small">${esc(d.doc_type || d.family)}</td>
+      <td class="small">${esc(d.period_covered || "—")}</td>
+      <td>${(d.card_flags || []).map((f) => `<span class="tag flag">${esc(f)}</span>`).join(" ")}
+          ${d.dupe_group ? `<span class="tag dupe">version family</span>` : ""}
+          ${d.n_paths > 1 ? `<span class="tag dupe">${d.n_paths}× filed</span>` : ""}
+          ${d.workstream ? badge : ""}</td>
+      <td class="num small">${nfmt(d.n_units)}</td>
+      <td class="num small">${bytes(d.size_bytes)}</td>`;
+    tb.append(tr);
+  }
+  const from = r.total ? state.docOffset + 1 : 0;
+  $("docCount").textContent = `${nfmt(from)}–${nfmt(Math.min(state.docOffset + state.docLimit, r.total))} of ${nfmt(r.total)}`;
+  $("docPrev").disabled = state.docOffset === 0;
+  $("docNext").disabled = state.docOffset + state.docLimit >= r.total;
+}
+
+/* ── document drawer ─────────────────────────────────────────────────── */
+$("drawerClose").onclick = closeDrawer;
+$("scrim").onclick = closeDrawer;
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); $("picker").classList.remove("open"); } });
+function closeDrawer() {
+  $("drawer").classList.remove("open");
+  $("scrim").classList.remove("open");
+}
+
+async function openDoc(docId, anchor) {
+  let card;
+  try { card = await api(`/api/documents/${docId}`); } catch (e) { return toast(e.message, true); }
+  $("drawerTitle").textContent = card.title || card.filename;
+  $("drawerPath").textContent = card.rel_path;
+  $("drawerOriginal").href = `/api/documents/${docId}/original`;
+  const meta = [
+    ["workstream", card.workstream], ["type", card.doc_type], ["period", card.period_covered],
+    ["parties", (card.parties || []).join(", ")],
+    ["key figures", (card.key_figures || []).join(" · ")],
+    ["flags", (card.card_flags || []).join(", ")],
+    ["status", card.status], ["units", card.n_units], ["size", bytes(card.size_bytes)],
+  ].filter(([, v]) => v != null && v !== "" && v !== "[]");
+  $("drawerMeta").innerHTML =
+    (card.summary ? `<div>${esc(card.summary)}</div>` : "") +
+    meta.map(([k, v]) => `<div><span class="muted">${k}:</span> ${esc(String(v))}</div>`).join("") +
+    ((card.identical_copies_at || []).length
+      ? `<div><span class="muted">identical copies at:</span> ${card.identical_copies_at
+          .map((p) => `<code>${esc(p)}</code>`).join(", ")}</div>` : "") +
+    ((card.near_duplicates || []).length
+      ? `<div><span class="muted">near-duplicate versions:</span> ${card.near_duplicates
+          .map((d) => `<code data-doc="${esc(d.doc_id)}">${esc(d.rel_path)}</code>`).join(", ")}</div>`
+      : "");
+  $("drawerAnchors").innerHTML = (card.anchors || [])
+    .map((a) => `<span class="anchor" data-a="${esc(a.anchor)}">${esc(a.anchor)}</span>`).join("");
+  for (const a of $("drawerAnchors").children) a.onclick = () => loadDocText(docId, a.dataset.a);
+  $("drawer").classList.add("open");
+  $("scrim").classList.add("open");
+  await loadDocText(docId, anchor);
+}
+
+async function loadDocText(docId, anchor) {
+  const p = new URLSearchParams({ chars: 30000 });
+  if (anchor) p.set("anchor", anchor);
+  try {
+    const t = await api(`/api/documents/${docId}/text?` + p);
+    $("drawerText").textContent = t.text || "(no extracted text)";
+    for (const a of $("drawerAnchors").children) a.classList.toggle("active", a.dataset.a === anchor);
+    $("drawerText").scrollIntoView({ block: "nearest" });
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ── markdown-lite with citation chips ──────────────────────────────── */
+const CITE = /\[\[([0-9a-f]{6,32}):([^\]\s]{1,120})\]\]/g;
+
+function inline(s) {
+  let out = esc(s);
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  out = out.replace(CITE, (_m, id, anchor) =>
+    `<button class="cite" data-doc="${id}" data-anchor="${esc(anchor)}">${esc(anchor)}</button>`);
+  return out;
+}
+
+function renderMarkdown(text) {
+  const lines = String(text || "").split("\n");
+  const html = [];
+  let list = null, table = null;
+  const closeList = () => { if (list) { html.push(`</${list}>`); list = null; } };
+  const closeTable = () => {
+    if (table) {
+      html.push("<table><thead><tr>" + table.header.map((h) => `<th>${inline(h)}</th>`).join("") + "</tr></thead><tbody>");
+      for (const r of table.rows) html.push("<tr>" + r.map((c) => `<td>${inline(c)}</td>`).join("") + "</tr>");
+      html.push("</tbody></table>");
+      table = null;
+    }
+  };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    const cells = line.trim().match(/^\|(.+)\|$/);
+    if (cells) {
+      const parts = cells[1].split("|").map((c) => c.trim());
+      if (!table) { table = { header: parts, rows: [] }; continue; }
+      if (parts.every((c) => /^:?-{2,}:?$/.test(c))) continue;
+      table.rows.push(parts);
+      continue;
+    }
+    closeTable();
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { closeList(); html.push(`<h4>${inline(h[2])}</h4>`); continue; }
+    const ul = line.match(/^\s*[-*•]\s+(.*)$/);
+    if (ul) { if (list !== "ul") { closeList(); html.push("<ul>"); list = "ul"; } html.push(`<li>${inline(ul[1])}</li>`); continue; }
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ol) { if (list !== "ol") { closeList(); html.push("<ol>"); list = "ol"; } html.push(`<li>${inline(ol[1])}</li>`); continue; }
+    closeList();
+    if (!line.trim()) { html.push("<br>"); continue; }
+    html.push(`<div>${inline(line)}</div>`);
+  }
+  closeList(); closeTable();
+  return html.join("");
+}
+
+document.addEventListener("click", (e) => {
+  const c = e.target.closest(".cite");
+  if (c) openDoc(c.dataset.doc, c.dataset.anchor);
+});
+
+/* ── ask ─────────────────────────────────────────────────────────────── */
+const SUGGESTIONS = [
+  "What does the data room contain, by workstream, and what is conspicuously missing for a standard buy-side DD?",
+  "Pull revenue and EBITDA for every year available, compute the CAGR from the source workbook, and reconcile the audited accounts against the management deck.",
+  "List every contract with a change-of-control or termination-for-convenience clause, with the exact clause text.",
+  "Produce a red-flag memo as a Word document: findings, evidence, severity, and the open questions for management.",
+];
+$("suggestions").innerHTML = SUGGESTIONS.map((s) => `<div class="suggestion">${esc(s)}</div>`).join("");
+for (const s of $("suggestions").children) {
+  s.onclick = () => { $("question").value = s.textContent; $("question").focus(); };
+}
+
+$("newThread").onclick = () => {
+  state.history = [];
+  $("thread").innerHTML = `<div class="empty"><h2>New thread</h2><p class="muted">Previous turns cleared.</p></div>`;
+  $("trace").innerHTML = ""; $("citations").innerHTML = ""; $("runMeta").textContent = "idle";
+};
+
+$("question").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("askForm").requestSubmit();
+});
+
+$("askForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (state.running) return;
+  const question = $("question").value.trim();
+  if (!question) return;
+  if (!state.status?.stats?.by_status?.carded) {
+    return toast("Nothing is indexed yet — run Ingest then Indexing first.", true);
+  }
+
+  state.running = true;
+  $("askBtn").disabled = true;
+  $("askBtn").textContent = "Working…";
+  $("question").value = "";
+  const thread = $("thread");
+  if (qs(".empty", thread)) thread.innerHTML = "";
+  $("trace").innerHTML = "";
+  $("citations").innerHTML = "";
+
+  thread.append(msgBlock("you", esc(question).replace(/\n/g, "<br>"), "user"));
+
+  const assistant = msgBlock("analyst", "", "assistant");
+  const think = el("div", "think hidden");
+  think.append(el("div", "who", "reasoning"));
+  const thinkBody = el("div", "b");
+  think.append(thinkBody);
+  const body = qs(".body", assistant);
+  assistant.insertBefore(think, body);
+  thread.append(assistant);
+  thread.scrollTop = thread.scrollHeight;
+
+  let answer = "";
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    if (!state.running) return clearInterval(tick);
+    const cur = $("runMeta").dataset.base || "";
+    $("runMeta").innerHTML = `<span class="spin">◐</span> ${((Date.now() - t0) / 1000).toFixed(0)}s ${cur}`;
+  }, 500);
+
+  try {
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question, history: state.history,
+        verify: $("verifyToggle").checked, effort: $("effort").value,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+
+    for await (const ev of sseStream(res)) {
+      switch (ev.type) {
+        case "status":
+          $("runMeta").dataset.base = esc(ev.message || "");
+          break;
+        case "thinking_delta":
+          think.classList.remove("hidden");
+          thinkBody.textContent += ev.text;
+          think.scrollTop = think.scrollHeight;
+          break;
+        case "text_delta":
+          answer += ev.text;
+          body.innerHTML = renderMarkdown(answer);
+          thread.scrollTop = thread.scrollHeight;
+          break;
+        case "tool_use":
+          addTrace(ev.id, ev.name, ev.label, "running");
+          break;
+        case "tool_result":
+          updateTrace(ev.id, ev.summary, ev.ok ? "ok" : "err");
+          break;
+        case "usage": {
+          const u = ev.cumulative || {};
+          $("runMeta").dataset.base =
+            `· ${money(u.cost_usd)} · ${nfmt(ev.cache_read)} cached / ${nfmt(ev.input)} fresh in, ${nfmt(ev.output)} out`;
+          break;
+        }
+        case "citations":
+          renderCitations(ev.citations, []);
+          break;
+        case "verdict":
+          markVerdict(ev);
+          break;
+        case "artifact":
+          body.appendChild(artifactRow(ev));
+          loadArtifacts();
+          break;
+        case "error":
+          toast(ev.message, true);
+          body.innerHTML += `<div class="tag bad">${esc(ev.message)}</div>`;
+          break;
+        case "done":
+          answer = ev.answer || answer;
+          body.innerHTML = renderMarkdown(answer);
+          for (const a of ev.artifacts || []) body.appendChild(artifactRow(a));
+          renderCitations(ev.citations, ev.verdicts);
+          state.history.push({ role: "user", content: question });
+          state.history.push({ role: "assistant", content: answer });
+          $("runMeta").innerHTML =
+            `done in ${ev.duration_s}s · ${money(ev.usage.cost_usd)} · ` +
+            `${(ev.citations || []).length} citations · ${(ev.verdicts || []).length} checked`;
+          $("runMeta").dataset.base = "";
+          loadQaLog();
+          break;
+      }
+    }
+  } catch (err) {
+    toast(err.message, true);
+    body.innerHTML += `<div class="tag bad">${esc(err.message)}</div>`;
+  } finally {
+    clearInterval(tick);
+    state.running = false;
+    $("askBtn").disabled = false;
+    $("askBtn").textContent = "Ask";
+    refreshStatus();
+  }
+});
+
+function msgBlock(who, html, cls) {
+  const m = el("div", "msg " + cls);
+  m.append(el("div", "who", who));
+  const b = el("div", "body");
+  b.innerHTML = html;
+  m.append(b);
+  return m;
+}
+
+async function* sseStream(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try { yield JSON.parse(line.slice(5).trim()); } catch { /* ignore */ }
+      }
+    }
+  }
+}
+
+function addTrace(id, name, label, cls) {
+  const step = el("div", "tstep " + cls);
+  step.id = "t-" + id;
+  step.append(el("span", "n", name));
+  step.append(el("div", "d", typeof label === "string" ? label.slice(0, 160) : ""));
+  $("trace").append(step);
+  $("trace").scrollTop = $("trace").scrollHeight;
+}
+function updateTrace(id, summary, cls) {
+  const step = $("t-" + id);
+  if (!step) return;
+  step.className = "tstep " + cls;
+  const d = qs(".d", step);
+  d.textContent = (d.textContent ? d.textContent + " → " : "") + summary;
+}
+
+function renderCitations(citations, verdicts) {
+  const byCite = {};
+  for (const v of verdicts || []) for (const c of v.citations || []) byCite[c] = v;
+
+  // Inline chips only have room for the anchor, and two documents can share an
+  // anchor name — put the document on the hover title once we know it.
+  const titles = {};
+  for (const c of citations || []) titles[c.citation] = c.title || c.rel_path || c.doc_id;
+  for (const chip of document.querySelectorAll(".msg .cite")) {
+    const key = `${chip.dataset.doc}:${chip.dataset.anchor}`;
+    if (titles[key]) chip.title = `${titles[key]} · ${chip.dataset.anchor}`;
+  }
+
+  const box = $("citations");
+  box.innerHTML = (citations || []).length
+    ? citations.map((c) => {
+        const v = byCite[c.citation];
+        return `<div class="citation" data-doc="${c.doc_id}" data-anchor="${esc(c.anchor)}">
+          ${v ? `<span class="v ${v.verdict}">${v.verdict}</span>` : ""}
+          <div class="c">${esc(c.anchor)}${c.count > 1 ? ` ×${c.count}` : ""}</div>
+          <div>${esc((c.title || "").slice(0, 90))}</div>
+          ${c.resolved ? "" : `<div class="tag bad">unresolved</div>`}
+        </div>`;
+      }).join("")
+    : `<span class="muted small">no citations yet</span>`;
+  for (const n of box.children) {
+    if (n.dataset?.doc) n.onclick = () => openDoc(n.dataset.doc, n.dataset.anchor);
+  }
+}
+
+function markVerdict(v) {
+  for (const c of v.citations || []) {
+    for (const n of $("citations").children) {
+      if (!n.dataset) continue;
+      if (`${n.dataset.doc}:${n.dataset.anchor}` !== c) continue;
+      if (qs(".v", n)) continue;
+      const badge = el("span", "v " + v.verdict, v.verdict);
+      n.prepend(badge);
+      if (v.verdict !== "supported" && v.note) n.append(el("div", "muted small", v.note));
+    }
+  }
+}
+
+function artifactRow(a) {
+  const row = el("div", "artifact");
+  const left = el("div");
+  left.innerHTML = `<span class="kindchip">${esc(a.kind)}</span> <strong>${esc(a.filename)}</strong>
+    <span class="muted small"> ${bytes(a.size_bytes)}</span>`;
+  const link = el("a", "btn ghost", "download");
+  link.href = a.download_url;
+  link.setAttribute("download", a.filename);
+  row.append(left, link);
+  return row;
+}
+
+/* ── deliverables ────────────────────────────────────────────────────── */
+async function loadArtifacts() {
+  try {
+    const r = await api("/api/artifacts");
+    $("artifacts").innerHTML = "";
+    if (!r.artifacts.length) {
+      $("artifacts").innerHTML = `<span class="muted small">Nothing generated yet. Ask for a memo, a findings table or a deck.</span>`;
+      return;
+    }
+    for (const a of r.artifacts) $("artifacts").append(artifactRow(a));
+  } catch (e) { /* ignore */ }
+}
+$("refreshArtifacts").onclick = loadArtifacts;
+
+async function loadQaLog() {
+  try {
+    const r = await api("/api/qa-log?limit=40");
+    const box = $("qaLog");
+    box.innerHTML = r.entries.length ? "" : `<span class="muted small">No questions asked yet.</span>`;
+    for (const e of r.entries) {
+      const bad = (e.verdicts || []).filter((v) => v.verdict === "unsupported" || v.verdict === "partial").length;
+      const n = el("div", "qa-entry");
+      n.innerHTML = `<div class="q">${esc(e.question.slice(0, 190))}</div>
+        <div class="muted small">${new Date(e.created_at * 1000).toLocaleString()} ·
+        ${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
+        ${money(e.usage?.cost_usd)} · ${Number(e.duration_s || 0).toFixed(0)}s</div>`;
+      const detail = el("div", "body hidden");
+      detail.innerHTML = renderMarkdown(e.answer || "");
+      n.append(detail);
+      n.onclick = (ev) => { if (!ev.target.closest(".cite")) detail.classList.toggle("hidden"); };
+      box.append(n);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+/* ── boot ────────────────────────────────────────────────────────────── */
+refreshStatus();
+loadDocs();
+connectEvents();
+setInterval(refreshStatus, 20000);

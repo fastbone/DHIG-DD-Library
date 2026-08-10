@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DD Library</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Crect x='9' y='8' width='4' height='16' rx='1' fill='white'/%3E%3Crect x='16' y='8' width='4' height='16' rx='1' fill='white' opacity='.65'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <span>DD&nbsp;Library</span>
+  </div>
+  <div class="root-line">
+    <span class="muted">corpus</span>
+    <code id="corpusRoot">not set</code>
+  </div>
+  <div class="pills" id="headPills"></div>
+  <button class="ghost" id="themeToggle" title="Toggle theme">◐</button>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="corpus" class="active">Corpus</button>
+  <button data-tab="sweep">Indexing</button>
+  <button data-tab="ask">Ask</button>
+  <button data-tab="deliverables">Deliverables</button>
+</nav>
+
+<main>
+  <!-- ─────────────── CORPUS ─────────────── -->
+  <section id="tab-corpus" class="tab active">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Ingest</h2>
+        <p class="muted small">
+          Walks the folder, extracts text from PDF / XLSX / PPTX / DOCX / CSV into a greppable
+          mirror with page-, slide- and sheet-level citation anchors, then flags duplicates.
+          Re-running only processes what changed.
+        </p>
+        <div class="field">
+          <label for="ingestPath">Folder</label>
+          <div class="row">
+            <input id="ingestPath" type="text" spellcheck="false" placeholder="/path/to/data-room">
+            <button class="ghost" id="browseBtn">Browse…</button>
+          </div>
+        </div>
+        <div class="row wrap gap">
+          <label class="check"><input type="checkbox" id="ocrToggle"> OCR scanned pages <span class="muted small">(slow)</span></label>
+        </div>
+        <div class="row gap">
+          <button id="ingestBtn" class="primary">Ingest</button>
+          <button id="dedupeBtn" class="ghost">Re-run dedupe</button>
+        </div>
+        <div id="ingestProgress" class="progress-wrap hidden">
+          <div class="progress"><div class="bar" id="ingestBar"></div></div>
+          <div class="progress-meta"><span id="ingestMeta"></span><button class="link" id="ingestCancel">cancel</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Corpus</h2>
+        <div class="stat-grid" id="statGrid"></div>
+        <h3>Coverage by workstream</h3>
+        <div id="workstreamBars" class="bars"></div>
+        <h3>By file type</h3>
+        <div id="familyBars" class="bars"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Documents</h2>
+        <div class="row wrap gap">
+          <input id="docQuery" type="search" placeholder="filter by name, title, party, summary…">
+          <select id="docWorkstream"><option value="">all workstreams</option></select>
+          <select id="docStatus">
+            <option value="">any status</option>
+            <option value="carded">indexed</option>
+            <option value="extracted">extracted, not indexed</option>
+            <option value="extract_failed">extraction failed</option>
+            <option value="card_failed">indexing failed</option>
+          </select>
+          <select id="docDupes">
+            <option value="all">all documents</option>
+            <option value="near_only">near-duplicate families only</option>
+            <option value="multi_path">filed in more than one place</option>
+          </select>
+          <label class="check"><input type="checkbox" id="docFlagged"> flagged only</label>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table id="docTable">
+          <thead><tr>
+            <th>Document</th><th>Workstream</th><th>Type</th><th>Period</th>
+            <th>Flags</th><th class="num">Units</th><th class="num">Size</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="row between">
+        <span class="muted small" id="docCount"></span>
+        <div class="row gap">
+          <button class="ghost" id="docPrev">← prev</button>
+          <button class="ghost" id="docNext">next →</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────── SWEEP ─────────────── -->
+  <section id="tab-sweep" class="tab">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Manifest sweep</h2>
+        <p class="muted small">
+          One structured catalogue card per document from
+          <code id="carderModel">…</code>. The cards become the corpus map that rides in the
+          analyst's context behind a 1-hour cache breakpoint — that map is what makes the
+          assistant aware of every file without ever loading the library.
+        </p>
+        <div class="row gap">
+          <button id="sweepBtn" class="primary">Run sweep</button>
+          <label class="check"><input type="checkbox" id="sweepRedo"> re-index already-indexed docs</label>
+        </div>
+        <div id="sweepProgress" class="progress-wrap hidden">
+          <div class="progress"><div class="bar" id="sweepBar"></div></div>
+          <div class="progress-meta"><span id="sweepMeta"></span><button class="link" id="sweepCancel">cancel</button></div>
+        </div>
+        <div class="stat-grid tight" id="sweepStats"></div>
+      </div>
+
+      <div class="card">
+        <h2>Context economics</h2>
+        <div class="stat-grid tight" id="manifestStats"></div>
+        <p class="muted small" id="manifestNote"></p>
+        <details>
+          <summary>Preview the corpus map</summary>
+          <pre id="manifestPreview" class="pre-scroll">—</pre>
+        </details>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Activity</h2>
+        <div class="row gap">
+          <label class="check"><input type="checkbox" id="logAutoscroll" checked> autoscroll</label>
+          <button class="ghost" id="logClear">clear</button>
+        </div>
+      </div>
+      <div id="log" class="log"></div>
+    </div>
+  </section>
+
+  <!-- ─────────────── ASK ─────────────── -->
+  <section id="tab-ask" class="tab">
+    <div class="ask-layout">
+      <div class="ask-main">
+        <div id="thread" class="thread">
+          <div class="empty">
+            <h2>Ask the data room</h2>
+            <p class="muted">
+              Questions are answered from the indexed corpus only, with a
+              <code>[[doc&nbsp;·&nbsp;page]]</code> citation on every claim. Ask for a document and it
+              gets built.
+            </p>
+            <div class="suggestions" id="suggestions"></div>
+          </div>
+        </div>
+        <form class="composer" id="askForm">
+          <textarea id="question" rows="3" placeholder="e.g. Summarise revenue by segment for FY22–FY24 from the audited accounts, and flag any inconsistency with the management deck."></textarea>
+          <div class="composer-bar">
+            <div class="row gap wrap">
+              <select id="effort" title="Reasoning effort">
+                <option value="low">effort: low</option>
+                <option value="medium">effort: medium</option>
+                <option value="high" selected>effort: high</option>
+                <option value="xhigh">effort: xhigh</option>
+                <option value="max">effort: max</option>
+              </select>
+              <label class="check"><input type="checkbox" id="verifyToggle" checked> verify citations</label>
+              <button type="button" class="ghost" id="newThread">new thread</button>
+            </div>
+            <button type="submit" class="primary" id="askBtn">Ask</button>
+          </div>
+        </form>
+      </div>
+
+      <aside class="ask-side">
+        <div class="side-card">
+          <h3>Run</h3>
+          <div id="runMeta" class="muted small">idle</div>
+        </div>
+        <div class="side-card">
+          <h3>Trace</h3>
+          <div id="trace" class="trace"></div>
+        </div>
+        <div class="side-card">
+          <h3>Citations</h3>
+          <div id="citations" class="citations"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ─────────────── DELIVERABLES ─────────────── -->
+  <section id="tab-deliverables" class="tab">
+    <div class="card">
+      <div class="card-head"><h2>Generated documents</h2>
+        <button class="ghost" id="refreshArtifacts">refresh</button></div>
+      <div id="artifacts" class="artifacts"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Question log</h2>
+        <span class="muted small">every question, its citations and its cost — the audit trail</span></div>
+      <div id="qaLog" class="qa-log"></div>
+    </div>
+  </section>
+</main>
+
+<!-- document reader -->
+<div id="drawer" class="drawer">
+  <div class="drawer-head">
+    <div>
+      <div id="drawerTitle" class="drawer-title">—</div>
+      <code id="drawerPath" class="muted small"></code>
+    </div>
+    <div class="row gap">
+      <a id="drawerOriginal" class="ghost btn" href="#" download>original</a>
+      <button class="ghost" id="drawerClose">close</button>
+    </div>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-meta" id="drawerMeta"></div>
+    <div class="drawer-anchors" id="drawerAnchors"></div>
+    <pre id="drawerText" class="pre-scroll"></pre>
+  </div>
+</div>
+<div id="scrim" class="scrim"></div>
+
+<!-- folder picker -->
+<div id="picker" class="modal">
+  <div class="modal-body">
+    <div class="row between">
+      <h3>Choose corpus folder</h3>
+      <button class="ghost" id="pickerClose">close</button>
+    </div>
+    <code id="pickerPath" class="muted small"></code>
+    <div id="pickerHere" class="muted small"></div>
+    <div id="pickerList" class="picker-list"></div>
+    <div class="row between">
+      <button class="ghost" id="pickerUp">↑ parent</button>
+      <button class="primary" id="pickerUse">Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

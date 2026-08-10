@@ -1,0 +1,12 @@
+# index, text mirror, generated deliverables — all rebuildable from the corpus
+data/
+sample-dataroom/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+.DS_Store
+*.swp
