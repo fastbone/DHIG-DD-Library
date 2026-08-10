@@ -295,11 +295,31 @@ def purge_expired_sessions() -> int:
     return cur.rowcount or 0
 
 
-def cookie_kwargs() -> dict:
+def cookie_secure_for(request: Request) -> bool:
+    """Whether to mark the session cookie Secure for this request.
+
+    ``DD_COOKIE_SECURE=1``/``0`` force it. The default, ``auto``, follows the
+    scheme the request arrived on: behind a proxy in ``DD_FORWARDED_ALLOW_IPS``
+    that is what X-Forwarded-Proto said, and otherwise it is the real scheme.
+
+    Deriving it avoids the failure mode in both directions — a Secure cookie on
+    plain HTTP is silently dropped by the browser, so sign-in looks like it
+    worked and every following request is 401. If your proxy terminates TLS but
+    does not forward the scheme, set 1 explicitly.
+    """
+    forced = settings.cookie_secure
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    return request.url.scheme == "https"
+
+
+def cookie_kwargs(request: Request) -> dict:
     return {
         "httponly": True,
         "samesite": "lax",
-        "secure": settings.cookie_secure,
+        "secure": cookie_secure_for(request),
         "path": "/",
         "max_age": settings.session_ttl_hours * 3600,
     }

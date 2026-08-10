@@ -175,9 +175,18 @@ def main() -> int:
 
     print("\n— first-run bootstrap —")
     admin = Client()
-    code, body, _ = admin.post("/api/bootstrap", {"username": "alice", "password": "correct-horse-1"})
+    code, body, headers = admin.post("/api/bootstrap",
+                                     {"username": "alice", "password": "correct-horse-1"})
     check("bootstrap creates the first admin and signs in",
           code == 200 and body.get("user", {}).get("role") == "admin", str(body))
+    # This whole suite talks plain HTTP. A Secure cookie would be dropped by a
+    # real browser, so sign-in would look fine and every later request would 401
+    # — the shipped default must not do that.
+    cookie_attrs = (headers.get("Set-Cookie") or "").lower()
+    check("the session cookie is not Secure over plain HTTP",
+          "secure" not in cookie_attrs, cookie_attrs)
+    check("the session cookie is HttpOnly and SameSite=Lax",
+          "httponly" in cookie_attrs and "samesite=lax" in cookie_attrs, cookie_attrs)
     admin.csrf = body.get("user", {}).get("csrf")
     code, body, _ = admin.post("/api/bootstrap", {"username": "eve", "password": "another-one-11"})
     check("bootstrap is closed once an account exists", code == 409, f"got {code}")

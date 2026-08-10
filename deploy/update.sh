@@ -301,6 +301,12 @@ if (( ROLLBACK )); then
   step "Rolling back to $target"
   run git checkout --quiet --force "$target"
   deploy_current_tree
+  if (( DRY_RUN )); then
+    # Nothing was swapped, so the health of whatever is running now says nothing
+    # about the rollback. Claiming success here would be a lie.
+    ok "dry run complete — nothing was changed"
+    exit 0
+  fi
   if wait_healthy; then
     ok "rolled back to $target"
     exit 0

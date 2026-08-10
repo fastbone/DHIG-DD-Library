@@ -132,7 +132,7 @@ async def session_info(request: Request):
 async def login(body: LoginBody, request: Request):
     token, user = await asyncio.to_thread(auth.login, body.username, body.password, request)
     response = JSONResponse({"user": {k: user[k] for k in ("username", "role", "csrf")}})
-    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs())
+    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs(request))
     return response
 
 
@@ -158,7 +158,7 @@ async def bootstrap(body: LoginBody, request: Request):
     broker.log(f"First administrator {user['username']!r} created.", level="success")
     token, logged_in = await asyncio.to_thread(auth.login, body.username, body.password, request)
     response = JSONResponse({"user": {k: logged_in[k] for k in ("username", "role", "csrf")}})
-    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs())
+    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs(request))
     return response
 
 

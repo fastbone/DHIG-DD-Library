@@ -63,7 +63,13 @@ class Settings:
     session_ttl_hours: int = _env_int("DD_SESSION_TTL_HOURS", 12)
     login_max_attempts: int = _env_int("DD_LOGIN_MAX_ATTEMPTS", 8)
     login_lockout_s: int = _env_int("DD_LOGIN_LOCKOUT_SECONDS", 300)
-    cookie_secure: bool = _env_bool("DD_COOKIE_SECURE", False)
+    # "auto" (the default) marks the session cookie Secure when the request
+    # itself arrived over HTTPS, which behind a trusted proxy means when
+    # X-Forwarded-Proto says https. Getting this wrong either way is a silent
+    # failure — a Secure cookie on http:// is dropped by the browser, so login
+    # appears to succeed and every later request is 401 — so deriving it beats
+    # asking every deployment to remember. "1"/"0" force it.
+    cookie_secure: str = os.environ.get("DD_COOKIE_SECURE", "auto").strip().lower()
 
     # --- archive upload / extraction limits ---
     max_upload_mb: int = _env_int("DD_MAX_UPLOAD_MB", 4096)

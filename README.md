@@ -205,7 +205,7 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_ADMIN_USER` / `DD_ADMIN_PASSWORD` | — | Creates the first administrator on start; otherwise created in the browser |
 | `DD_ADMIN_RESET_PASSWORD` | `0` | Set to `1` for one restart to recover a locked-out administrator |
 | `DD_SESSION_TTL_HOURS` | `12` | Sliding session expiry |
-| `DD_COOKIE_SECURE` | `0` | Set to `1` when serving over HTTPS |
+| `DD_COOKIE_SECURE` | `auto` | Marks the session cookie Secure when the request arrived over HTTPS. `1`/`0` force it |
 | `DD_LOGIN_MAX_ATTEMPTS` / `DD_LOGIN_LOCKOUT_SECONDS` | `8` / `300` | Sign-in throttle |
 | `DD_BROWSE_ROOTS` | extraction root + `/corpus` + cwd | Directories the folder picker may descend into |
 | `DD_MAX_UPLOAD_MB` | `4096` | Per-archive upload ceiling |
@@ -238,8 +238,11 @@ Read this before pointing it at a live deal.
   user, and the folder picker can descend into `DD_BROWSE_ROOTS` (administrators
   only). Both are intended; keep the roots narrow.
 - **Bind to localhost.** The default is `127.0.0.1`. Serving it publicly means a
-  TLS-terminating reverse proxy in front, `DD_COOKIE_SECURE=1`, and
-  `DD_FORWARDED_ALLOW_IPS` set to that proxy — not `DD_HOST=0.0.0.0` on its own.
+  TLS-terminating reverse proxy in front and `DD_FORWARDED_ALLOW_IPS` set to that
+  proxy — not `DD_HOST=0.0.0.0` on its own. That variable also decides whether
+  the session cookie gets marked Secure, since `DD_COOKIE_SECURE=auto` follows
+  the forwarded scheme; if your proxy terminates TLS without forwarding it, set
+  `DD_COOKIE_SECURE=1`.
 - **Uploads land on the server's filesystem.** Extraction refuses traversal,
   absolute paths, links, special files, oversized and over-ratio archives, and
   writes only under `data/uploads/extracted`. The limits are configurable; the
@@ -296,12 +299,16 @@ If the host runs Nginx Proxy Manager instead (port 81 suggests it does), create
 the proxy host in its UI and paste the block at the end of that file into the
 **Advanced** tab; tick Websockets Support, Force SSL and HTTP/2.
 
-Set `DD_COOKIE_SECURE=1` once TLS is in front. `DD_FORWARDED_ALLOW_IPS` decides
-whose `X-Forwarded-For` is believed — and therefore whether the audit log and
-the login lockout see real client addresses. It is **not** `127.0.0.1`: the proxy
-connects to the published loopback port and Docker's NAT rewrites the source to
-the bridge gateway (typically `172.17.0.1`), so the compose default trusts the
-private ranges Docker allocates from. Narrow it to the exact gateway if you want.
+`DD_FORWARDED_ALLOW_IPS` decides whose `X-Forwarded-*` is believed, and so
+whether the audit log and the login lockout see real client addresses — and
+whether the session cookie is marked Secure, since `DD_COOKIE_SECURE=auto`
+follows the forwarded scheme. It is **not** `127.0.0.1`: the proxy connects to
+the published loopback port and Docker's NAT rewrites the source to the bridge
+gateway (typically `172.17.0.1`), so the compose default trusts the private
+ranges Docker allocates from. Narrow it to the exact gateway if you want.
+
+If your proxy terminates TLS but does not forward `X-Forwarded-Proto`, set
+`DD_COOKIE_SECURE=1` explicitly rather than leaving it on `auto`.
 
 ### Updating
 
