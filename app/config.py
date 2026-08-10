@@ -192,7 +192,13 @@ class Settings:
             return True
         cfg = Path(os.environ.get("ANTHROPIC_CONFIG_DIR", Path.home() / ".config" / "anthropic"))
         creds = cfg / "credentials"
-        return creds.is_dir() and any(creds.glob("*.json"))
+        try:
+            return creds.is_dir() and any(creds.glob("*.json"))
+        except OSError:
+            # An unreadable home directory is a deployment quirk, not a reason to
+            # refuse to start: a container can be handed a home it cannot stat.
+            # Keys stored in the app still work.
+            return False
 
 
 settings = Settings()

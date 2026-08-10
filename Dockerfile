@@ -33,7 +33,11 @@ COPY README.md ./
 # Unprivileged runtime user. run_python executes model-authored code as this
 # user, so it must own as little as possible: /app stays root-owned and
 # read-only to the app, only /data is writable.
-RUN useradd --system --uid 10001 --create-home --home-dir /home/dd dd \
+#
+# The gid is pinned as well as the uid: docker-compose.yml mounts a tmpfs over
+# /home/dd with uid/gid 10001, and a tmpfs is root-owned unless told otherwise.
+RUN groupadd --system --gid 10001 dd \
+ && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/dd dd \
  && mkdir -p /data /corpus \
  && chown -R dd:dd /data \
  && chmod -R a-w /app

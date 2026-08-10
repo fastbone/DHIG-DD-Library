@@ -5,15 +5,23 @@ services:
       args:
         # Set to "true" to bundle Tesseract for OCR of scanned PDFs (+~250 MB).
         INSTALL_OCR: "false"
+      labels:
+        net.dhig.ddlib: "true"
     image: dd-library:latest
     container_name: dd-library
     restart: unless-stopped
+    labels:
+      net.dhig.ddlib: "true"
 
-    # Published on localhost only. To reach it from elsewhere, put a reverse
-    # proxy with TLS in front and set DD_COOKIE_SECURE=1 — do not change this
-    # to 0.0.0.0 and expose it directly.
+    # Published on loopback only: the reverse proxy on this host terminates TLS
+    # for ddlib.dhig.net and forwards here. Do not bind 0.0.0.0 — the app would
+    # then be reachable without TLS and without the proxy's access controls.
+    #
+    # 8412 was chosen because it is free on the target host (80/81/443 nginx,
+    # 8000/8080/8081/8082/8763/3001/3003/9432/9443 already published). Override
+    # with DD_HOST_PORT in .env if that changes.
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${DD_BIND_ADDR:-127.0.0.1}:${DD_HOST_PORT:-8412}:8000"
 
     env_file:
       - .env
@@ -23,6 +31,10 @@ services:
       # Where the folder picker may look. /corpus is the read-only mount below;
       # /data/uploads/extracted is always browsable.
       DD_BROWSE_ROOTS: /corpus:/data/uploads/extracted
+      # uvicorn only honours X-Forwarded-* from these addresses. The proxy talks
+      # to the published loopback port, so its requests arrive from the docker
+      # bridge gateway — not 127.0.0.1 as seen from inside the container.
+      DD_FORWARDED_ALLOW_IPS: ${DD_FORWARDED_ALLOW_IPS:-172.16.0.0/12,192.168.0.0/16,10.0.0.0/8}
 
     volumes:
       # Index, text mirror, uploads, generated documents. Back this up.
@@ -36,7 +48,12 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=2g,mode=1777
-      - /home/dd:size=64m,mode=0700
+      # uid/gid must be spelled out. A tmpfs mount is root-owned, so with
+      # mode=0700 alone the runtime user cannot even stat its own home — and the
+      # app reads ~/.config/anthropic on startup to detect an `ant auth login`
+      # profile, which made the container exit before serving a request.
+      # 10001 is pinned as both uid and gid in the Dockerfile.
+      - /home/dd:size=64m,mode=0700,uid=10001,gid=10001
     cap_drop: ["ALL"]
     security_opt:
       - no-new-privileges:true

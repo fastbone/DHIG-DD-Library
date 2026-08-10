@@ -124,6 +124,28 @@ fi
 [[ -d "$DATA_DIR/uploads/extracted" ]] && pass "upload directories created in the data volume" \
   || bad "upload directories missing from the data volume"
 
+# A home directory the app cannot read must not stop it from starting. In the
+# image /home/dd is a tmpfs, and a tmpfs is root-owned unless the mount says
+# otherwise — that combination made the container exit before serving anything,
+# because the credential probe stats ~/.config/anthropic. Only reproducible as
+# an unprivileged user: root is not stopped by mode 0700.
+if [[ -n "$RUNNER" ]]; then
+  UNREADABLE="$DATA_DIR/unreadable-home"
+  mkdir -p "$UNREADABLE/.config/anthropic/credentials"
+  chown -R root:root "$UNREADABLE"
+  chmod 700 "$UNREADABLE"
+  OUT=$($RUNNER "cd '$APP_DIR' && env ${ENV_ARGS[*]} HOME='$UNREADABLE' python3 -c \"
+from app.config import settings
+print('probe:', settings.has_api_key())
+\"" 2>&1 | tail -1)
+  if [[ "$OUT" == "probe: False" ]]; then
+    pass "an unreadable home directory does not break startup"
+  else
+    bad "the credential probe raised on an unreadable home: $OUT"
+  fi
+  chmod 755 "$UNREADABLE"
+fi
+
 OUT=$(run_in_app "python3 -c \"
 from app import db, tools
 db.init()

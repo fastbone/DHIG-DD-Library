@@ -150,12 +150,12 @@ if you want to index a data room straight off the host rather than uploading it.
 For OCR, build with `INSTALL_OCR=true` (adds ~250 MB of Tesseract) and set
 `DD_OCR=1`.
 
-The compose file publishes on `127.0.0.1` only, and hardens the container
+The compose file publishes on `127.0.0.1:8412` only, and hardens the container
 because `run_python` executes model-authored code: read-only root filesystem,
 tmpfs `/tmp`, all capabilities dropped, `no-new-privileges`, a PID limit and a
 memory limit. To reach it from another machine, put a TLS-terminating reverse
 proxy in front, set `DD_COOKIE_SECURE=1`, and leave the published port bound to
-localhost.
+localhost — see *Deploying to a host* below.
 
 **Keep `DD_SECRET_KEY`.** It encrypts stored API keys; if it changes, they cannot
 be decrypted and have to be re-added (the app tells you rather than failing
@@ -255,13 +255,109 @@ Read this before pointing it at a live deal.
 
 ---
 
+## Deploying to a host
+
+The production instance is `https://ddlib.dhig.net`: the host's existing nginx
+terminates TLS and forwards to the container on `127.0.0.1:8412`.
+
+### Port
+
+The container listens on 8000 internally and is published on `8412`, chosen
+because the deployment host already has 80/81/443 (nginx), 3001, 3003, 8000,
+8080, 8081, 8082, 9432 and 9443 (other containers) and 8763 in use. Change it in
+one place — `DD_HOST_PORT` in `.env` — and update the proxy to match. Check
+before you pick: `ss -tulpn | grep -w 8412`.
+
+`DD_BIND_ADDR` stays `127.0.0.1`. Publishing on `0.0.0.0` would serve the app
+over plain HTTP beside the TLS vhost, cookies and all.
+
+### Reverse proxy
+
+`deploy/nginx/ddlib.dhig.net.conf` is a complete vhost:
+
+```bash
+sudo cp deploy/nginx/ddlib.dhig.net.conf /etc/nginx/sites-available/ddlib.dhig.net
+sudo ln -s ../sites-available/ddlib.dhig.net /etc/nginx/sites-enabled/
+sudo certbot --nginx -d ddlib.dhig.net
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Four of its settings are load-bearing, and each fails in a way that looks like
+an application bug:
+
+| Setting | Without it |
+|---|---|
+| `client_max_body_size 4096m` | uploading a data-room zip fails with 413 — nginx's default is 1 MB |
+| `proxy_request_buffering off` | nginx spools the whole multi-gigabyte upload to disk first |
+| `proxy_buffering off` | indexing progress and streamed answers appear only once finished |
+| `proxy_read_timeout 3600s` | long analyst turns die at 60s |
+
+If the host runs Nginx Proxy Manager instead (port 81 suggests it does), create
+the proxy host in its UI and paste the block at the end of that file into the
+**Advanced** tab; tick Websockets Support, Force SSL and HTTP/2.
+
+Set `DD_COOKIE_SECURE=1` once TLS is in front. `DD_FORWARDED_ALLOW_IPS` decides
+whose `X-Forwarded-For` is believed — and therefore whether the audit log and
+the login lockout see real client addresses. It is **not** `127.0.0.1`: the proxy
+connects to the published loopback port and Docker's NAT rewrites the source to
+the bridge gateway (typically `172.17.0.1`), so the compose default trusts the
+private ranges Docker allocates from. Narrow it to the exact gateway if you want.
+
+### Updating
+
+`deploy/update.sh` runs on the docker host, from the checkout:
+
+```bash
+cd /opt/dd-library
+./deploy/update.sh              # fetch, build, swap, verify — rolls back if unhealthy
+./deploy/update.sh --status     # what is running now
+./deploy/update.sh --dry-run    # print the plan, change nothing
+./deploy/update.sh --rollback   # back to the previous commit
+```
+
+What it does, in order: takes a `flock` so two runs can't overlap; refuses to
+start without `.env` and a non-empty `DD_SECRET_KEY`, with a dirty checkout
+(unless `--force`), or if the port belongs to someone else; fast-forwards the
+branch (never merges) and prints the changelog; warns if `.env.example` gained a
+variable; snapshots the index and secrets; builds the new image **while the old
+container still serves**; swaps; then polls `/api/health` for up to three
+minutes. If the new version doesn't come up healthy it restores the previous
+commit, brings the old one back and exits non-zero — a failed update leaves the
+service running.
+
+Nightly, unattended:
+
+```
+17 3 * * *  cd /opt/dd-library && ./deploy/update.sh >> /var/log/ddlib-update.log 2>&1
+```
+
+An up-to-date, healthy instance prints one line and exits 0.
+
+### Backups
+
+`update.sh` snapshots into `.deploy/backups/<timestamp>/` before each update
+(keeping the newest 5, `--keep N` to change): the SQLite catalogue via the
+backup API — a file copy of a live database would be torn — plus `secret.key`
+and `settings.json`, because the catalogue's stored API keys are useless without
+the key that decrypts them. **Those snapshots contain secrets; `.deploy/` is
+gitignored, keep it that way.**
+
+That is the catalogue, not the corpus. For a full restore also back up the
+`dd-data` volume (text mirror, uploads, generated deliverables) — a host-level
+backup of `/var/lib/docker/volumes/*_dd-data` while the container is stopped, or
+`docker run --rm -v dd-library_dd-data:/data -v $PWD:/out alpine tar czf
+/out/dd-data.tgz /data`. Everything except uploads and deliverables can be
+rebuilt from the corpus by reindexing, at the cost of another indexing sweep.
+
+---
+
 ## Verifying it works
 
 Three suites, none of which spend a token or touch your real index — each uses
 its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 50 checks: auth, CSRF, keys, uploads, storage, audit
+python3 tools/api_smoke.py            # 53 checks: auth, CSRF, keys, uploads, storage, audit
 python3 tools/ui_smoke.py             # 25 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks: the container's runtime constraints
 ```
@@ -272,8 +368,9 @@ closes, a missing or wrong CSRF token is rejected, failed sign-ins throttle,
 analysts cannot reach admin routes, disabling a user kills their session
 immediately, a stored API key round-trips through encryption and is never echoed
 back, an archive with a `../` member extracts its safe files and refuses the
-rest, browsing outside the permitted roots is refused, and every privileged
-action lands in the audit log.
+rest, browsing outside the permitted roots is refused — as is naming such a path
+directly to the corpus-root and ingest routes — and every privileged action
+lands in the audit log.
 
 `ui_smoke.py` ingests the sample corpus, stamps synthetic cards, replaces the
 agent with a scripted event stream, and drives a real browser: sign-in,
@@ -318,7 +415,10 @@ app/
 web/              single-page UI plus the login page, no build step
 tools/            sample corpus, API smoke test, UI smoke test, container check
 Dockerfile        non-root, read-only /app, /data volume
-docker-compose.yml  hardened runtime, localhost-published
+docker-compose.yml  hardened runtime, localhost-published on 8412
+deploy/
+  update.sh       host-side update: pull, build, swap, health-check, roll back
+  nginx/ddlib.dhig.net.conf   the production vhost
 ```
 
 ### Design notes worth knowing before you change things
