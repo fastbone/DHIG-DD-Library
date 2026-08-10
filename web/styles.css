@@ -145,11 +145,19 @@ button { cursor: pointer; border-radius: 8px; }
 }
 .ghost:hover { color: var(--ink); border-color: var(--ink-3); }
 .link { background: none; border: 0; color: var(--accent); padding: 0; text-decoration: underline; }
-input[type=text], input[type=search], select, textarea {
-  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px;
-  padding: 7px 10px; min-width: 0;
+/* Every text-like input, not just [type=text] — a password field left out of
+   this list keeps the browser default white background in dark mode. */
+input:not([type=checkbox]):not([type=radio]):not([type=file]), select, textarea {
+  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line-2);
+  border-radius: 8px; padding: 7px 10px; min-width: 0;
 }
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: var(--ink-3); }
+/* Chromium paints its own autofill background; keep the token palette. */
+input:-webkit-autofill, input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--ink);
+  box-shadow: 0 0 0 60px var(--panel-2) inset;
+}
 textarea { width: 100%; resize: vertical; font-family: var(--sans); }
 .row { display: flex; align-items: center; gap: 8px; }
 .row.wrap { flex-wrap: wrap; }
