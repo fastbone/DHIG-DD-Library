@@ -344,10 +344,38 @@ class RootBody(BaseModel):
     path: str
 
 
+def permitted_dir(raw: str) -> Path:
+    """Resolve a caller-supplied directory, refusing anything outside the roots.
+
+    Every route that takes a filesystem path from the browser goes through here.
+    Without it, a signed-in user could point the indexer at any directory the
+    service account can read — /etc, another tenant's data room, the host's home
+    — and then read the extracted text and download the originals through the
+    ordinary document routes. The roots are operator-configured
+    (``DD_BROWSE_ROOTS``), which is the same fence the folder picker honours.
+    """
+    roots = settings.browse_roots
+    if not roots:
+        raise HTTPException(400, "no browsable roots configured (set DD_BROWSE_ROOTS)")
+    target = Path(raw).expanduser()
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        raise HTTPException(400, f"cannot resolve path: {raw}") from exc
+    if not any(resolved == r or security.is_within(resolved, r) for r in roots):
+        raise HTTPException(
+            403,
+            "path is outside the permitted roots: " + ", ".join(str(r) for r in roots),
+        )
+    if not resolved.is_dir():
+        raise HTTPException(400, f"not a directory: {resolved}")
+    return resolved
+
+
 @app.post("/api/corpus-root")
 async def set_root(body: RootBody, request: Request):
     try:
-        resolved = settings.set_corpus_root(body.path)
+        resolved = settings.set_corpus_root(str(permitted_dir(body.path)))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     db.audit("corpus.set_root", actor=actor(request), detail=str(resolved))
@@ -410,11 +438,14 @@ class IngestBody(BaseModel):
 
 @app.post("/api/ingest")
 async def start_ingest(body: IngestBody, request: Request):
-    root = Path(body.path).expanduser().resolve() if body.path else settings.corpus_root
-    if root is None:
-        raise HTTPException(400, "no corpus root set")
-    if not root.is_dir():
-        raise HTTPException(400, f"not a directory: {root}")
+    if body.path:
+        root = permitted_dir(body.path)
+    else:
+        root = settings.corpus_root
+        if root is None:
+            raise HTTPException(400, "no corpus root set")
+        if not root.is_dir():
+            raise HTTPException(400, f"not a directory: {root}")
     if any(k.startswith("ingest-") for k in JOBS):
         raise HTTPException(409, "an ingest job is already running")
     settings.set_corpus_root(str(root))

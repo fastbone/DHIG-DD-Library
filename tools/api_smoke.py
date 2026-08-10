@@ -287,6 +287,15 @@ def main() -> int:
     code, body, _ = admin.get(f"/api/browse?path={root}")
     check("browsing inside a permitted root works", code == 200, str(body)[:160])
 
+    # The picker is not the only way to name a path: these two routes take one
+    # straight from the request body, so they must honour the same fence.
+    code, body, _ = admin.post("/api/corpus-root", {"path": "/etc"})
+    check("setting the corpus root outside the roots is refused", code == 403, f"got {code}")
+    code, body, _ = admin.post("/api/ingest", {"path": "/etc"})
+    check("indexing a path outside the roots is refused", code == 403, f"got {code}")
+    code, body, _ = admin.post("/api/corpus-root", {"path": str(root)})
+    check("setting the corpus root inside the roots works", code == 200, str(body)[:160])
+
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
     check("storage usage reports areas and roots",

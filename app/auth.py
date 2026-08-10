@@ -196,9 +196,20 @@ def clear_failures(username: str, ip: str) -> None:
 
 
 def client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()[:64]
+    """The peer address, as the ASGI server reports it.
+
+    Deliberately does *not* read ``X-Forwarded-For`` here. That header is
+    attacker-controlled unless the request came from a proxy we trust, and this
+    value gates the login lockout and lands in the audit log — honouring a raw
+    header would let anyone rotate spoofed values to sidestep the lockout and
+    poison the audit trail.
+
+    Trust lives in exactly one place: uvicorn's proxy-headers middleware, which
+    rewrites the peer address from ``X-Forwarded-For`` only when the connection
+    itself comes from an address in ``DD_FORWARDED_ALLOW_IPS`` (IPs or CIDR).
+    Behind a proxy that is not listed, every request looks like it came from the
+    proxy — a shared throttle bucket, which fails closed rather than open.
+    """
     return (request.client.host if request.client else "unknown")[:64]
 
 
@@ -250,7 +261,7 @@ def session_user(request: Request) -> dict | None:
     if not token:
         return None
     row = db.one(
-        "SELECT s.token_hash, s.csrf, s.expires_at, u.* FROM sessions s"
+        "SELECT s.token_hash, s.csrf, s.expires_at, s.last_seen_at, u.* FROM sessions s"
         " JOIN users u ON u.id = s.user_id WHERE s.token_hash=?",
         (security.token_fingerprint(token),),
     )
@@ -261,7 +272,7 @@ def session_user(request: Request) -> dict | None:
         db.execute("DELETE FROM sessions WHERE token_hash=?", (row["token_hash"],))
         return None
     # Slide the window, but write at most once a minute.
-    if now - (row["last_seen_at"] if "last_seen_at" in row.keys() else 0) > 60:
+    if now - (row["last_seen_at"] or 0) > 60:
         db.execute(
             "UPDATE sessions SET last_seen_at=?, expires_at=? WHERE token_hash=?",
             (now, now + settings.session_ttl_hours * 3600, row["token_hash"]),

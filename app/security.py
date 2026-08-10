@@ -118,7 +118,8 @@ def instance_key() -> bytes:
             path.write_text(raw)
             os.chmod(path, 0o600)
     _cached_key = hashlib.scrypt(
-        raw.encode("utf-8"), salt=_KEY_SALT, n=2**14, r=8, p=1, dklen=32
+        raw.encode("utf-8"), salt=_KEY_SALT, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+        dklen=_DKLEN, maxmem=_maxmem(_SCRYPT_N, _SCRYPT_R),
     )
     return _cached_key
 
