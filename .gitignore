@@ -2,6 +2,10 @@
 data/
 sample-dataroom/
 
+# compose bind-mount target: keep the folder, ignore whatever is dropped in it
+corpus/*
+!corpus/.gitkeep
+
 __pycache__/
 *.py[cod]
 .venv/

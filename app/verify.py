@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from . import db, extract, pricing
+from . import credentials, db, extract, pricing
 from .config import settings
 
 CITATION_RE = re.compile(r"\[\[([0-9a-f]{6,32}):([^\]\s]{1,120})\]\]")
@@ -112,7 +112,7 @@ async def verify_answer(
     claims = extract_claims(answer)
     if not claims:
         return
-    client = AsyncAnthropic()
+    client = credentials.get_client()
     sem = asyncio.Semaphore(settings.verify_concurrency)
 
     async def one(claim: dict) -> dict:

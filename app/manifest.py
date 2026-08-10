@@ -16,7 +16,7 @@ import uuid
 
 from anthropic import AsyncAnthropic
 
-from . import db, extract, pricing
+from . import credentials, db, extract, pricing
 from .config import WORKSTREAMS, settings
 from .events import broker
 
@@ -176,7 +176,7 @@ class SweepJob:
                            failed=0, message="nothing to index")
             return
 
-        client = AsyncAnthropic()
+        client = credentials.get_client()
         sem = asyncio.Semaphore(settings.card_concurrency)
 
         async def worker(doc: dict) -> None:

@@ -39,21 +39,10 @@ function toast(msg, isErr) {
   toast._t = setTimeout(() => (t.className = "toast"), 4200);
 }
 
-async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
-  if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
-  return data;
-}
-
 const state = {
   status: null,
+  user: null,
+  csrf: "",
   docOffset: 0,
   docLimit: 60,
   docTotal: 0,
@@ -61,6 +50,26 @@ const state = {
   running: false,
   pickerPath: null,
 };
+
+function authHeaders(extra = {}) {
+  const h = { ...extra };
+  if (state.csrf) h["X-CSRF-Token"] = state.csrf;
+  return h;
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: authHeaders({ "Content-Type": "application/json", ...(opts.headers || {}) }),
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (res.status === 401) { location.replace("/login"); throw new Error("session expired"); }
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+  return data;
+}
 
 /* ── theme ───────────────────────────────────────────────────────────── */
 const savedTheme = localStorage.getItem("dd-theme");
@@ -81,6 +90,7 @@ $("tabs").addEventListener("click", (e) => {
   for (const s of document.querySelectorAll(".tab")) s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab);
   if (btn.dataset.tab === "deliverables") { loadArtifacts(); loadQaLog(); }
   if (btn.dataset.tab === "sweep") loadManifestPreview();
+  if (btn.dataset.tab === "admin") loadAdmin();
 });
 
 /* ── status ──────────────────────────────────────────────────────────── */
@@ -88,6 +98,10 @@ async function refreshStatus() {
   let s;
   try { s = await api("/api/status"); } catch (e) { toast("status: " + e.message, true); return; }
   state.status = s;
+  state.user = s.user;
+  state.csrf = s.user?.csrf || state.csrf;
+  renderUserChip(s.user);
+  $("adminTabBtn").classList.toggle("hidden", s.user?.role !== "admin");
   $("corpusRoot").textContent = s.corpus_root || "not set";
   if (s.corpus_root && !$("ingestPath").value) $("ingestPath").value = s.corpus_root;
   $("carderModel").textContent = s.models.carder;
@@ -103,7 +117,7 @@ async function refreshStatus() {
   $("headPills").innerHTML =
     pills.map(([k, v]) => `<span class="pill"><span class="muted">${k}</span><b>${v}</b></span>`).join("") +
     (s.has_api_key
-      ? `<span class="pill ok">${esc(s.models.analyst)}</span>`
+      ? `<span class="pill ok" title="credentials: ${esc(s.credentials)}">${esc(s.models.analyst)}</span>`
       : `<span class="pill warn">no API key</span>`);
 
   $("statGrid").innerHTML = [
@@ -158,6 +172,22 @@ async function refreshStatus() {
     .join("") || `<div class="stat"><div class="v">—</div><div class="k">no sweep yet</div></div>`;
 }
 
+function renderUserChip(user) {
+  if (!user) return;
+  const chip = $("userChip");
+  chip.innerHTML =
+    `<span>${esc(user.username)}</span><span class="role">${esc(user.role)}</span>` +
+    `<button id="logoutBtn" title="Sign out">⏻</button>`;
+  $("logoutBtn").onclick = async () => {
+    try { await api("/api/logout", { method: "POST" }); } catch { /* ignore */ }
+    location.replace("/login");
+  };
+  if (user.must_change_password && !renderUserChip._warned) {
+    renderUserChip._warned = true;
+    toast("Your password was set by an administrator — change it under Admin.", true);
+  }
+}
+
 function renderBars(target, pairs) {
   const max = Math.max(1, ...pairs.map((p) => p[1]));
   $(target).innerHTML = pairs.length
@@ -183,6 +213,7 @@ function connectEvents() {
       clearTimeout(statsTimer);
       statsTimer = setTimeout(() => { refreshStatus(); loadDocs(); }, 400);
     }
+    else if (ev.kind === "archives_dirty") loadArchives();
   };
   src.onerror = () => { src.close(); setTimeout(connectEvents, 2500); };
 }
@@ -197,33 +228,40 @@ function appendLog(ev) {
 }
 $("logClear").onclick = () => ($("log").innerHTML = "");
 
+const JOB_UI = { ingest: "ingest", sweep: "sweep", extract: "extract" };
+
 function onJob(ev) {
-  const which = ev.job_kind === "ingest" ? "ingest" : "sweep";
+  const which = JOB_UI[ev.job_kind] || "sweep";
   const wrap = $(which + "Progress");
   wrap.classList.remove("hidden");
   const pct = ev.total ? Math.round((ev.done / ev.total) * 100) : 0;
   $(which + "Bar").style.width = pct + "%";
-  const bits = [`${nfmt(ev.done)} / ${nfmt(ev.total)}`, `${pct}%`];
-  if (ev.skipped) bits.push(`${ev.skipped} unchanged`);
+  const bits = [];
+  if (ev.status === "running") bits.push(`${nfmt(ev.done)} / ${nfmt(ev.total)}`, `${pct}%`);
+  // "skipped" means unchanged files during ingest, but refused members during
+  // extraction — same field, different meaning.
+  if (ev.skipped) bits.push(`${ev.skipped} ${which === "extract" ? "refused" : "unchanged"}`);
   if (ev.failed) bits.push(`${ev.failed} failed`);
-  if (ev.bytes_done) bits.push(bytes(ev.bytes_done));
+  if (ev.bytes_done && ev.status === "running") bits.push(bytes(ev.bytes_done));
   if (ev.usage?.cost_usd != null) bits.push(money(ev.usage.cost_usd));
   if (ev.message) bits.push(ev.message);
   $(which + "Meta").textContent = bits.join(" · ");
-  $(which + "Cancel").dataset.job = ev.job_id;
+  const cancelBtn = $(which + "Cancel");
+  if (cancelBtn) cancelBtn.dataset.job = ev.job_id;
   if (ev.status !== "running") {
-    $(which === "ingest" ? "ingestBtn" : "sweepBtn").disabled = false;
-    setTimeout(() => { refreshStatus(); loadDocs(); }, 300);
-    setTimeout(() => hideProgress(which), 12000);
+    hideProgress(which);
+    setTimeout(() => { refreshStatus(); loadDocs(); loadArchives(); }, 300);
   }
 }
 function hideProgress(which) {
-  const btn = $(which === "ingest" ? "ingestBtn" : "sweepBtn");
-  if (btn) btn.disabled = false;
+  const btn = { ingest: "ingestBtn", sweep: "sweepBtn" }[which];
+  if (btn && $(btn)) $(btn).disabled = false;
 }
 
-for (const which of ["ingest", "sweep"]) {
-  $(which + "Cancel").onclick = async (e) => {
+for (const which of ["ingest", "sweep", "extract"]) {
+  const btn = $(which + "Cancel");
+  if (!btn) continue;
+  btn.onclick = async (e) => {
     const job = e.target.dataset.job;
     if (!job) return;
     try { await api(`/api/jobs/${job}/cancel`, { method: "POST" }); } catch (err) { toast(err.message, true); }
@@ -271,30 +309,156 @@ async function loadManifestPreview() {
   } catch { /* ignore */ }
 }
 
+/* ── archive upload ──────────────────────────────────────────────────── */
+const dz = $("dropzone");
+$("fileInput").onchange = (e) => { if (e.target.files[0]) uploadArchive(e.target.files[0]); };
+dz.onclick = () => $("fileInput").click();
+for (const ev of ["dragenter", "dragover"]) {
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("over"); });
+}
+for (const ev of ["dragleave", "drop"]) {
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("over"); });
+}
+dz.addEventListener("drop", (e) => {
+  const f = e.dataTransfer?.files?.[0];
+  if (f) uploadArchive(f);
+});
+
+function uploadArchive(file) {
+  const limit = (state.status?.max_upload_mb || 4096) * 1024 * 1024;
+  if (file.size > limit) {
+    return toast(`${file.name} is larger than the ${state.status.max_upload_mb} MB limit`, true);
+  }
+  const form = new FormData();
+  form.append("file", file);
+  form.append("auto_extract", $("autoExtract").checked ? "true" : "false");
+  form.append("auto_ingest", $("autoIngest").checked ? "true" : "false");
+
+  $("uploadProgress").classList.remove("hidden");
+  $("uploadMeta").textContent = `uploading ${file.name} …`;
+
+  // XHR rather than fetch: upload progress events are not available on fetch.
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/archives");
+  if (state.csrf) xhr.setRequestHeader("X-CSRF-Token", state.csrf);
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    const pct = Math.round((e.loaded / e.total) * 100);
+    $("uploadBar").style.width = pct + "%";
+    $("uploadMeta").textContent = `uploading ${file.name} · ${bytes(e.loaded)} / ${bytes(e.total)} · ${pct}%`;
+  };
+  xhr.onload = () => {
+    let data = {};
+    try { data = JSON.parse(xhr.responseText); } catch { /* ignore */ }
+    if (xhr.status === 401) return location.replace("/login");
+    if (xhr.status >= 400) {
+      $("uploadMeta").textContent = "";
+      $("uploadProgress").classList.add("hidden");
+      return toast(data.error || data.detail || `upload failed (${xhr.status})`, true);
+    }
+    $("uploadBar").style.width = "100%";
+    $("uploadMeta").textContent = `uploaded ${file.name} (${bytes(data.archive?.size_bytes)})`;
+    setTimeout(() => $("uploadProgress").classList.add("hidden"), 4000);
+    $("fileInput").value = "";
+    loadArchives();
+  };
+  xhr.onerror = () => {
+    $("uploadProgress").classList.add("hidden");
+    toast("upload failed — connection error", true);
+  };
+  xhr.send(form);
+}
+
+async function loadArchives() {
+  let r;
+  try { r = await api("/api/archives"); } catch { return; }
+  $("dropHint").textContent =
+    `${r.accepted.join(" · ")} — up to ${r.max_upload_mb} MB, extracted into ${r.extract_root}`;
+  const box = $("archiveList");
+  if (!r.archives.length) { box.innerHTML = ""; return; }
+  box.innerHTML = "";
+  for (const a of r.archives) {
+    const row = el("div", "rowitem");
+    const state_tag =
+      a.status === "extracted" ? `<span class="tag">${a.n_files} files</span>`
+      : a.status === "failed" ? `<span class="tag bad">failed</span>`
+      : `<span class="tag dupe">${esc(a.status)}</span>`;
+    const meta = el("div", "meta");
+    meta.innerHTML = `<div class="t">${esc(a.filename)} ${state_tag}</div>
+      <div class="muted small">${bytes(a.size_bytes)} · ${new Date(a.created_at * 1000).toLocaleString()}
+      ${a.uploaded_by ? "· " + esc(a.uploaded_by) : ""}
+      ${a.n_skipped ? `· <span class="tag flag">${a.n_skipped} skipped</span>` : ""}
+      ${a.error ? "· " + esc(a.error.slice(0, 120)) : ""}</div>
+      ${a.extract_dir ? `<div class="doc-path">${esc(a.extract_dir)}</div>` : ""}`;
+    const actions = el("div", "actions");
+
+    if (a.extract_dir) {
+      const useBtn = el("button", "ghost", "use as corpus");
+      useBtn.onclick = async () => {
+        try {
+          await api("/api/corpus-root", { method: "POST", body: { path: a.extract_dir } });
+          $("ingestPath").value = a.extract_dir;
+          toast("Corpus root set — press Ingest");
+          refreshStatus();
+        } catch (e) { toast(e.message, true); }
+      };
+      actions.append(useBtn);
+    }
+    const exBtn = el("button", "ghost", a.extract_dir ? "re-extract" : "extract");
+    exBtn.onclick = async () => {
+      try {
+        await api(`/api/archives/${a.id}/extract`, {
+          method: "POST", body: { auto_ingest: $("autoIngest").checked },
+        });
+        $("extractProgress").classList.remove("hidden");
+        $("extractMeta").textContent = "starting …";
+      } catch (e) { toast(e.message, true); }
+    };
+    const delBtn = el("button", "danger", "delete");
+    delBtn.onclick = async () => {
+      const withDir = a.extract_dir
+        ? confirm(`Delete ${a.filename} AND its extracted folder?\n\n${a.extract_dir}\n\n` +
+                  "OK = remove both, Cancel = keep the extracted folder.")
+        : false;
+      try {
+        await api(`/api/archives/${a.id}?drop_extracted=${withDir}`, { method: "DELETE" });
+        loadArchives(); refreshStatus();
+      } catch (e) { toast(e.message, true); }
+    };
+    actions.append(exBtn, delBtn);
+    row.append(meta, actions);
+    box.append(row);
+  }
+}
+
 /* ── folder picker ───────────────────────────────────────────────────── */
-$("browseBtn").onclick = () => openPicker($("ingestPath").value || "/");
+$("browseBtn").onclick = () => openPicker($("ingestPath").value || "");
 $("pickerClose").onclick = () => $("picker").classList.remove("open");
-$("pickerUp").onclick = () => openPicker(state.pickerParent);
+$("pickerUp").onclick = () => openPicker(state.pickerParent || "");
 $("pickerUse").onclick = () => {
+  if (!state.pickerPath) return toast("Pick a folder first", true);
   $("ingestPath").value = state.pickerPath;
   $("picker").classList.remove("open");
 };
 async function openPicker(path) {
   try {
-    const r = await api(`/api/browse?path=${encodeURIComponent(path || "/")}`);
+    const r = await api(`/api/browse?path=${encodeURIComponent(path || "")}`);
     state.pickerPath = r.path;
     state.pickerParent = r.parent;
-    $("pickerPath").textContent = r.path;
-    const counts = Object.entries(r.supported_files_here);
-    $("pickerHere").textContent = counts.length
-      ? "here: " + counts.map(([k, v]) => `${v}× ${k}`).join(", ")
-      : "no supported files directly in this folder (subfolders are still scanned)";
+    $("pickerPath").textContent = r.path || "permitted roots";
+    const counts = Object.entries(r.supported_files_here || {});
+    $("pickerHere").textContent = !r.path
+      ? "Browsing is limited to these roots (DD_BROWSE_ROOTS)."
+      : counts.length
+        ? "here: " + counts.map(([k, v]) => `${v}× ${k}`).join(", ")
+        : "no supported files directly in this folder (subfolders are still scanned)";
     $("pickerList").innerHTML = r.dirs.length
-      ? r.dirs.map((d) => `<div data-path="${esc(d.path)}">${esc(d.name)}/</div>`).join("")
+      ? r.dirs.map((d) => `<div data-path="${esc(d.path)}">${esc(d.name)}${r.path ? "/" : ""}</div>`).join("")
       : `<div class="muted">no subfolders</div>`;
     for (const d of $("pickerList").children) {
       if (d.dataset.path) d.onclick = () => openPicker(d.dataset.path);
     }
+    $("pickerUp").classList.toggle("hidden", !r.parent);
     $("picker").classList.add("open");
   } catch (e) { toast(e.message, true); }
 }
@@ -525,7 +689,7 @@ $("askForm").addEventListener("submit", async (e) => {
   try {
     const res = await fetch("/api/ask", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         question, history: state.history,
         verify: $("verifyToggle").checked, effort: $("effort").value,
@@ -736,8 +900,248 @@ async function loadQaLog() {
   } catch (e) { /* ignore */ }
 }
 
+/* ── admin ───────────────────────────────────────────────────────────── */
+const AREA_COLOURS = ["#0f766e", "#2dd4bf", "#a5610a", "#7b848e", "#196b3c"];
+
+async function loadAdmin() {
+  await Promise.all([loadKeys(), loadUsers(), loadStorage(), loadAudit()]);
+}
+
+async function loadKeys() {
+  let r;
+  try { r = await api("/api/keys"); } catch (e) { return toast(e.message, true); }
+  $("keySource").innerHTML =
+    `resolving from <b>${esc(r.source)}</b>${r.env_key_present ? " · env key present" : ""}` +
+    ` · secret: ${esc(r.secret_key_source)}`;
+  const box = $("keyList");
+  box.innerHTML = "";
+  if (!r.keys.length) {
+    box.innerHTML = r.env_key_present
+      ? `<div class="notice">No stored key — using <code>ANTHROPIC_API_KEY</code> from the environment.</div>`
+      : `<div class="notice warn">No API key configured. Indexing and Ask are disabled until you add one.</div>`;
+  }
+  for (const k of r.keys) {
+    const row = el("div", "rowitem" + (k.is_active ? " active" : ""));
+    const test = k.last_test_at
+      ? `<span class="tag ${k.last_test_ok ? "" : "bad"}">${k.last_test_ok ? "verified" : "failed"}</span>`
+      : "";
+    const meta = el("div", "meta");
+    meta.innerHTML = `<div class="t">${esc(k.label)} ${k.is_active ? '<span class="tag">active</span>' : ""} ${test}</div>
+      <div class="keymask">sk-ant-…${esc(k.last4)}</div>
+      <div class="muted small">added ${new Date(k.created_at * 1000).toLocaleDateString()}
+        ${k.created_by ? "by " + esc(k.created_by) : ""}
+        ${k.last_used_at ? "· last used " + new Date(k.last_used_at * 1000).toLocaleString() : ""}
+        ${k.last_test_note ? "· " + esc(k.last_test_note.slice(0, 110)) : ""}</div>`;
+    const actions = el("div", "actions");
+    const testBtn = el("button", "ghost", "test");
+    testBtn.onclick = async () => {
+      testBtn.textContent = "testing…";
+      try {
+        const res = await api(`/api/keys/${k.id}/test`, { method: "POST" });
+        toast(res.ok ? `OK — ${res.note}` : res.note, !res.ok);
+      } catch (e) { toast(e.message, true); }
+      loadKeys();
+    };
+    actions.append(testBtn);
+    if (!k.is_active) {
+      const act = el("button", "ghost", "make active");
+      act.onclick = async () => {
+        try { await api(`/api/keys/${k.id}/activate`, { method: "POST" }); loadKeys(); refreshStatus(); }
+        catch (e) { toast(e.message, true); }
+      };
+      actions.append(act);
+    }
+    const del = el("button", "danger", "delete");
+    del.onclick = async () => {
+      if (!confirm(`Delete key "${k.label}"?`)) return;
+      try { await api(`/api/keys/${k.id}`, { method: "DELETE" }); loadKeys(); refreshStatus(); }
+      catch (e) { toast(e.message, true); }
+    };
+    actions.append(del);
+    row.append(meta, actions);
+    box.append(row);
+  }
+}
+
+$("addKeyBtn").onclick = async () => {
+  const key = $("keyValue").value.trim();
+  if (!key) return toast("Paste an API key first", true);
+  try {
+    await api("/api/keys", {
+      method: "POST",
+      body: { label: $("keyLabel").value.trim() || "default", key, activate: true },
+    });
+    $("keyValue").value = ""; $("keyLabel").value = "";
+    toast("Key stored and activated");
+    loadKeys(); refreshStatus();
+  } catch (e) { toast(e.message, true); }
+};
+
+async function loadUsers() {
+  let r;
+  try { r = await api("/api/users"); } catch (e) { return; }
+  $("accountCount").textContent = `${r.users.length} account${r.users.length === 1 ? "" : "s"}`;
+  const box = $("userList");
+  box.innerHTML = "";
+  for (const u of r.users) {
+    const row = el("div", "rowitem");
+    const meta = el("div", "meta");
+    meta.innerHTML = `<div class="t">${esc(u.username)}
+      <span class="tag">${esc(u.role)}</span>
+      ${u.disabled ? '<span class="tag bad">disabled</span>' : ""}
+      ${u.must_change_password ? '<span class="tag flag">must change password</span>' : ""}</div>
+      <div class="muted small">created ${new Date(u.created_at * 1000).toLocaleDateString()}
+        ${u.last_login_at ? "· last sign-in " + new Date(u.last_login_at * 1000).toLocaleString() : "· never signed in"}</div>`;
+    const actions = el("div", "actions");
+
+    const roleBtn = el("button", "ghost", u.role === "admin" ? "make analyst" : "make admin");
+    roleBtn.onclick = () => patchUser(u.username, { role: u.role === "admin" ? "analyst" : "admin" });
+    const disBtn = el("button", "ghost", u.disabled ? "enable" : "disable");
+    disBtn.onclick = () => patchUser(u.username, { disabled: !u.disabled });
+    const pwBtn = el("button", "ghost", "set password");
+    pwBtn.onclick = () => {
+      const pw = prompt(`New password for ${u.username} (min 8 characters):`);
+      if (pw) patchUser(u.username, { password: pw });
+    };
+    actions.append(roleBtn, disBtn, pwBtn);
+    if (u.username !== state.user?.username) {
+      const del = el("button", "danger", "delete");
+      del.onclick = async () => {
+        if (!confirm(`Delete account "${u.username}"? Their sessions end immediately.`)) return;
+        try { await api(`/api/users/${u.username}`, { method: "DELETE" }); loadUsers(); }
+        catch (e) { toast(e.message, true); }
+      };
+      actions.append(del);
+    }
+    row.append(meta, actions);
+    box.append(row);
+  }
+}
+
+async function patchUser(username, patch) {
+  try {
+    await api(`/api/users/${username}`, { method: "POST", body: patch });
+    toast(`Updated ${username}`);
+    loadUsers();
+  } catch (e) { toast(e.message, true); }
+}
+
+$("addUserBtn").onclick = async () => {
+  const username = $("newUsername").value.trim();
+  const password = $("newPassword").value;
+  if (!username || password.length < 8) return toast("Username and a password of 8+ characters", true);
+  try {
+    await api("/api/users", { method: "POST", body: { username, password, role: $("newRole").value } });
+    $("newUsername").value = ""; $("newPassword").value = "";
+    toast(`Created ${username}`);
+    loadUsers();
+  } catch (e) { toast(e.message, true); }
+};
+
+$("changePwBtn").onclick = async () => {
+  const current_password = $("curPassword").value;
+  const new_password = $("nextPassword").value;
+  if (new_password.length < 8) return toast("New password must be 8+ characters", true);
+  try {
+    await api("/api/me/password", { method: "POST", body: { current_password, new_password } });
+    toast("Password changed — signing out");
+    setTimeout(() => location.replace("/login"), 1200);
+  } catch (e) { toast(e.message, true); }
+};
+
+async function loadStorage() {
+  let r;
+  try { r = await api("/api/storage"); } catch (e) { return; }
+  $("dataDirPath").textContent = r.data_dir;
+  const total = Math.max(1, r.total_bytes);
+  $("usageBar").innerHTML = r.areas
+    .map((a, i) => `<span style="width:${(a.bytes / total) * 100}%;background:${AREA_COLOURS[i % AREA_COLOURS.length]}"
+       title="${esc(a.label)}: ${bytes(a.bytes)}"></span>`).join("");
+  $("usageLegend").innerHTML = r.areas
+    .map((a, i) => `<span><i style="background:${AREA_COLOURS[i % AREA_COLOURS.length]}"></i>
+       ${esc(a.label)} <b>${bytes(a.bytes)}</b>
+       <span class="muted">${a.files ? a.files + " files" : ""}</span></span>`).join("")
+    + `<span class="muted">total <b>${bytes(r.total_bytes)}</b></span>`;
+
+  const box = $("rootList");
+  box.innerHTML = "";
+  if (!r.known_roots.length) {
+    box.innerHTML = `<span class="muted small">No corpus folder yet — upload an archive or set a folder above.</span>`;
+  }
+  for (const root of r.known_roots) {
+    const row = el("div", "rowitem" + (root.active ? " active" : ""));
+    const meta = el("div", "meta");
+    meta.innerHTML = `<div class="t">${esc(root.name)}
+        ${root.active ? '<span class="tag">active</span>' : ""}
+        <span class="tag dupe">${esc(root.source)}</span></div>
+      <div class="doc-path">${esc(root.path)}</div>
+      <div class="muted small">${bytes(root.bytes)} · ${nfmt(root.files)} files ·
+        ${nfmt(root.indexed_documents)} indexed documents</div>`;
+    const actions = el("div", "actions");
+    if (!root.active) {
+      const use = el("button", "ghost", "make active");
+      use.onclick = async () => {
+        try {
+          await api("/api/corpus-root", { method: "POST", body: { path: root.path } });
+          $("ingestPath").value = root.path;
+          toast("Corpus root set"); loadStorage(); refreshStatus();
+        } catch (e) { toast(e.message, true); }
+      };
+      actions.append(use);
+    }
+    if (root.source === "extracted") {
+      const del = el("button", "danger", "delete folder");
+      del.onclick = async () => {
+        if (!confirm(`Permanently delete ${root.path}?\n\nIts documents stay in the index until you run "Purge missing files".`)) return;
+        try {
+          const res = await api("/api/storage/extracted/delete", { method: "POST", body: { path: root.path } });
+          toast(`Deleted ${res.files} files (${bytes(res.reclaimed_bytes)})`);
+          loadStorage(); refreshStatus();
+        } catch (e) { toast(e.message, true); }
+      };
+      actions.append(del);
+    }
+    row.append(meta, actions);
+    box.append(row);
+  }
+
+  $("storageNote").dataset.orphans = r.orphan_occurrences;
+}
+
+for (const btn of document.querySelectorAll("[data-op]")) {
+  btn.onclick = async () => {
+    const op = btn.dataset.op;
+    const scary = { clear_cards: "Clear every catalogue card? The next sweep re-indexes and re-bills.",
+                    reset_index: "Drop the whole index and text mirror? Originals are untouched but a full re-ingest is needed." };
+    if (scary[op] && !confirm(scary[op])) return;
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = "working…";
+    try {
+      const res = await api(`/api/storage/${op}`, { method: "POST" });
+      toast(Object.entries(res).map(([k, v]) =>
+        `${k.replace(/_/g, " ")}: ${typeof v === "number" && k.includes("bytes") ? bytes(v) : v}`).join(" · "));
+      loadStorage(); refreshStatus(); loadDocs();
+    } catch (e) { toast(e.message, true); }
+    btn.disabled = false; btn.textContent = label;
+  };
+}
+
+async function loadAudit() {
+  let r;
+  try { r = await api("/api/audit?limit=200"); } catch (e) { return; }
+  const tb = qs("#auditTable tbody");
+  tb.innerHTML = r.entries.map((a) => `<tr>
+      <td class="muted">${new Date(a.ts * 1000).toLocaleString()}</td>
+      <td>${esc(a.actor || "—")}</td>
+      <td><code>${esc(a.action)}</code></td>
+      <td class="muted">${esc((a.detail || "").slice(0, 160))}</td>
+    </tr>`).join("");
+}
+$("refreshAudit").onclick = loadAudit;
+
 /* ── boot ────────────────────────────────────────────────────────────── */
 refreshStatus();
 loadDocs();
+loadArchives();
 connectEvents();
 setInterval(refreshStatus, 20000);

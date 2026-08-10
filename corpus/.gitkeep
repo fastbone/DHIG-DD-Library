@@ -1,0 +1,2 @@
+# docker-compose bind-mounts this directory read-only at /corpus.
+# Drop a data room here to index it from the host instead of uploading a zip.

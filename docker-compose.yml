@@ -1,0 +1,54 @@
+services:
+  dd-library:
+    build:
+      context: .
+      args:
+        # Set to "true" to bundle Tesseract for OCR of scanned PDFs (+~250 MB).
+        INSTALL_OCR: "false"
+    image: dd-library:latest
+    container_name: dd-library
+    restart: unless-stopped
+
+    # Published on localhost only. To reach it from elsewhere, put a reverse
+    # proxy with TLS in front and set DD_COOKIE_SECURE=1 — do not change this
+    # to 0.0.0.0 and expose it directly.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      DD_DATA_DIR: /data
+      # Where the folder picker may look. /corpus is the read-only mount below;
+      # /data/uploads/extracted is always browsable.
+      DD_BROWSE_ROOTS: /corpus:/data/uploads/extracted
+
+    volumes:
+      # Index, text mirror, uploads, generated documents. Back this up.
+      - dd-data:/data
+      # Optional: an existing data room from the host, mounted read-only so the
+      # app can index it but nothing in the container can modify it.
+      - ./corpus:/corpus:ro
+
+    # run_python executes model-authored code. These are the guardrails that
+    # make that acceptable; loosen them only deliberately.
+    read_only: true
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+      - /home/dd:size=64m,mode=0700
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4g
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  dd-data:

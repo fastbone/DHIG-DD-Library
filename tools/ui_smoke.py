@@ -31,8 +31,12 @@ os.environ.setdefault("DD_DATA_DIR", _TMP)
 # agent.ask is replaced below, so no request is ever made — but the /api/ask
 # route refuses to run without credentials configured.
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-ui-smoke-test-no-request-is-made")
+os.environ.setdefault("DD_SECRET_KEY", "ui-smoke-secret-not-for-production")
+# Deterministic first-run account so the browser can sign in.
+os.environ["DD_ADMIN_USER"] = SMOKE_USER = "smoke-admin"
+os.environ["DD_ADMIN_PASSWORD"] = SMOKE_PASSWORD = "ui-smoke-password"
 
-from app import agent, db, docgen, ingest, manifest, search  # noqa: E402
+from app import agent, auth, db, docgen, ingest, manifest, search  # noqa: E402
 
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8099"))
 
@@ -59,6 +63,10 @@ async def prepare_index() -> None:
 
         make(corpus)
     db.init()
+    auth.bootstrap()
+    from app.config import settings
+
+    settings.set_corpus_root(str(corpus.resolve()))
     await ingest.IngestJob(corpus.resolve(), ocr=False).run()
 
     for row in db.rows("SELECT id, family, filename FROM documents WHERE status='extracted'"):
@@ -76,6 +84,19 @@ async def prepare_index() -> None:
     manifest.invalidate_manifest()
     print(f"index ready: {db.scalar('SELECT COUNT(*) FROM documents')} documents "
           f"({db.scalar('SELECT COUNT(*) FROM units')} units) in {os.environ['DD_DATA_DIR']}")
+
+
+def _smoke_zip() -> bytes:
+    """A small archive with one traversal attempt, for the upload path."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("uploaded/board_minutes.md",
+                    "# Board minutes\n\nApproved the FY2025 budget of EUR 61.4m.\n" * 30)
+        zf.writestr("../escape.md", "must be skipped")
+    return buf.getvalue()
 
 
 def pick_citations() -> list[str]:
@@ -190,7 +211,15 @@ async def main() -> int:
         page.on("console", lambda m: problems.append(f"console.error: {m.text}")
                 if m.type == "error" else None)
 
+        # Sign in through the real login form.
         await page.goto(f"http://127.0.0.1:{PORT}/", wait_until="networkidle")
+        checks_login = page.url.endswith("/login")
+        await page.fill("#username", SMOKE_USER)
+        await page.fill("#password", SMOKE_PASSWORD)
+        await page.click("#submitBtn")
+        await page.wait_for_url(f"http://127.0.0.1:{PORT}/", timeout=15_000)
+        await page.wait_for_timeout(800)
+
         await page.click('button[data-tab="ask"]')
         await page.fill("#question", "What was FY2024 revenue, and is the largest contract at risk?")
         await page.click("#askBtn")
@@ -212,6 +241,11 @@ async def main() -> int:
         await page.wait_for_timeout(600)
 
         checks = {
+            "unauthenticated visit lands on /login": checks_login,
+            "sign-in returns to the app": page.url.rstrip("/").endswith(str(PORT)),
+            "user chip shows the account": SMOKE_USER in await page.inner_text("#userChip"),
+            "admin tab visible to an admin":
+                await page.locator("#adminTabBtn:not(.hidden)").count() == 1,
             "answer rendered": await page.locator(".msg.assistant .body table").count() == 1,
             "citation chips": await page.locator(".msg.assistant .cite").count() >= 3,
             "thinking shown": "Checking the corpus map" in await page.inner_text(".think"),
@@ -231,6 +265,50 @@ async def main() -> int:
         checks["drawer opens from citation"] = await page.locator("#drawer.open").count() == 1
         checks["drawer has text"] = len(await page.inner_text("#drawerText")) > 50
         await page.screenshot(path="/tmp/ask-drawer.png", full_page=True)
+        await page.keyboard.press("Escape")
+
+        # Admin tab: keys, accounts, storage, audit all render from live data.
+        await page.click('button[data-tab="admin"]')
+        await page.wait_for_timeout(1500)
+        checks["admin: storage areas listed"] = await page.locator("#usageLegend span").count() >= 5
+        checks["admin: corpus folder listed"] = await page.locator("#rootList .rowitem").count() >= 1
+        checks["admin: own account listed"] = SMOKE_USER in await page.inner_text("#userList")
+        checks["admin: audit rows present"] = await page.locator("#auditTable tbody tr").count() >= 1
+        checks["admin: key notice when none stored"] = (
+            await page.locator("#keyList .notice").count() == 1
+        )
+        await page.screenshot(path="/tmp/admin.png", full_page=True)
+
+        # Store a (fake) API key through the UI and confirm it is masked.
+        await page.fill("#keyLabel", "smoke-key")
+        await page.fill("#keyValue", "sk-ant-api03-uismoke-" + "x" * 40)
+        await page.click("#addKeyBtn")
+        await page.wait_for_timeout(1200)
+        key_text = await page.inner_text("#keyList")
+        checks["admin: key stored and masked"] = "smoke-key" in key_text and "xxxx" in key_text
+        checks["admin: plaintext key not shown"] = "sk-ant-api03-uismoke" not in key_text
+        await page.screenshot(path="/tmp/admin-key.png", full_page=True)
+
+        # Upload an archive through the drop zone and watch it extract + ingest.
+        await page.click('button[data-tab="corpus"]')
+        await page.wait_for_timeout(500)
+        await page.set_input_files("#fileInput", {
+            "name": "smoke-upload.zip",
+            "mimeType": "application/zip",
+            "buffer": _smoke_zip(),
+        })
+        try:
+            await page.wait_for_function(
+                "() => document.getElementById('archiveList').textContent.includes('smoke-upload')",
+                timeout=45_000,
+            )
+            checks["upload: archive appears in the list"] = True
+        except Exception:  # noqa: BLE001
+            checks["upload: archive appears in the list"] = False
+        await page.wait_for_timeout(3000)
+        archive_text = await page.inner_text("#archiveList")
+        checks["upload: archive reports extracted files"] = "files" in archive_text
+        await page.screenshot(path="/tmp/corpus-upload.png", full_page=True)
 
         for name, ok in checks.items():
             print(f"  {'PASS' if ok else 'FAIL'}  {name}")
@@ -239,7 +317,8 @@ async def main() -> int:
         await browser.close()
 
     print("\nJS problems:", problems or "none")
-    print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png")
+    print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
+          "/tmp/admin-key.png /tmp/corpus-upload.png")
     return 1 if problems else 0
 
 

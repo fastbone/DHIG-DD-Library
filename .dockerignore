@@ -1,0 +1,16 @@
+.git
+.gitignore
+data/
+sample-dataroom/
+corpus/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
