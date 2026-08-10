@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · DD Library</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Crect x='9' y='8' width='4' height='16' rx='1' fill='white'/%3E%3Crect x='16' y='8' width='4' height='16' rx='1' fill='white' opacity='.65'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="centered">
+
+<main class="auth-card">
+  <div class="brand big">
+    <span class="mark"></span>
+    <span>DD&nbsp;Library</span>
+  </div>
+
+  <div id="bootstrapNote" class="notice hidden">
+    <strong>First run.</strong> No accounts exist yet — the account you create here becomes the
+    administrator.
+  </div>
+
+  <form id="authForm">
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required
+             spellcheck="false" autocapitalize="none">
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <div class="field hidden" id="confirmField">
+      <label for="confirm">Confirm password</label>
+      <input id="confirm" type="password" autocomplete="new-password">
+    </div>
+    <div id="authError" class="notice err hidden"></div>
+    <button type="submit" class="primary wide" id="submitBtn">Sign in</button>
+  </form>
+
+  <p class="muted small footnote">
+    Sessions are server-side and revocable. This app has no password reset — an administrator
+    resets passwords from the Admin tab, and
+    <code>DD_ADMIN_USER</code>&nbsp;/&nbsp;<code>DD_ADMIN_PASSWORD</code> plus
+    <code>DD_ADMIN_RESET_PASSWORD=1</code> recovers a locked-out administrator on restart.
+  </p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let mode = "login";
+
+function fail(message) {
+  const box = $("authError");
+  box.textContent = message;
+  box.classList.remove("hidden");
+}
+
+async function init() {
+  try {
+    const res = await fetch("/api/session");
+    const info = await res.json();
+    if (info.authenticated) { location.replace("/"); return; }
+    if (info.needs_bootstrap) {
+      mode = "bootstrap";
+      $("bootstrapNote").classList.remove("hidden");
+      $("confirmField").classList.remove("hidden");
+      $("password").autocomplete = "new-password";
+      $("submitBtn").textContent = "Create administrator";
+      document.title = "Set up · DD Library";
+    }
+  } catch (e) {
+    fail("Cannot reach the server.");
+  }
+  $("username").focus();
+}
+
+$("authForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("authError").classList.add("hidden");
+  const username = $("username").value.trim();
+  const password = $("password").value;
+  if (mode === "bootstrap") {
+    if (password.length < 8) return fail("Choose a password of at least 8 characters.");
+    if (password !== $("confirm").value) return fail("The passwords do not match.");
+  }
+  $("submitBtn").disabled = true;
+  try {
+    const res = await fetch(mode === "bootstrap" ? "/api/bootstrap" : "/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.detail || res.statusText);
+    location.replace("/");
+  } catch (err) {
+    fail(err.message);
+    $("submitBtn").disabled = false;
+    $("password").value = "";
+    $("password").focus();
+  }
+});
+
+init();
+</script>
+</body>
+</html>

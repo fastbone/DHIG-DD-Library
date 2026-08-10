@@ -130,6 +130,76 @@ CREATE TABLE IF NOT EXISTS artifacts (
     qa_id       TEXT,
     created_at  REAL NOT NULL
 );
+
+-- --- accounts and access ------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'analyst',   -- admin | analyst
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    created_by    TEXT,
+    last_login_at REAL,
+    must_change_password INTEGER NOT NULL DEFAULT 0
+);
+
+-- Sessions are stored by token digest, so the table cannot be replayed.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash   TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    csrf         TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    user_agent   TEXT,
+    ip           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- Anthropic API keys, encrypted with the instance key (see security.py).
+CREATE TABLE IF NOT EXISTS api_keys (
+    id             TEXT PRIMARY KEY,
+    label          TEXT NOT NULL,
+    nonce          BLOB NOT NULL,
+    ciphertext     BLOB NOT NULL,
+    last4          TEXT NOT NULL,
+    is_active      INTEGER NOT NULL DEFAULT 0,
+    created_at     REAL NOT NULL,
+    created_by     TEXT,
+    last_used_at   REAL,
+    last_test_at   REAL,
+    last_test_ok   INTEGER,
+    last_test_note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS archives (
+    id            TEXT PRIMARY KEY,
+    filename      TEXT NOT NULL,
+    stored_path   TEXT NOT NULL,
+    extract_dir   TEXT,
+    size_bytes    INTEGER NOT NULL,
+    sha256        TEXT,
+    n_files       INTEGER DEFAULT 0,
+    n_skipped     INTEGER DEFAULT 0,
+    bytes_written INTEGER DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'uploaded',  -- uploaded|extracting|extracted|failed
+    error         TEXT,
+    uploaded_by   TEXT,
+    created_at    REAL NOT NULL,
+    extracted_at  REAL
+);
+
+CREATE TABLE IF NOT EXISTS audit (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    actor   TEXT,
+    action  TEXT NOT NULL,
+    detail  TEXT,
+    ip      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);
 """
 
 
@@ -289,3 +359,17 @@ def job(job_id: str) -> dict | None:
 
 def recent_jobs(limit: int = 10) -> list[dict]:
     return [dict(r) for r in rows("SELECT * FROM jobs ORDER BY started_at DESC LIMIT ?", (limit,))]
+
+
+# --- audit ---------------------------------------------------------------
+
+
+def audit(action: str, actor: str | None = None, detail: str | None = None, ip: str | None = None) -> None:
+    execute(
+        "INSERT INTO audit(ts, actor, action, detail, ip) VALUES(?,?,?,?,?)",
+        (time.time(), actor, action, detail, ip),
+    )
+
+
+def recent_audit(limit: int = 200) -> list[dict]:
+    return [dict(r) for r in rows("SELECT * FROM audit ORDER BY ts DESC LIMIT ?", (limit,))]

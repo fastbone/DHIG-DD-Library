@@ -19,6 +19,7 @@
     <code id="corpusRoot">not set</code>
   </div>
   <div class="pills" id="headPills"></div>
+  <span class="userchip" id="userChip"></span>
   <button class="ghost" id="themeToggle" title="Toggle theme">◐</button>
 </header>
 
@@ -27,6 +28,7 @@
   <button data-tab="sweep">Indexing</button>
   <button data-tab="ask">Ask</button>
   <button data-tab="deliverables">Deliverables</button>
+  <button data-tab="admin" id="adminTabBtn" class="hidden">Admin</button>
 </nav>
 
 <main>
@@ -58,6 +60,26 @@
           <div class="progress"><div class="bar" id="ingestBar"></div></div>
           <div class="progress-meta"><span id="ingestMeta"></span><button class="link" id="ingestCancel">cancel</button></div>
         </div>
+
+        <h3>Upload an archive</h3>
+        <div class="dropzone" id="dropzone">
+          <div class="big">Drop a .zip here, or click to choose</div>
+          <div class="muted small" id="dropHint">extracted into the data folder, then indexed</div>
+          <input type="file" id="fileInput" class="hidden" accept=".zip,.tar,.gz,.tgz,.bz2,.xz">
+        </div>
+        <div class="row wrap gap" style="margin-top:10px">
+          <label class="check"><input type="checkbox" id="autoExtract" checked> extract on upload</label>
+          <label class="check"><input type="checkbox" id="autoIngest" checked> ingest after extracting</label>
+        </div>
+        <div id="uploadProgress" class="progress-wrap hidden">
+          <div class="progress"><div class="bar" id="uploadBar"></div></div>
+          <div class="progress-meta"><span id="uploadMeta"></span></div>
+        </div>
+        <div id="extractProgress" class="progress-wrap hidden">
+          <div class="progress"><div class="bar" id="extractBar"></div></div>
+          <div class="progress-meta"><span id="extractMeta"></span><button class="link" id="extractCancel">cancel</button></div>
+        </div>
+        <div id="archiveList" class="rowlist" style="margin-top:12px"></div>
       </div>
 
       <div class="card">
@@ -217,6 +239,78 @@
       <div class="card-head"><h2>Question log</h2>
         <span class="muted small">every question, its citations and its cost — the audit trail</span></div>
       <div id="qaLog" class="qa-log"></div>
+    </div>
+  </section>
+
+  <!-- ─────────────── ADMIN ─────────────── -->
+  <section id="tab-admin" class="tab">
+    <div class="admin-grid">
+      <div class="card">
+        <div class="card-head"><h2>API keys</h2><span class="muted small" id="keySource"></span></div>
+        <p class="muted small">
+          Stored encrypted with the instance key and never returned to the browser. One key is
+          active at a time; with none stored the app falls back to <code>ANTHROPIC_API_KEY</code>.
+        </p>
+        <div class="row wrap gap">
+          <input id="keyLabel" type="text" placeholder="label (e.g. deal-kestrel)" style="width:170px">
+          <input id="keyValue" type="password" placeholder="sk-ant-…" style="flex:1;min-width:180px"
+                 autocomplete="off" spellcheck="false">
+          <button class="primary" id="addKeyBtn">Add</button>
+        </div>
+        <div id="keyList" class="rowlist" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Accounts</h2><span class="muted small" id="accountCount"></span></div>
+        <div class="row wrap gap">
+          <input id="newUsername" type="text" placeholder="username" style="width:150px"
+                 spellcheck="false" autocapitalize="none">
+          <input id="newPassword" type="password" placeholder="password (min 8)" style="width:170px"
+                 autocomplete="new-password">
+          <select id="newRole"><option value="analyst">analyst</option><option value="admin">admin</option></select>
+          <button class="primary" id="addUserBtn">Create</button>
+        </div>
+        <div id="userList" class="rowlist" style="margin-top:12px"></div>
+        <h3>Your password</h3>
+        <div class="row wrap gap">
+          <input id="curPassword" type="password" placeholder="current" style="width:150px" autocomplete="current-password">
+          <input id="nextPassword" type="password" placeholder="new (min 8)" style="width:150px" autocomplete="new-password">
+          <button class="ghost" id="changePwBtn">Change</button>
+        </div>
+        <p class="muted small">Changing your password signs out every session, including this one.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Data folder</h2><span class="muted small" id="dataDirPath"></span></div>
+        <div class="usage-bar" id="usageBar"></div>
+        <div class="usage-legend" id="usageLegend"></div>
+        <h3>Corpus folders</h3>
+        <div id="rootList" class="rowlist"></div>
+        <h3>Reclaim space</h3>
+        <div class="row wrap gap">
+          <button class="ghost" data-op="clear_artifacts">Delete generated documents</button>
+          <button class="ghost" data-op="vacuum">Vacuum database</button>
+          <button class="ghost" data-op="purge_missing">Purge missing files</button>
+          <button class="danger" data-op="clear_cards">Clear catalogue cards</button>
+          <button class="danger" data-op="reset_index">Reset index</button>
+        </div>
+        <p class="muted small" id="storageNote">
+          None of these touch your original documents. “Clear catalogue cards” keeps the extracted
+          text and requires a new sweep; “Reset index” drops the text mirror too and requires a
+          full re-ingest.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Audit log</h2>
+          <button class="ghost" id="refreshAudit">refresh</button></div>
+        <div class="table-scroll" style="max-height:420px">
+          <table class="audit-table" id="auditTable">
+            <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </section>
 </main>

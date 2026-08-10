@@ -2,6 +2,14 @@
 data/
 sample-dataroom/
 
+# compose bind-mount target: keep the folder, ignore whatever is dropped in it
+corpus/*
+!corpus/.gitkeep
+
+# update.sh state: rollback pointer and pre-update snapshots. The snapshots
+# contain secret.key and the encrypted API keys — never commit them.
+.deploy/
+
 __pycache__/
 *.py[cod]
 .venv/

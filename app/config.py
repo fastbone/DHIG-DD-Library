@@ -59,8 +59,33 @@ class Settings:
 
     max_file_mb: int = _env_int("DD_MAX_FILE_MB", 256)
 
+    # --- accounts ---
+    session_ttl_hours: int = _env_int("DD_SESSION_TTL_HOURS", 12)
+    login_max_attempts: int = _env_int("DD_LOGIN_MAX_ATTEMPTS", 8)
+    login_lockout_s: int = _env_int("DD_LOGIN_LOCKOUT_SECONDS", 300)
+    # "auto" (the default) marks the session cookie Secure when the request
+    # itself arrived over HTTPS, which behind a trusted proxy means when
+    # X-Forwarded-Proto says https. Getting this wrong either way is a silent
+    # failure — a Secure cookie on http:// is dropped by the browser, so login
+    # appears to succeed and every later request is 401 — so deriving it beats
+    # asking every deployment to remember. "1"/"0" force it.
+    cookie_secure: str = os.environ.get("DD_COOKIE_SECURE", "auto").strip().lower()
+
+    # --- archive upload / extraction limits ---
+    max_upload_mb: int = _env_int("DD_MAX_UPLOAD_MB", 4096)
+    max_extract_gb: int = _env_int("DD_MAX_EXTRACT_GB", 20)
+    max_archive_members: int = _env_int("DD_MAX_ARCHIVE_MEMBERS", 100_000)
+    max_compression_ratio: int = _env_int("DD_MAX_COMPRESSION_RATIO", 200)
+
     def __post_init__(self) -> None:
-        for d in (self.data_dir, self.derived_dir, self.artifacts_dir):
+        for d in (
+            self.data_dir,
+            self.derived_dir,
+            self.artifacts_dir,
+            self.uploads_dir,
+            self.archives_dir,
+            self.extract_root,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
     # --- derived paths ---------------------------------------------------
@@ -77,8 +102,50 @@ class Settings:
         return self.data_dir / "artifacts"
 
     @property
+    def uploads_dir(self) -> Path:
+        return self.data_dir / "uploads"
+
+    @property
+    def archives_dir(self) -> Path:
+        """Uploaded archives, kept so an extraction can be repeated or audited."""
+        return self.uploads_dir / "archives"
+
+    @property
+    def extract_root(self) -> Path:
+        """Where uploaded archives are expanded. A corpus root may live here."""
+        return self.uploads_dir / "extracted"
+
+    @property
     def state_path(self) -> Path:
         return self.data_dir / "settings.json"
+
+    @property
+    def browse_roots(self) -> list[Path]:
+        """Directories the folder picker may descend into.
+
+        Deliberately narrow: without this the picker is a filesystem browser for
+        anyone who can reach the app. Override with DD_BROWSE_ROOTS (os.pathsep
+        separated).
+        """
+        raw = os.environ.get("DD_BROWSE_ROOTS")
+        if raw:
+            roots = [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+        else:
+            roots = [self.extract_root]
+            for candidate in (Path("/corpus"), Path.home() / "corpus", Path.cwd()):
+                if candidate.is_dir():
+                    roots.append(candidate)
+            if self.corpus_root:
+                roots.append(self.corpus_root)
+        seen: list[Path] = []
+        for r in roots:
+            try:
+                resolved = r.resolve()
+            except OSError:
+                continue
+            if resolved.is_dir() and resolved not in seen:
+                seen.append(resolved)
+        return seen
 
     def text_path(self, doc_id: str) -> Path:
         return self.derived_dir / f"{doc_id}.md"
@@ -106,8 +173,24 @@ class Settings:
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_dir():
             raise ValueError(f"not a directory: {resolved}")
-        self._write_state({"corpus_root": str(resolved)})
+        # Remember every root we have pointed at, so the storage panel can list
+        # a folder that was ingested earlier and is no longer active.
+        history = [h for h in self.root_history if h != str(resolved)]
+        history.insert(0, str(resolved))
+        self._write_state({"corpus_root": str(resolved), "root_history": history[:20]})
         return resolved
+
+    def clear_corpus_root(self) -> None:
+        self._write_state({"corpus_root": None})
+
+    @property
+    def root_history(self) -> list[str]:
+        value = self._state().get("root_history") or []
+        return [v for v in value if isinstance(v, str)]
+
+    def forget_root(self, path: str) -> None:
+        target = str(Path(path).expanduser().resolve())
+        self._write_state({"root_history": [h for h in self.root_history if h != target]})
 
     def has_api_key(self) -> bool:
         """True when the SDK will find credentials: env var, or an `ant auth login` profile."""
@@ -115,7 +198,13 @@ class Settings:
             return True
         cfg = Path(os.environ.get("ANTHROPIC_CONFIG_DIR", Path.home() / ".config" / "anthropic"))
         creds = cfg / "credentials"
-        return creds.is_dir() and any(creds.glob("*.json"))
+        try:
+            return creds.is_dir() and any(creds.glob("*.json"))
+        except OSError:
+            # An unreadable home directory is a deployment quirk, not a reason to
+            # refuse to start: a container can be handed a home it cannot stat.
+            # Keys stored in the app still work.
+            return False
 
 
 settings = Settings()

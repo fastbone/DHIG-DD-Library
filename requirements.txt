@@ -2,6 +2,8 @@ anthropic>=0.121.0
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
+python-multipart>=0.0.9   # multipart archive upload
+cryptography>=41         # AES-GCM for API keys at rest
 
 # extraction
 pymupdf>=1.24          # PDF text + optional OCR textpage

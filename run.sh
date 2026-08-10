@@ -10,7 +10,8 @@ cd "$(dirname "$0")"
 if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
   if ! compgen -G "${ANTHROPIC_CONFIG_DIR:-$HOME/.config/anthropic}/credentials/*.json" > /dev/null; then
     echo "warning: no Anthropic credentials found." >&2
-    echo "         Ingest and search work; indexing and Ask need ANTHROPIC_API_KEY." >&2
+    echo "         Ingest and search work; indexing and Ask need a key — add one in" >&2
+    echo "         Admin -> API keys, or set ANTHROPIC_API_KEY." >&2
   fi
 fi
 

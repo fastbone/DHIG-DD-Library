@@ -22,7 +22,7 @@ from typing import AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from . import db, docgen, manifest, pricing, tools, verify
+from . import credentials, db, docgen, manifest, pricing, tools, verify
 from .config import settings
 from .events import broker
 
@@ -153,7 +153,7 @@ async def ask(
     messages: list[dict] = list(history or [])
     messages.append({"role": "user", "content": question})
 
-    client = AsyncAnthropic()
+    client = credentials.get_client()
     tool_trace: list[dict] = []
     final_text = ""
     artifacts: list[dict] = []

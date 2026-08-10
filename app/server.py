@@ -1,19 +1,36 @@
-"""FastAPI application: REST + SSE, serving the single-page web UI."""
+"""FastAPI application: REST + SSE, serving the single-page web UI.
+
+Access control is enforced in one place — the middleware below — so a new route
+is protected by default rather than by remembering to add a dependency. Admin
+routes additionally declare `Depends(auth.require_admin)`.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import agent, db, extract, ingest, manifest, pricing, search
+from . import (
+    agent,
+    auth,
+    credentials,
+    db,
+    extract,
+    ingest,
+    manifest,
+    pricing,
+    search,
+    security,
+    storage,
+    uploads,
+)
 from .config import SUPPORTED_EXTS, WORKSTREAMS, settings
 from .events import broker, sse
 
@@ -21,16 +38,58 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 JOBS: dict[str, object] = {}
 
+# Reachable without a session. Everything else needs one.
+PUBLIC_PATHS = {
+    "/login", "/login.js", "/styles.css", "/app.js", "/favicon.ico",
+    "/api/session", "/api/login", "/api/bootstrap", "/api/health",
+}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
     broker.bind_loop(asyncio.get_running_loop())
-    broker.log("Server ready.")
+    auth.bootstrap()
+    storage.housekeeping()
+    if security.secret_key_source() == "file":
+        broker.log(
+            "DD_SECRET_KEY is not set — using data/secret.key. Set it explicitly in production; "
+            "losing it makes stored API keys undecryptable.",
+            level="warn",
+        )
+    broker.log(
+        f"Server ready · {auth.user_count()} account(s) · credentials: {credentials.source()}"
+    )
     yield
 
 
-app = FastAPI(title="DD Library", lifespan=lifespan)
+app = FastAPI(title="DD Library", lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def access_control(request: Request, call_next):
+    path = request.url.path
+    request.state.user = None
+
+    if path not in PUBLIC_PATHS and not path.startswith("/api/bootstrap"):
+        user = await asyncio.to_thread(auth.session_user, request)
+        request.state.user = user
+        if user is None:
+            if path.startswith("/api/"):
+                return JSONResponse({"error": "authentication required"}, status_code=401)
+            return RedirectResponse("/login", status_code=302)
+        # CSRF: a cookie alone must not be enough to change state.
+        if request.method not in SAFE_METHODS:
+            sent = request.headers.get("x-csrf-token", "")
+            if not security.constant_time_equals(sent, user.get("csrf", "")):
+                return JSONResponse({"error": "CSRF token missing or invalid"}, status_code=403)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 @app.exception_handler(Exception)
@@ -39,21 +98,219 @@ async def unhandled(request: Request, exc: Exception):
     return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
 
+def actor(request: Request) -> str | None:
+    user = getattr(request.state, "user", None)
+    return user.get("username") if user else None
+
+
+# --- session / accounts --------------------------------------------------
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True, "accounts": auth.user_count()}
+
+
+@app.get("/api/session")
+async def session_info(request: Request):
+    """Public: tells the login page whether to offer first-run setup."""
+    user = await asyncio.to_thread(auth.session_user, request)
+    return {
+        "authenticated": user is not None,
+        "needs_bootstrap": auth.user_count() == 0,
+        "user": {k: user[k] for k in ("username", "role", "csrf", "must_change_password")}
+        if user else None,
+    }
+
+
+@app.post("/api/login")
+async def login(body: LoginBody, request: Request):
+    token, user = await asyncio.to_thread(auth.login, body.username, body.password, request)
+    response = JSONResponse({"user": {k: user[k] for k in ("username", "role", "csrf")}})
+    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs(request))
+    return response
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    auth.logout(request.cookies.get(auth.COOKIE_NAME), actor=actor(request))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
+
+
+@app.post("/api/bootstrap")
+async def bootstrap(body: LoginBody, request: Request):
+    """Create the first administrator. Only available while no accounts exist."""
+    if auth.user_count() > 0:
+        raise HTTPException(409, "accounts already exist — sign in instead")
+    try:
+        user = await asyncio.to_thread(
+            auth.create_user, body.username, body.password, "admin", created_by="first-run"
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    broker.log(f"First administrator {user['username']!r} created.", level="success")
+    token, logged_in = await asyncio.to_thread(auth.login, body.username, body.password, request)
+    response = JSONResponse({"user": {k: logged_in[k] for k in ("username", "role", "csrf")}})
+    response.set_cookie(auth.COOKIE_NAME, token, **auth.cookie_kwargs(request))
+    return response
+
+
+class PasswordBody(BaseModel):
+    current_password: str | None = None
+    new_password: str = Field(min_length=8)
+
+
+@app.post("/api/me/password")
+async def change_own_password(body: PasswordBody, request: Request):
+    user = auth.require_user(request)
+    stored = db.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+    if not security.verify_password(body.current_password or "", stored["password_hash"]):
+        raise HTTPException(403, "current password is incorrect")
+    await asyncio.to_thread(
+        auth.set_password, user["username"], body.new_password, actor=user["username"]
+    )
+    response = JSONResponse({"ok": True, "note": "signed out of all sessions"})
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
+
+
+class UserBody(BaseModel):
+    username: str
+    password: str = Field(min_length=8)
+    role: str = "analyst"
+
+
+@app.get("/api/users")
+async def list_users(_: dict = Depends(auth.require_admin)):
+    return {"users": auth.list_users(), "roles": list(auth.ROLES)}
+
+
+@app.post("/api/users")
+async def create_user(body: UserBody, request: Request, admin: dict = Depends(auth.require_admin)):
+    try:
+        user = await asyncio.to_thread(
+            auth.create_user, body.username, body.password, body.role,
+            created_by=admin["username"], must_change_password=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"user": user}
+
+
+class UserPatch(BaseModel):
+    role: str | None = None
+    disabled: bool | None = None
+    password: str | None = None
+
+
+@app.post("/api/users/{username}")
+async def patch_user(username: str, body: UserPatch, admin: dict = Depends(auth.require_admin)):
+    try:
+        if body.password:
+            await asyncio.to_thread(
+                auth.set_password, username, body.password, actor=admin["username"]
+            )
+        user = await asyncio.to_thread(
+            auth.update_user, username, role=body.role, disabled=body.disabled,
+            actor=admin["username"],
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"user": user}
+
+
+@app.delete("/api/users/{username}")
+async def remove_user(username: str, admin: dict = Depends(auth.require_admin)):
+    if username.strip().lower() == admin["username"]:
+        raise HTTPException(400, "you cannot delete your own account")
+    try:
+        await asyncio.to_thread(auth.delete_user, username, actor=admin["username"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"deleted": username}
+
+
+# --- API keys ------------------------------------------------------------
+
+
+class KeyBody(BaseModel):
+    label: str = "default"
+    key: str
+    activate: bool = True
+
+
+@app.get("/api/keys")
+async def list_keys(_: dict = Depends(auth.require_admin)):
+    return {
+        "keys": credentials.list_keys(),
+        "source": credentials.source(),
+        "env_key_present": settings.has_api_key(),
+        "secret_key_source": security.secret_key_source(),
+    }
+
+
+@app.post("/api/keys")
+async def add_key(body: KeyBody, admin: dict = Depends(auth.require_admin)):
+    try:
+        key = credentials.add_key(
+            body.label, body.key, actor=admin["username"], activate=body.activate
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"key": key, "source": credentials.source()}
+
+
+@app.post("/api/keys/{key_id}/activate")
+async def activate_key(key_id: str, admin: dict = Depends(auth.require_admin)):
+    try:
+        return {"key": credentials.set_active(key_id, actor=admin["username"])}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/keys/{key_id}/test")
+async def test_key(key_id: str, admin: dict = Depends(auth.require_admin)):
+    try:
+        return await credentials.test_key(key_id, actor=admin["username"])
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/keys/test-active")
+async def test_active_key(admin: dict = Depends(auth.require_admin)):
+    if not credentials.available():
+        raise HTTPException(400, "no credentials configured")
+    return await credentials.test_key(None, actor=admin["username"])
+
+
+@app.delete("/api/keys/{key_id}")
+async def delete_key(key_id: str, admin: dict = Depends(auth.require_admin)):
+    try:
+        credentials.delete_key(key_id, actor=admin["username"])
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"deleted": key_id, "source": credentials.source()}
+
+
 # --- status / config -----------------------------------------------------
 
 
 @app.get("/api/status")
-async def status():
-    running = {
-        k: {"id": k, "kind": getattr(v, "id", k).split("-")[0],
-            "done": getattr(v, "done", 0), "total": getattr(v, "total", 0),
-            "failed": getattr(v, "failed", 0)}
-        for k, v in JOBS.items()
-    }
+async def status(request: Request):
+    user = auth.require_user(request)
     m = manifest.build()
     return {
+        "user": {k: user[k] for k in ("username", "role", "csrf", "must_change_password")},
         "corpus_root": str(settings.corpus_root) if settings.corpus_root else None,
-        "has_api_key": settings.has_api_key(),
+        "credentials": credentials.source(),
+        "has_api_key": credentials.available(),
         "models": {
             "analyst": settings.analyst_model,
             "carder": settings.carder_model,
@@ -63,6 +320,8 @@ async def status():
         "python_tool": settings.enable_python_tool,
         "ocr": settings.ocr_enabled,
         "supported_extensions": sorted(SUPPORTED_EXTS),
+        "archive_extensions": list(uploads.ARCHIVE_SUFFIXES),
+        "max_upload_mb": settings.max_upload_mb,
         "workstreams": WORKSTREAMS,
         "stats": search.stats(),
         "manifest": {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed")},
@@ -71,7 +330,11 @@ async def status():
             * pricing.CACHE_READ_MULTIPLIER / 1_000_000,
             4,
         ),
-        "jobs_running": running,
+        "jobs_running": {
+            k: {"id": k, "kind": k.split("-")[0], "done": getattr(v, "done", 0),
+                "total": getattr(v, "total", 0), "failed": getattr(v, "failed", 0)}
+            for k, v in JOBS.items()
+        },
         "recent_jobs": db.recent_jobs(8),
         "lifetime_usage": pricing.lifetime.snapshot(),
     }
@@ -81,39 +344,85 @@ class RootBody(BaseModel):
     path: str
 
 
-@app.post("/api/corpus-root")
-async def set_root(body: RootBody):
+def permitted_dir(raw: str) -> Path:
+    """Resolve a caller-supplied directory, refusing anything outside the roots.
+
+    Every route that takes a filesystem path from the browser goes through here.
+    Without it, a signed-in user could point the indexer at any directory the
+    service account can read — /etc, another tenant's data room, the host's home
+    — and then read the extracted text and download the originals through the
+    ordinary document routes. The roots are operator-configured
+    (``DD_BROWSE_ROOTS``), which is the same fence the folder picker honours.
+    """
+    roots = settings.browse_roots
+    if not roots:
+        raise HTTPException(400, "no browsable roots configured (set DD_BROWSE_ROOTS)")
+    target = Path(raw).expanduser()
     try:
-        resolved = settings.set_corpus_root(body.path)
+        resolved = target.resolve()
+    except OSError as exc:
+        raise HTTPException(400, f"cannot resolve path: {raw}") from exc
+    if not any(resolved == r or security.is_within(resolved, r) for r in roots):
+        raise HTTPException(
+            403,
+            "path is outside the permitted roots: " + ", ".join(str(r) for r in roots),
+        )
+    if not resolved.is_dir():
+        raise HTTPException(400, f"not a directory: {resolved}")
+    return resolved
+
+
+@app.post("/api/corpus-root")
+async def set_root(body: RootBody, request: Request):
+    try:
+        resolved = settings.set_corpus_root(str(permitted_dir(body.path)))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    db.audit("corpus.set_root", actor=actor(request), detail=str(resolved))
     broker.log(f"Corpus root set to {resolved}")
     return {"corpus_root": str(resolved)}
 
 
 @app.get("/api/browse")
-async def browse(path: str = Query("/")):
-    """Minimal directory picker for the ingest form."""
-    p = Path(path).expanduser()
-    if not p.is_dir():
-        p = p.parent if p.parent.is_dir() else Path.home()
+async def browse(path: str = Query(""), _: dict = Depends(auth.require_admin)):
+    """Folder picker, restricted to the configured browse roots."""
+    roots = settings.browse_roots
+    if not roots:
+        raise HTTPException(400, "no browsable roots configured (set DD_BROWSE_ROOTS)")
+    if not path:
+        return {
+            "path": "", "parent": "", "roots": [str(r) for r in roots],
+            "dirs": [{"name": str(r), "path": str(r)} for r in roots],
+            "supported_files_here": {},
+        }
+    target = Path(path).expanduser()
+    if not any(security.is_within(target, r) or target.resolve() == r for r in roots):
+        raise HTTPException(403, "path is outside the permitted roots")
+    if not target.is_dir():
+        raise HTTPException(400, "not a directory")
+
     try:
         entries = sorted(
-            (c for c in p.iterdir() if c.is_dir() and not c.name.startswith(".")),
+            (c for c in target.iterdir() if c.is_dir() and not c.name.startswith(".")),
             key=lambda c: c.name.lower(),
         )[:400]
     except PermissionError:
         entries = []
     counts: dict[str, int] = {}
     try:
-        for c in p.iterdir():
+        for c in target.iterdir():
             if c.is_file() and c.suffix.lower() in SUPPORTED_EXTS:
                 counts[c.suffix.lower()] = counts.get(c.suffix.lower(), 0) + 1
     except PermissionError:
         pass
+    resolved = target.resolve()
+    parent = str(resolved.parent) if any(
+        security.is_within(resolved.parent, r) or resolved.parent == r for r in roots
+    ) else ""
     return {
-        "path": str(p.resolve()),
-        "parent": str(p.resolve().parent),
+        "path": str(resolved),
+        "parent": parent,
+        "roots": [str(r) for r in roots],
         "dirs": [{"name": c.name, "path": str(c.resolve())} for c in entries],
         "supported_files_here": counts,
     }
@@ -128,15 +437,19 @@ class IngestBody(BaseModel):
 
 
 @app.post("/api/ingest")
-async def start_ingest(body: IngestBody):
-    root = Path(body.path).expanduser().resolve() if body.path else settings.corpus_root
-    if root is None:
-        raise HTTPException(400, "no corpus root set")
-    if not root.is_dir():
-        raise HTTPException(400, f"not a directory: {root}")
+async def start_ingest(body: IngestBody, request: Request):
+    if body.path:
+        root = permitted_dir(body.path)
+    else:
+        root = settings.corpus_root
+        if root is None:
+            raise HTTPException(400, "no corpus root set")
+        if not root.is_dir():
+            raise HTTPException(400, f"not a directory: {root}")
     if any(k.startswith("ingest-") for k in JOBS):
         raise HTTPException(409, "an ingest job is already running")
     settings.set_corpus_root(str(root))
+    db.audit("ingest.start", actor=actor(request), detail=str(root))
     job = ingest.IngestJob(root, ocr=body.ocr or settings.ocr_enabled)
     JOBS[job.id] = job
 
@@ -156,13 +469,14 @@ class SweepBody(BaseModel):
 
 
 @app.post("/api/sweep")
-async def start_sweep(body: SweepBody):
-    if not settings.has_api_key():
-        raise HTTPException(400, "no Anthropic credentials found (set ANTHROPIC_API_KEY)")
+async def start_sweep(body: SweepBody, request: Request):
+    if not credentials.available():
+        raise HTTPException(400, "no API key configured — add one under Admin → API keys")
     if any(k.startswith("sweep-") for k in JOBS):
         raise HTTPException(409, "a sweep is already running")
     job = manifest.SweepJob(redo=body.redo)
     JOBS[job.id] = job
+    db.audit("sweep.start", actor=actor(request), detail=f"redo={body.redo}")
 
     async def runner():
         try:
@@ -175,21 +489,127 @@ async def start_sweep(body: SweepBody):
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(job_id: str, request: Request):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "job not running")
     job.cancel.set()  # type: ignore[attr-defined]
+    db.audit("job.cancel", actor=actor(request), detail=job_id)
     broker.log(f"Cancelling {job_id} …", level="warn")
     return {"cancelling": job_id}
 
 
 @app.post("/api/dedupe")
-async def rerun_dedupe():
+async def rerun_dedupe(request: Request):
     result = await asyncio.to_thread(ingest.mark_duplicates)
     manifest.invalidate_manifest()
+    db.audit("corpus.dedupe", actor=actor(request), detail=json.dumps(result))
     broker.publish("stats_dirty")
     return result
+
+
+# --- uploads -------------------------------------------------------------
+
+
+@app.get("/api/archives")
+async def list_archives():
+    return {
+        "archives": uploads.list_archives(),
+        "accepted": list(uploads.ARCHIVE_SUFFIXES),
+        "max_upload_mb": settings.max_upload_mb,
+        "extract_root": str(settings.extract_root),
+    }
+
+
+@app.post("/api/archives")
+async def upload_archive(
+    request: Request,
+    file: UploadFile = File(...),
+    auto_extract: bool = Form(True),
+    auto_ingest: bool = Form(False),
+):
+    try:
+        arc = await uploads.save_upload(file, actor=actor(request))
+    except uploads.UnsafeArchive as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    job_id = None
+    if auto_extract:
+        job_id = _start_extract(arc["id"], then_ingest=auto_ingest, actor=actor(request))
+    return {"archive": arc, "job_id": job_id}
+
+
+def _start_extract(archive_id: str, *, then_ingest: bool, actor: str | None) -> str:
+    if any(k.startswith("extract-") for k in JOBS):
+        raise HTTPException(409, "another extraction is already running")
+    job = uploads.ExtractJob(archive_id, actor=actor)
+    JOBS[job.id] = job
+
+    async def runner():
+        try:
+            await job.run(then_ingest=then_ingest)
+        finally:
+            JOBS.pop(job.id, None)
+
+    asyncio.create_task(runner())
+    return job.id
+
+
+class ExtractBody(BaseModel):
+    auto_ingest: bool = False
+
+
+@app.post("/api/archives/{archive_id}/extract")
+async def extract_archive(archive_id: str, body: ExtractBody, request: Request):
+    if uploads.get_archive(archive_id) is None:
+        raise HTTPException(404, "no such archive")
+    return {"job_id": _start_extract(archive_id, then_ingest=body.auto_ingest,
+                                     actor=actor(request))}
+
+
+@app.delete("/api/archives/{archive_id}")
+async def delete_archive(archive_id: str, request: Request, drop_extracted: bool = False):
+    try:
+        return uploads.delete_archive(
+            archive_id, drop_extracted=drop_extracted, actor=actor(request)
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+# --- storage -------------------------------------------------------------
+
+
+@app.get("/api/storage")
+async def storage_usage(_: dict = Depends(auth.require_admin)):
+    return await asyncio.to_thread(storage.usage)
+
+
+@app.post("/api/storage/{operation}")
+async def storage_operation(operation: str, admin: dict = Depends(auth.require_admin)):
+    op = storage.OPERATIONS.get(operation)
+    if op is None:
+        raise HTTPException(404, f"unknown operation (have: {', '.join(storage.OPERATIONS)})")
+    return await asyncio.to_thread(op, actor=admin["username"])
+
+
+class PathBody(BaseModel):
+    path: str
+
+
+@app.post("/api/storage/extracted/delete")
+async def delete_extracted(body: PathBody, admin: dict = Depends(auth.require_admin)):
+    try:
+        return await asyncio.to_thread(
+            storage.delete_extracted, body.path, actor=admin["username"]
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/audit")
+async def audit_log(limit: int = 200, _: dict = Depends(auth.require_admin)):
+    return {"entries": db.recent_audit(min(limit, 1000))}
 
 
 # --- events (SSE) --------------------------------------------------------
@@ -274,10 +694,11 @@ async def document_text(doc_id: str, start: int = 0, chars: int = 20_000, anchor
 
 
 @app.get("/api/documents/{doc_id}/original")
-async def document_original(doc_id: str):
+async def document_original(doc_id: str, request: Request):
     row = db.one("SELECT abs_path, filename FROM documents WHERE id=?", (doc_id,))
     if row is None or not Path(row["abs_path"]).exists():
         raise HTTPException(404, "original not available")
+    db.audit("document.download", actor=actor(request), detail=row["filename"])
     return FileResponse(row["abs_path"], filename=row["filename"])
 
 
@@ -306,9 +727,10 @@ class AskBody(BaseModel):
 
 
 @app.post("/api/ask")
-async def ask(body: AskBody):
-    if not settings.has_api_key():
-        raise HTTPException(400, "no Anthropic credentials found (set ANTHROPIC_API_KEY)")
+async def ask(body: AskBody, request: Request):
+    if not credentials.available():
+        raise HTTPException(400, "no API key configured — add one under Admin → API keys")
+    db.audit("ask", actor=actor(request), detail=body.question[:300])
 
     async def gen():
         async for event in agent.ask(
@@ -364,18 +786,37 @@ async def download(artifact_id: str):
     return FileResponse(row["path"], filename=row["filename"])
 
 
-# --- static -------------------------------------------------------------
+# --- pages --------------------------------------------------------------
+
+
+@app.get("/login")
+async def login_page():
+    return FileResponse(WEB_DIR / "login.html")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(WEB_DIR / "index.html")
+
 
 if WEB_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+    app.mount("/", StaticFiles(directory=str(WEB_DIR)), name="web")
 
 
 def main() -> None:
+    import os
+
     import uvicorn
 
-    host = __import__("os").environ.get("DD_HOST", "127.0.0.1")
-    port = int(__import__("os").environ.get("DD_PORT", "8000"))
-    uvicorn.run("app.server:app", host=host, port=port, reload=False, log_level="info")
+    uvicorn.run(
+        "app.server:app",
+        host=os.environ.get("DD_HOST", "127.0.0.1"),
+        port=int(os.environ.get("DD_PORT", "8000")),
+        reload=False,
+        log_level=os.environ.get("DD_LOG_LEVEL", "info"),
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get("DD_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+    )
 
 
 if __name__ == "__main__":
