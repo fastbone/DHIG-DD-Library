@@ -191,8 +191,14 @@ def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
         params += [nonce, ciphertext, fields["secret"].strip()[-4:]]
     if fields.get("site_url"):
         graph.split_site_url(fields["site_url"])
-        # The library lives on the site, so a new URL invalidates the drive id.
-        sets.append("drive_id=NULL")
+    # The drive id is what rclone actually mirrors, and site URL + library are the
+    # two things that identify it. Change either and the stored id is stale, so it
+    # is discarded and the next sync re-resolves. Presence, not truthiness:
+    # clearing the library back to the site default is exactly such a change, and
+    # leaving the id in place would go on mirroring the previous library while the
+    # UI showed the new one — wrong data rather than an error.
+    if any(f in fields and fields[f] is not None for f in ("site_url", "library")):
+        sets += ["drive_id=NULL", "drive_name=NULL"]
     if not sets:
         return get(conn_id)
     params.append(conn_id)

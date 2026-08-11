@@ -95,8 +95,11 @@ class GraphStub(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         p = self.path
         if p.endswith("/drives"):
-            self._send(200, {"value": [{"id": "drv-1", "name": "Documents",
-                                        "driveType": "documentLibrary"}]})
+            # Two libraries, so selecting one by name is a real choice.
+            self._send(200, {"value": [
+                {"id": "drv-1", "name": "Documents", "driveType": "documentLibrary"},
+                {"id": "drv-dd", "name": "DD Room", "driveType": "documentLibrary"},
+            ]})
         elif "/root" in p:
             self._send(200, {"id": "root", "name": "root", "size": 1024,
                              "folder": {"childCount": 4}})
@@ -156,9 +159,30 @@ async def main() -> int:
     # a connection pointed at a named library can never be pointed back.
     sync.update(cid, library="DD Room")
     check("a named library is stored", sync.get(cid)["library"] == "DD Room")
+    # The drive id is what actually gets mirrored, so pointing the connection at a
+    # different library has to discard it — otherwise the next sync keeps mirroring
+    # the old drive while the UI shows the new library.
+    check("naming a different library discards the resolved drive",
+          sync.get(cid)["drive_id"] is None, sync.get(cid)["drive_id"])
+    await sync.test(cid)  # re-resolve, and against the named library this time
+    check("re-testing resolves the named library's own drive",
+          sync.get(cid)["drive_id"] == "drv-dd", sync.get(cid)["drive_id"])
     sync.update(cid, library="")
     check("an empty library clears back to the default", sync.get(cid)["library"] is None,
           sync.get(cid)["library"])
+    check("clearing the library also discards the resolved drive",
+          sync.get(cid)["drive_id"] is None, sync.get(cid)["drive_id"])
+    await sync.test(cid)
+    sync.update(cid, site_url="https://contoso.sharepoint.com/sites/Other")
+    check("a new site URL discards the resolved drive too",
+          sync.get(cid)["drive_id"] is None, sync.get(cid)["drive_id"])
+    sync.update(cid, site_url=SITE)
+    await sync.test(cid)
+    # Only the two fields that identify the drive invalidate it; everything else
+    # must leave it resolved, or every edit would cost a Graph round trip.
+    sync.update(cid, label="DD Room", interval_minutes=0, mirror_deletions=True)
+    check("an edit that does not touch site or library keeps the resolved drive",
+          sync.get(cid)["drive_id"] == "drv-1", sync.get(cid)["drive_id"])
     for field in ("label", "site_url", "tenant", "client_id"):
         try:
             sync.update(cid, **{field: "   "})

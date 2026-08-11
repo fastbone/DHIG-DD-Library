@@ -447,7 +447,7 @@ network — each uses its own temporary data directory.
 
 ```bash
 python3 tools/api_smoke.py            # 80 checks: auth, CSRF, keys, uploads, sync, storage, audit
-python3 tools/sync_smoke.py           # 50 checks: connected libraries, end to end
+python3 tools/sync_smoke.py           # 55 checks: connected libraries, end to end
 python3 tools/ui_smoke.py             # 34 checks: the browser front end, end to end
 tools/container_check.sh              # 7 checks: the container's runtime constraints
 ```
