@@ -527,7 +527,7 @@ network — each uses its own temporary data directory.
 
 ```bash
 python3 tools/api_smoke.py            # 89 checks: auth, CSRF, keys, uploads, access, sync, storage
-python3 tools/sync_smoke.py           # 65 checks: connected libraries, end to end
+python3 tools/sync_smoke.py           # 68 checks: connected libraries, end to end
 python3 tools/ui_smoke.py             # 36 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```

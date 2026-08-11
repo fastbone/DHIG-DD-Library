@@ -319,6 +319,7 @@ async def main() -> int:
     # preflight runs before any progress is published, so a hang there is the
     # least visible way for a job to wedge — and it holds the one-sync-at-a-time
     # lock while it does.
+    before_cancel = sync.get(cid)
     scenario(FAKE_RCLONE_MODE="hangsize")
     job = sync.SyncJob(cid)
     runner = asyncio.create_task(job.run(then_ingest=False))
@@ -330,6 +331,18 @@ async def main() -> int:
     except asyncio.TimeoutError:
         check("a sync cancelled during the preflight stops promptly", False,
               "still running after 20s")
+    # It must not fall through into the transfer, and — since it never measured
+    # the library — it must not overwrite what the last good sync recorded.
+    check("cancelling mid-listing transfers nothing", job.done == 0, f"done={job.done}")
+    after_cancel = sync.get(cid)
+    check("cancelling mid-listing keeps the recorded library size",
+          after_cancel["n_files"] == before_cancel["n_files"]
+          and after_cancel["bytes_total"] == before_cancel["bytes_total"],
+          f"{before_cancel['n_files']}/{before_cancel['bytes_total']} became "
+          f"{after_cancel['n_files']}/{after_cancel['bytes_total']}")
+    check("and keeps the last successful sync time",
+          after_cancel["last_sync_at"] == before_cancel["last_sync_at"],
+          f"{before_cancel['last_sync_at']} became {after_cancel['last_sync_at']}")
 
     scenario(FAKE_RCLONE_MODE="badauth")
     job = sync.SyncJob(cid)

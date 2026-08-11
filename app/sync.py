@@ -326,6 +326,9 @@ class SyncJob:
         # done/bytes_done, which count only what this run transferred.
         self.library_files = 0
         self.library_bytes = 0
+        # True once the preflight has actually measured the library. Until then
+        # library_files/bytes are placeholders that must not reach the row.
+        self.library_measured = False
         self.mirror: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._error_tail: list[str] = []
@@ -533,6 +536,7 @@ class SyncJob:
         # the library's real size rather than "0 files".
         self.library_files = count
         self.library_bytes = remote_bytes
+        self.library_measured = True
         broker.log(
             f"{count} file(s), {remote_bytes / 1e9:.2f} GB in the library · "
             f"{held / 1e9:.2f} GB already mirrored · {free / 1e9:.1f} GB free."
@@ -571,6 +575,11 @@ class SyncJob:
             mirror.mkdir(parents=True, exist_ok=True)
             env = self._env(row, secret)
             await self._preflight(row, env, mirror)
+            if self.cancel.is_set():
+                # Cancelled while listing. Stop here rather than falling through
+                # and starting a transfer nobody asked to continue.
+                await self._finish(row, "cancelled", started, then_ingest=False)
+                return
 
             verb = "sync" if row["mirror_deletions"] else "copy"
             args = [
@@ -611,13 +620,24 @@ class SyncJob:
         # n_files / bytes_total describe the library, not this run: an incremental
         # sync that transfers nothing would otherwise store zeros and the UI would
         # report a healthy connection as "0 files".
-        db.execute(
-            "UPDATE sync_connections SET status=?, error=NULL, last_sync_at=?,"
-            " last_sync_seconds=?, n_files=?, n_deleted=?, bytes_total=? WHERE id=?",
-            ("ok" if status == "ok" else "failed" if status == "failed" else "ok",
-             time.time(), elapsed, self.library_files, self.deleted, self.library_bytes,
-             self.conn_id),
-        )
+        #
+        # And only when this run actually measured them. A run cancelled during
+        # the listing has no figures, and writing its zeros would throw away what
+        # the last good sync knew — the same "0 files" bug by another route.
+        new_status = "ok" if status == "ok" else "failed" if status == "failed" else "ok"
+        if self.library_measured:
+            db.execute(
+                "UPDATE sync_connections SET status=?, error=NULL, last_sync_at=?,"
+                " last_sync_seconds=?, n_files=?, n_deleted=?, bytes_total=? WHERE id=?",
+                (new_status, time.time(), elapsed, self.library_files, self.deleted,
+                 self.library_bytes, self.conn_id),
+            )
+        else:
+            db.execute(
+                "UPDATE sync_connections SET status=?, error=NULL, last_sync_seconds=?"
+                " WHERE id=?",
+                (new_status, elapsed, self.conn_id),
+            )
         size = (f"{self.bytes_done / 1e9:.2f} GB" if self.bytes_done >= 1e9
                 else f"{self.bytes_done / 1e6:.1f} MB")
         msg = (
