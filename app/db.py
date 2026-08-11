@@ -431,7 +431,45 @@ def recent_audit(limit: int = 200) -> list[dict]:
 # --- activity log --------------------------------------------------------
 
 LOG_LEVELS = ("info", "success", "warn", "error")
+LOG_CONTEXT_MAX = 20_000
 _log_writes = 0
+
+
+def _log_context_json(context: dict) -> str:
+    """Serialise a context object, shrinking the *object* if it is too large.
+
+    Slicing the serialised JSON instead would cut mid-string and store something
+    unparseable, and an unparseable context is worse than a shortened one: on read
+    it degrades to an opaque blob, losing the traceback and the path list at
+    exactly the moment a bug report needs them. So oversize values are trimmed
+    individually — with a marker saying so — and the result is always valid JSON.
+    """
+    payload = json.dumps(context, default=str)
+    if len(payload) <= LOG_CONTEXT_MAX:
+        return payload
+
+    # Budget per value, so one enormous field cannot crowd out the rest.
+    budget = max(400, LOG_CONTEXT_MAX // max(len(context), 1))
+    shrunk: dict = {}
+    for key, value in context.items():
+        if isinstance(value, str) and len(value) > budget:
+            shrunk[key] = value[:budget] + f"… [{len(value) - budget} more characters]"
+        elif isinstance(value, list):
+            kept = [str(v)[:400] for v in value[:100]]
+            if len(value) > 100:
+                kept.append(f"… [{len(value) - 100} more]")
+            shrunk[key] = kept
+        else:
+            shrunk[key] = value
+    payload = json.dumps(shrunk, default=str)
+    if len(payload) <= LOG_CONTEXT_MAX:
+        return payload
+    # Still too big: keep the keys and say what was dropped, rather than storing
+    # something that will not parse.
+    return json.dumps(
+        {"truncated": True, "keys": sorted(context), "note":
+         f"context exceeded {LOG_CONTEXT_MAX} characters and was not stored"}
+    )
 
 
 def log_record(
@@ -451,7 +489,7 @@ def log_record(
     global _log_writes
 
     try:
-        payload = json.dumps(context, default=str)[:20_000] if context else None
+        payload = _log_context_json(context) if context else None
         cur = execute(
             "INSERT INTO logs(ts, level, source, message, context, job_id) VALUES(?,?,?,?,?,?)",
             (time.time(), level if level in LOG_LEVELS else "info", source,
@@ -488,9 +526,15 @@ def log_query(
     source: str | None = None,
     query: str | None = None,
     before_id: int | None = None,
+    after_id: int | None = None,
     limit: int = 200,
 ) -> list[dict]:
-    """Newest first. `before_id` pages backwards through the history."""
+    """Newest first.
+
+    ``before_id`` pages backwards through the history; ``after_id`` fetches only
+    what is newer than a line the caller already holds, which is how a browser
+    fills the gap after its event stream dropped and reconnected.
+    """
     where = ["1=1"]
     params: list = []
     wanted = [lv for lv in (levels or []) if lv in LOG_LEVELS]
@@ -506,6 +550,9 @@ def log_query(
     if before_id:
         where.append("id < ?")
         params.append(before_id)
+    if after_id:
+        where.append("id > ?")
+        params.append(after_id)
     params.append(max(1, min(limit, 2000)))
     out: list[dict] = []
     for r in rows(

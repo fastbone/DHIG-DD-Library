@@ -207,8 +207,16 @@ function renderBars(target, pairs) {
 
 /* ── live events ─────────────────────────────────────────────────────── */
 let statsTimer = null;
+let eventsOpenedOnce = false;
 function connectEvents() {
   const src = new EventSource("/api/events");
+  src.onopen = () => {
+    // Log lines are not replayed on the stream — history is a query — so a
+    // reconnect has to fetch whatever was written while it was down. The first
+    // open needs nothing: boot already loaded the log.
+    if (eventsOpenedOnce) catchUpLog();
+    eventsOpenedOnce = true;
+  };
   src.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
@@ -324,13 +332,27 @@ function renderLogCounts() {
   }
 }
 
+const logNewestId = () =>
+  logState.entries.reduce((n, e) => (e.id != null && e.id > n ? e.id : n), 0);
+
+/* The paging cursor is derived from what is actually on screen, never from what
+   was fetched. Trimming to LOG_MAX can discard part of a page, and a cursor that
+   advanced past discarded rows would make every further click page over history
+   nobody ever saw. */
+function syncOldestId() {
+  const ids = logState.entries.map((e) => e.id).filter((n) => n != null);
+  logState.oldestId = ids.length ? Math.min(...ids) : null;
+}
+
 async function loadLog({ older = false } = {}) {
   try {
     const qs = logQueryString(older ? { before_id: logState.oldestId, limit: 200 } : { limit: 300 });
     const r = await api(`/api/logs?${qs}`);
     const fetched = (r.entries || []).slice().reverse();   // server sends newest first
     if (older) {
-      logState.entries = fetched.concat(logState.entries).slice(-LOG_MAX);
+      // Trim from the newest end, not the oldest: the click asked to see further
+      // back, so that is the end worth keeping.
+      logState.entries = fetched.concat(logState.entries).slice(0, LOG_MAX);
     } else {
       // A line can arrive over SSE while this request is in flight. Every stored
       // line carries its row id, so anything already held that the query did not
@@ -341,13 +363,7 @@ async function loadLog({ older = false } = {}) {
       const live = logState.entries.filter((e) => (e.id ?? Infinity) > newest && !seen.has(e.id));
       logState.entries = fetched.concat(live);
     }
-    const ids = fetched.map((e) => e.id).filter((n) => n != null);
-    if (ids.length) {
-      const lowest = Math.min(...ids);
-      logState.oldestId = older ? Math.min(logState.oldestId ?? lowest, lowest) : lowest;
-    } else if (!older) {
-      logState.oldestId = null;
-    }
+    syncOldestId();
     logState.counts = r.counts;
     renderLogCounts();
     renderLog({ keepScroll: older });
@@ -358,6 +374,29 @@ async function loadLog({ older = false } = {}) {
   } catch (e) {
     $("logHint").textContent = `could not load the log: ${e.message}`;
   }
+}
+
+/* Called when the event stream reconnects. Lines written while it was down were
+   never streamed and are not replayed, so without this they would stay invisible
+   until a filter change or a reload — a failure disappearing from a live view is
+   the one thing this panel exists to prevent. Only what is newer than the newest
+   line held is fetched, so the view (including any "load older" pages) survives. */
+async function catchUpLog() {
+  const after = logNewestId();
+  if (!after) return loadLog();
+  try {
+    const LIMIT = 300;
+    const r = await api(`/api/logs?${logQueryString({ after_id: after, limit: LIMIT })}`);
+    const fetched = (r.entries || []).slice().reverse();
+    // A full page back means the gap may be longer than one page; a plain reload
+    // is then both simpler and correct.
+    if (fetched.length >= LIMIT) return loadLog();
+    for (const ev of fetched) appendLog(ev);
+    // After the appends, not before: appendLog adjusts the counts itself, so
+    // overwriting them first would count the caught-up lines twice.
+    logState.counts = r.counts;
+    renderLogCounts();
+  } catch { /* the next reconnect tries again */ }
 }
 
 function appendLog(ev) {

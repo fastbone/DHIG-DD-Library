@@ -891,12 +891,13 @@ async def logs(
     source: str | None = None,
     q: str | None = None,
     before_id: int | None = None,
+    after_id: int | None = None,
     limit: int = 200,
 ):
     return {
         "entries": db.log_query(
             levels=_log_levels(levels), source=source, query=q,
-            before_id=before_id, limit=limit,
+            before_id=before_id, after_id=after_id, limit=limit,
         ),
         "counts": db.log_counts(),
         "retention": settings.log_retention,

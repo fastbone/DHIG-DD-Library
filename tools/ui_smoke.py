@@ -459,6 +459,35 @@ async def main() -> int:
         checks["log: clearing is offered to an admin"] = (
             await page.locator("#logClear:not(.hidden)").count() == 1
         )
+
+        # The reconnect gap. Written straight to the table, deliberately bypassing
+        # the broker, so nothing is streamed — exactly the state of a line written
+        # while the event stream was down. Log lines are not replayed on reconnect,
+        # so catchUpLog is what has to find it.
+        await page.fill("#logSearch", "")
+        await page.wait_for_timeout(500)
+        db.log_record("error", "written while the stream was down", source="sync")
+        before_gap = await page.inner_text("#log")
+        await page.evaluate("() => catchUpLog()")
+        await page.wait_for_timeout(500)
+        after_gap = await page.inner_text("#log")
+        checks["log: a reconnect picks up lines written while the stream was down"] = (
+            "written while the stream was down" not in before_gap
+            and "written while the stream was down" in after_gap
+        )
+        checks["log: catching up does not duplicate lines already shown"] = (
+            after_gap.count("quarterly_pack.pdf: FileDataError") == 1
+        )
+        # The paging cursor must describe what is on screen. It once advanced to a
+        # page that trimming had discarded, so every further click paged over
+        # history nobody had seen.
+        cursor_ok = await page.evaluate(
+            """() => {
+                 const ids = logState.entries.map(e => e.id).filter(n => n != null);
+                 return !ids.length || logState.oldestId === Math.min(...ids);
+               }"""
+        )
+        checks["log: the paging cursor matches the oldest line displayed"] = cursor_ok
         await page.fill("#logSearch", "")
         await page.wait_for_timeout(500)
         await page.screenshot(path="/tmp/sweep-log.png", full_page=True)

@@ -401,26 +401,30 @@ def main() -> int:
     print("\n— spreadsheets are routed by content, not by extension —")
     # The end-to-end half: a genuine Excel 97-2003 workbook indexed through the
     # normal ingest path, with a figure only that workbook contains.
+    # Searched by content unique to the legacy workbook. Deliberately not by
+    # filename: the .xls and the .xlsx fixture are byte-identical, so which of the
+    # two names ends up canonical is a race between concurrent extract workers —
+    # the document is the content, and either name reaches it.
     code, body, _ = admin.get("/api/search?q=%22previous+ledger+system%22")
-    check("a legacy .xls is indexed and searchable",
-          code == 200 and any("legacy_working_file" in h["rel_path"] for h in body["hits"]),
-          str(body)[:200])
-    code, body, _ = admin.get("/api/documents?query=legacy_working_file")
-    legacy_doc = next((d for d in body["documents"] if "legacy_working_file" in d["rel_path"]), None)
-    if legacy_doc:
-        code, card, _ = admin.get(f"/api/documents/{legacy_doc['id']}")
+    hit = next(iter(body.get("hits", [])), None) if code == 200 else None
+    check("a legacy .xls is indexed and searchable", hit is not None, str(body)[:200])
+    if hit:
+        code, card, _ = admin.get(f"/api/documents/{hit['doc_id']}")
         anchors = [a["anchor"] for a in card.get("anchors", [])]
         # Same anchor shape as a modern workbook, so a citation into a legacy file
         # resolves identically.
         check("legacy sheets get sheet-range anchors",
               anchors and all("!" in a and ":" in a for a in anchors), str(anchors))
-        # Identical bytes filed under a second name collapse to one document.
-        check("the same workbook named .xlsx collapses onto the same document",
-              any("mislabelled_legacy.xlsx" in p for p in card.get("identical_copies_at", [])),
-              str(card.get("identical_copies_at")))
+        # Identical bytes filed under two names collapse to one content-addressed
+        # document that knows both paths.
+        filed_at = {card.get("rel_path"), *card.get("identical_copies_at", [])}
+        check("the same workbook under both names collapses onto one document",
+              any("legacy_working_file.xls" in p for p in filed_at)
+              and any("mislabelled_legacy.xlsx" in p for p in filed_at),
+              str(sorted(filed_at)))
     else:
-        check("legacy sheets get sheet-range anchors", False, "legacy document not indexed")
-        check("the same workbook named .xlsx collapses onto the same document", False, "missing")
+        check("legacy sheets get sheet-range anchors", False, "legacy content not indexed")
+        check("the same workbook under both names collapses onto one document", False, "missing")
 
     # The routing half, in process: every name/content combination, including the
     # ones dedupe hides above.
@@ -736,6 +740,48 @@ def main() -> int:
     check("the source filter narrows to one subsystem",
           code == 200 and body["entries"] and all(e["source"] == "ingest" for e in body["entries"]),
           str({e["source"] for e in body.get("entries", [])}))
+
+    # Paging cursors. after_id is what a browser uses to fill the gap after its
+    # event stream dropped: lines written while it was down are never streamed, so
+    # without it a failure stays invisible until a reload.
+    newest_id = entries[0]["id"]
+    code, body, _ = admin.get(f"/api/logs?after_id={newest_id - 3}")
+    check("after_id returns only newer lines",
+          code == 200 and body["entries"] and all(e["id"] > newest_id - 3 for e in body["entries"]),
+          str([e["id"] for e in body.get("entries", [])])[:120])
+    code, body, _ = admin.get(f"/api/logs?before_id={newest_id}")
+    check("before_id pages backwards",
+          code == 200 and all(e["id"] < newest_id for e in body["entries"]),
+          str([e["id"] for e in body.get("entries", [])])[:120])
+    code, body, _ = admin.get(f"/api/logs?after_id={newest_id}")
+    check("after_id at the newest line returns nothing rather than everything",
+          code == 200 and body["entries"] == [], f"{len(body.get('entries', []))} entries")
+
+    # An oversize context must shrink as an *object*. Slicing the serialised JSON
+    # would cut mid-string, and an unparseable context degrades to an opaque blob —
+    # losing the traceback exactly when a bug report needs it.
+    from app import db as _db
+
+    _db.log_record(
+        "error", "oversize context probe", source="ingest",
+        context={
+            "rel_path": "deep/folder/enormous.pdf",
+            "traceback": "Traceback (most recent call last):\n" + "  File 'x.py', line 1\n" * 3000,
+            "paths": [f"/corpus/f{i}/document {i}.pdf" for i in range(500)],
+        },
+    )
+    code, body, _ = admin.get("/api/logs?q=oversize%20context%20probe")
+    probe = (body.get("entries") or [{}])[0]
+    ctx = probe.get("context")
+    check("an oversize context is still stored as parseable structure",
+          isinstance(ctx, dict) and "raw" not in ctx
+          and ctx.get("rel_path") == "deep/folder/enormous.pdf",
+          str(ctx)[:200])
+    check("an oversize context keeps a usable prefix of each field",
+          isinstance(ctx, dict)
+          and str(ctx.get("traceback", "")).startswith("Traceback (most recent call last)")
+          and 0 < len(ctx.get("paths") or []) < 500,
+          str({k: str(v)[:40] for k, v in (ctx or {}).items()}))
 
     code, report, _ = admin.get("/api/logs/export?levels=error")
     check("the log exports as plain text", code == 200 and isinstance(report, str), f"got {code}")
