@@ -304,6 +304,12 @@ def _xls_cell(sh, row: int, col: int, datemode: int) -> str:
             stamp = xlrd.xldate_as_datetime(value, datemode)
         except (ValueError, OverflowError, xlrd.XLDateError):
             return _cell(value)
+        # A serial below 1 is a time of day with no date part — an `hh:mm` cell.
+        # xldate_as_datetime lands those on the epoch day, so rendering the whole
+        # timestamp turns a shift start of 15:00 into "1899-12-31 15:00:00", which
+        # is precisely the invented figure this branch exists to prevent.
+        if 0 <= float(value) < 1:
+            return stamp.strftime("%H:%M:%S" if stamp.second else "%H:%M")
         # A serial with no time component is a plain date; keep it short.
         if (stamp.hour, stamp.minute, stamp.second) == (0, 0, 0):
             return stamp.date().isoformat()

@@ -450,6 +450,15 @@ def main() -> int:
     text, _ = _extract.extract_spreadsheet(probe_dir / "legacy_working_file.xls")
     check("the legacy mirror discloses that formulas are unrecoverable",
           "formulas are not recoverable" in text, text[:160])
+    # BIFF gives a time-only cell the same type as a date, and the serial lands on
+    # the epoch day, so a 15:00 cut-off renders as "1899-12-31 15:00:00" unless the
+    # date part is checked. An invented timestamp in a mirror gets quoted as fact.
+    check("a time-only cell renders as a time, not an 1899 timestamp",
+          "15:00" in text and "1899" not in text,
+          next((ln for ln in text.splitlines() if "Cut-off" in ln), "row missing"))
+    check("dates in a legacy workbook render as ISO dates, not serial numbers",
+          "2023-03-14" in text and "44999" not in text,
+          next((ln for ln in text.splitlines() if "Ledger closed" in ln), "row missing"))
 
     payload, ctype = multipart({"auto_extract": "false"}, "notes.txt", b"not an archive")
     code, body, _ = admin.post("/api/archives", payload, raw=True, content_type=ctype)
