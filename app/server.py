@@ -9,11 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -84,6 +92,13 @@ async def scheduler() -> None:
 async def lifespan(app: FastAPI):
     db.init()
     broker.bind_loop(asyncio.get_running_loop())
+    # Persist log lines as well as streaming them. Registered here rather than
+    # imported inside events.py, which stays dependency-free — and registered
+    # after db.init() so the first line has a table to land in.
+    broker.sink = lambda ev: db.log_record(
+        ev["level"], ev["message"], source=ev.get("source"),
+        context=ev.get("context"), job_id=ev.get("job_id"),
+    )
     auth.bootstrap()
     storage.housekeeping()
     sync.reset_interrupted()
@@ -133,7 +148,18 @@ async def access_control(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
-    broker.log(f"{request.url.path}: {type(exc).__name__}: {exc}", level="error")
+    broker.log(
+        f"{request.url.path}: {type(exc).__name__}: {exc}",
+        level="error",
+        source="server",
+        context={
+            "method": request.method,
+            "path": str(request.url.path),
+            "query": str(request.url.query) or None,
+            "exc_type": type(exc).__name__,
+            "traceback": traceback.format_exc(limit=12),
+        },
+    )
     return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
 
@@ -844,6 +870,126 @@ async def audit_log(limit: int = 200, _: dict = Depends(auth.require_admin)):
     return {"entries": db.recent_audit(min(limit, 1000))}
 
 
+# --- activity log -------------------------------------------------------
+#
+# The live SSE feed is a ring buffer in memory: the one failure worth reporting
+# scrolls past, and a restart loses it. These routes read the persisted copy, so
+# a sweep's errors can still be found — and exported — an hour and a restart
+# later.
+
+
+def _log_levels(levels: str | None) -> list[str]:
+    """Parse `levels=error,warn`. Empty or unrecognised means "everything"."""
+    if not levels:
+        return []
+    return [lv for lv in (s.strip().lower() for s in levels.split(",")) if lv in db.LOG_LEVELS]
+
+
+@app.get("/api/logs")
+async def logs(
+    levels: str | None = None,
+    source: str | None = None,
+    q: str | None = None,
+    before_id: int | None = None,
+    after_id: int | None = None,
+    limit: int = 200,
+):
+    return {
+        "entries": db.log_query(
+            levels=_log_levels(levels), source=source, query=q,
+            before_id=before_id, after_id=after_id, limit=limit,
+        ),
+        "counts": db.log_counts(),
+        "retention": settings.log_retention,
+    }
+
+
+@app.get("/api/logs/export")
+async def logs_export(
+    levels: str | None = None,
+    source: str | None = None,
+    q: str | None = None,
+    limit: int = 2000,
+):
+    """The same log as a plain-text report, oldest first.
+
+    This is the point of persisting the log: paste the output into a bug report
+    and the reader gets the failing paths, the exception types and the tracebacks
+    rather than a retyped fragment of one line.
+    """
+    wanted = _log_levels(levels)
+    entries = db.log_query(levels=wanted, source=source, query=q, limit=limit)
+    text = _format_log_report(entries, levels=wanted, source=source, query=q)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return PlainTextResponse(
+        text,
+        headers={"Content-Disposition": f'attachment; filename="dd-library-log-{stamp}.txt"'},
+    )
+
+
+def _format_log_report(
+    entries: list[dict], *, levels: list[str], source: str | None, query: str | None
+) -> str:
+    counts = db.log_counts()
+    filters = ", ".join(
+        part for part in [
+            f"levels={'+'.join(levels)}" if levels else "levels=all",
+            f"source={source}" if source else None,
+            f"search={query!r}" if query else None,
+        ] if part
+    )
+    lines = [
+        "DD Library activity log",
+        f"exported   {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())}",
+        f"filter     {filters}",
+        f"matched    {len(entries)} of {counts['total']} kept "
+        f"({counts['error']} error, {counts['warn']} warn, "
+        f"{counts['success']} success, {counts['info']} info)",
+        "",
+        "Oldest first. Indented blocks are the structured context behind a line:",
+        "the path that failed, its size and extension, and the traceback.",
+        "=" * 78,
+        "",
+    ]
+    for e in reversed(entries):  # log_query returns newest first
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
+        head = f"[{stamp}] {e['level'].upper():<7} {e.get('source') or '-'}"
+        if e.get("job_id"):
+            head += f"  job={e['job_id']}"
+        lines.append(head)
+        lines.append(f"  {e['message']}")
+        ctx = e.get("context") or {}
+        for key, value in ctx.items():
+            if key == "traceback":
+                lines.append("    traceback:")
+                lines.extend(f"      {tl}" for tl in str(value).rstrip().splitlines())
+            elif isinstance(value, list):
+                lines.append(f"    {key}: ({len(value)})")
+                lines.extend(f"      - {item}" for item in value[:200])
+                if len(value) > 200:
+                    lines.append(f"      … {len(value) - 200} more")
+            else:
+                lines.append(f"    {key}: {value}")
+        lines.append("")
+    if not entries:
+        lines.append("(nothing matched this filter)")
+    return "\n".join(lines) + "\n"
+
+
+class LogClearBody(BaseModel):
+    levels: list[str] = []
+
+
+@app.post("/api/logs/clear")
+async def logs_clear(
+    body: LogClearBody, request: Request, admin: dict = Depends(auth.require_admin)
+):
+    wanted = [lv for lv in body.levels if lv in db.LOG_LEVELS]
+    removed = db.log_clear(wanted)
+    db.audit("log.clear", actor=actor(request), detail=f"{removed} line(s) {wanted or 'all'}")
+    return {"removed": removed, "counts": db.log_counts()}
+
+
 # --- events (SSE) --------------------------------------------------------
 
 
@@ -854,6 +1000,12 @@ async def events(request: Request):
     async def gen():
         try:
             for past in broker.replay():
+                # Job events are replayed so a page load repaints a running
+                # progress bar. Log lines are not: they are read from the `logs`
+                # table now, and replaying them would double every line the
+                # browser had already fetched — including on every reconnect.
+                if past.get("kind") == "log":
+                    continue
                 yield sse(past)
             yield sse({"kind": "hello"})
             while True:

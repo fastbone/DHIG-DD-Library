@@ -10,6 +10,7 @@ is a behaviour someone could break by accident.
 from __future__ import annotations
 
 import io
+import json
 import os
 import secrets
 import sys
@@ -138,12 +139,64 @@ def _decode(payload: bytes):
         return payload.decode("utf-8", "replace")
 
 
+def _spreadsheet_fixtures() -> dict[str, bytes]:
+    """The four spreadsheet shapes a real data room contains.
+
+    Extensions in a data room lie in both directions, and the app dispatches on
+    the container rather than the name. Each of these went wrong at some point:
+    a legacy workbook reached openpyxl and raised InvalidFileException; a modern
+    workbook named .xls was refused by openpyxl's *extension* check even though
+    its bytes were fine; and a reporting system's HTML table named .xls is not a
+    workbook at all.
+    """
+    import base64
+    import gzip
+
+    from openpyxl import Workbook
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    from make_sample_corpus import _LEGACY_XLS_GZ_B64
+
+    legacy = gzip.decompress(base64.b64decode(_LEGACY_XLS_GZ_B64))
+
+    buf = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Model"
+    ws.append(["Revenue", 412600])
+    ws.append(["EBITDA", 79192])
+    ws.append(["Margin", "=B2/B1"])
+    wb.save(buf)
+    modern = buf.getvalue()
+
+    return {
+        # A genuine Excel 97-2003 workbook, correctly named.
+        "deal/legacy_working_file.xls": legacy,
+        # Modern workbook, wrongly named .xls.
+        "deal/mislabelled_modern.xls": modern,
+        # Legacy workbook, wrongly named .xlsx.
+        "deal/mislabelled_legacy.xlsx": legacy,
+        # An HTML export a reporting system called a spreadsheet.
+        "deal/reporting_export.xls": (
+            "<html><body><table>"
+            "<tr><td>Backlog</td><td>214,000</td></tr>"
+            "</table></body></html>"
+        ).encode(),
+    }
+
+
 def build_zip() -> bytes:
     """A benign archive plus two members that must be refused."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("deal/notes.txt", "Revenue EUR 412.6m in FY2024.\n" * 40)
         zf.writestr("deal/sub/more.md", "# Findings\n\nCustomer concentration 31%.\n" * 20)
+        # A supported extension over bytes that are not a PDF. Ingest must record
+        # it as a failed document and log the failure with enough structure to
+        # report — which is what the activity-log checks below read.
+        zf.writestr("deal/corrupt_scan.pdf", b"%PDF-1.4 truncated before anything useful")
+        for name, content in _spreadsheet_fixtures().items():
+            zf.writestr(name, content)
         zf.writestr("../escape.txt", "should never be written outside the target")
         zf.writestr("/abs.txt", "absolute path, also refused")
     return buf.getvalue()
@@ -344,6 +397,77 @@ def main() -> int:
 
     code, body, _ = admin.get("/api/search?q=revenue")
     check("extracted content is searchable", code == 200 and len(body["hits"]) >= 1, str(body)[:160])
+
+    print("\n— spreadsheets are routed by content, not by extension —")
+    # The end-to-end half: a genuine Excel 97-2003 workbook indexed through the
+    # normal ingest path, with a figure only that workbook contains.
+    # Searched by content unique to the legacy workbook. Deliberately not by
+    # filename: the .xls and the .xlsx fixture are byte-identical, so which of the
+    # two names ends up canonical is a race between concurrent extract workers —
+    # the document is the content, and either name reaches it.
+    code, body, _ = admin.get("/api/search?q=%22previous+ledger+system%22")
+    hit = next(iter(body.get("hits", [])), None) if code == 200 else None
+    check("a legacy .xls is indexed and searchable", hit is not None, str(body)[:200])
+    if hit:
+        code, card, _ = admin.get(f"/api/documents/{hit['doc_id']}")
+        anchors = [a["anchor"] for a in card.get("anchors", [])]
+        # Same anchor shape as a modern workbook, so a citation into a legacy file
+        # resolves identically.
+        check("legacy sheets get sheet-range anchors",
+              anchors and all("!" in a and ":" in a for a in anchors), str(anchors))
+        # Identical bytes filed under two names collapse to one content-addressed
+        # document that knows both paths.
+        filed_at = {card.get("rel_path"), *card.get("identical_copies_at", [])}
+        check("the same workbook under both names collapses onto one document",
+              any("legacy_working_file.xls" in p for p in filed_at)
+              and any("mislabelled_legacy.xlsx" in p for p in filed_at),
+              str(sorted(filed_at)))
+    else:
+        check("legacy sheets get sheet-range anchors", False, "legacy content not indexed")
+        check("the same workbook under both names collapses onto one document", False, "missing")
+
+    # The routing half, in process: every name/content combination, including the
+    # ones dedupe hides above.
+    from app import extract as _extract
+
+    probe_dir = Path(_TMP) / "spreadsheets"
+    probe_dir.mkdir(exist_ok=True)
+    expectations = {
+        # name                            container  must contain
+        "deal/legacy_working_file.xls": ("ole2", "Consolidated P&L"),
+        "deal/mislabelled_modern.xls": ("ooxml", "## formulas"),
+        "deal/mislabelled_legacy.xlsx": ("ole2", "Consolidated P&L"),
+        "deal/reporting_export.xls": ("other", "214,000"),
+    }
+    for name, content in _spreadsheet_fixtures().items():
+        target = probe_dir / Path(name).name
+        target.write_bytes(content)
+        want_container, want_text = expectations[name]
+        got_container = _extract._container(target)
+        try:
+            text, units = _extract.extract_spreadsheet(target)
+        except Exception as exc:  # noqa: BLE001 — the failure is the finding
+            check(f"{target.name} extracts", False, repr(exc))
+            continue
+        check(
+            f"{target.name} is read as {want_container}",
+            got_container == want_container and want_text in text and bool(units),
+            f"container={got_container} units={len(units)} text_ok={want_text in text}",
+        )
+    # A legacy workbook exposes values but never formulas; the mirror has to say
+    # so, or the model reads the absence as "this workbook has no formulas".
+    text, _ = _extract.extract_spreadsheet(probe_dir / "legacy_working_file.xls")
+    check("the legacy mirror discloses that formulas are unrecoverable",
+          "formulas are not recoverable" in text, text[:160])
+    # BIFF gives a time-only cell the same type as a date, and the serial lands on
+    # the epoch day, so a 15:00 cut-off renders as "1899-12-31 15:00:00" unless the
+    # date part is checked. An invented timestamp in a mirror gets quoted as fact.
+    check("a time-only cell renders as a time, not an 1899 timestamp",
+          "15:00" in text and "1899" not in text,
+          next((ln for ln in text.splitlines() if "Cut-off" in ln), "row missing"))
+    check("dates in a legacy workbook render as ISO dates, not serial numbers",
+          "2023-03-14" in text and "44999" not in text,
+          next((ln for ln in text.splitlines() if "Ledger closed" in ln), "row missing"))
 
     payload, ctype = multipart({"auto_extract": "false"}, "notes.txt", b"not an archive")
     code, body, _ = admin.post("/api/archives", payload, raw=True, content_type=ctype)
@@ -564,11 +688,159 @@ def main() -> int:
     code, body, _ = admin.get("/api/status")
     check("the corpus is empty after a reset", body["stats"]["documents"] == 0, str(body["stats"]))
 
+    print("\n— activity log —")
+    # The live SSE feed is a ring buffer, so the point of this table is that a
+    # failure is still there — and still exportable — after it scrolled past.
+    code, body, _ = admin.get("/api/logs?limit=500")
+    entries = body.get("entries", []) if code == 200 else []
+    check("the activity log is persisted and readable", code == 200 and len(entries) > 5,
+          f"got {code} with {len(entries)} entries")
+    check("counts are reported per level",
+          isinstance(body.get("counts"), dict) and "error" in body["counts"], str(body.get("counts")))
+
+    failure = next(
+        (e for e in entries if "corrupt_scan.pdf" in (e.get("message") or "")), None
+    )
+    check("an extraction failure is logged at error level",
+          failure is not None and failure["level"] == "error",
+          str(failure)[:200] if failure else "no line mentions the corrupt file")
+    ctx = (failure or {}).get("context") or {}
+    # The whole reason for the context column: a message says what broke, this says
+    # which file, how big, and where in the code — the difference between a report
+    # someone can act on and a retyped fragment of one line.
+    check("the failure carries the path, extension and traceback",
+          ctx.get("rel_path", "").endswith("corrupt_scan.pdf") and ctx.get("ext") == ".pdf"
+          and "Traceback" in (ctx.get("traceback") or ""),
+          str({k: str(v)[:60] for k, v in ctx.items()}))
+    check("the failure is attributed to a source and a job",
+          failure and failure.get("source") == "ingest" and failure.get("job_id"),
+          str(failure)[:160] if failure else "")
+    check("streamed and stored lines share an id, so the browser can dedupe them",
+          all(e.get("id") for e in entries[:20]), str(entries[:1])[:160])
+
+    code, body, _ = admin.get("/api/logs?levels=error")
+    only_errors = body.get("entries", [])
+    check("the error filter returns errors only",
+          code == 200 and only_errors and all(e["level"] == "error" for e in only_errors),
+          str({e["level"] for e in only_errors}))
+    code, body, _ = admin.get("/api/logs?levels=error,warn")
+    check("the problems filter returns warnings as well as errors",
+          code == 200 and {e["level"] for e in body["entries"]} <= {"error", "warn"},
+          str({e["level"] for e in body.get("entries", [])}))
+    code, body, _ = admin.get("/api/logs?levels=nonsense")
+    check("an unrecognised level is ignored rather than returning nothing",
+          code == 200 and len(body["entries"]) > 5, f"{len(body.get('entries', []))} entries")
+    code, body, _ = admin.get("/api/logs?q=corrupt_scan")
+    check("the text filter narrows to matching lines",
+          code == 200 and body["entries"] and all(
+              "corrupt_scan" in (e["message"] or "") + json.dumps(e["context"] or {})
+              for e in body["entries"]),
+          f"{len(body.get('entries', []))} entries")
+    code, body, _ = admin.get("/api/logs?source=ingest")
+    check("the source filter narrows to one subsystem",
+          code == 200 and body["entries"] and all(e["source"] == "ingest" for e in body["entries"]),
+          str({e["source"] for e in body.get("entries", [])}))
+
+    # Paging cursors. after_id is what a browser uses to fill the gap after its
+    # event stream dropped: lines written while it was down are never streamed, so
+    # without it a failure stays invisible until a reload.
+    newest_id = entries[0]["id"]
+    code, body, _ = admin.get(f"/api/logs?after_id={newest_id - 3}")
+    check("after_id returns only newer lines",
+          code == 200 and body["entries"] and all(e["id"] > newest_id - 3 for e in body["entries"]),
+          str([e["id"] for e in body.get("entries", [])])[:120])
+    code, body, _ = admin.get(f"/api/logs?before_id={newest_id}")
+    check("before_id pages backwards",
+          code == 200 and all(e["id"] < newest_id for e in body["entries"]),
+          str([e["id"] for e in body.get("entries", [])])[:120])
+    code, body, _ = admin.get(f"/api/logs?after_id={newest_id}")
+    check("after_id at the newest line returns nothing rather than everything",
+          code == 200 and body["entries"] == [], f"{len(body.get('entries', []))} entries")
+
+    # An oversize context must shrink as an *object*. Slicing the serialised JSON
+    # would cut mid-string, and an unparseable context degrades to an opaque blob —
+    # losing the traceback exactly when a bug report needs it.
+    from app import db as _db
+
+    # Long paths deliberately: a list capped by item count rather than by
+    # characters passes a short-path test and still blows the column ten times
+    # over, and the fallback for "still too big" is a stub with no traceback in it.
+    _db.log_record(
+        "error", "oversize context probe", source="ingest",
+        context={
+            "rel_path": "deep/folder/enormous.pdf",
+            "traceback": "Traceback (most recent call last):\n" + "  File 'x.py', line 1\n" * 3000,
+            "paths": [
+                f"/corpus/{'deeply_nested_folder_'*8}{i}/Consolidated statements {i}.pdf"
+                for i in range(500)
+            ],
+        },
+    )
+    code, body, _ = admin.get("/api/logs?q=oversize%20context%20probe")
+    probe = (body.get("entries") or [{}])[0]
+    ctx = probe.get("context")
+    check("an oversize context is still stored as parseable structure",
+          isinstance(ctx, dict) and "raw" not in ctx
+          and ctx.get("rel_path") == "deep/folder/enormous.pdf",
+          str(ctx)[:200])
+    check("an oversize context is shortened rather than abandoned",
+          isinstance(ctx, dict) and not ctx.get("truncated")
+          and str(ctx.get("traceback", "")).startswith("Traceback (most recent call last)")
+          and 0 < len(ctx.get("paths") or []) < 500,
+          str({k: str(v)[:40] for k, v in (ctx or {}).items()}))
+    check("an oversize context fits the column it is stored in",
+          isinstance(ctx, dict) and len(json.dumps(ctx)) <= _db.LOG_CONTEXT_MAX,
+          f"{len(json.dumps(ctx)) if isinstance(ctx, dict) else 0} chars")
+    # And the shapes the app really produces are not shortened at all.
+    real_tb = "Traceback (most recent call last):\n" + "  File 'extract.py', line 5\n" * 12
+    _db.log_record("error", "realistic failure probe", source="ingest",
+                   context={"rel_path": "1.1.6/dhig_FinancialStatements.xls", "ext": ".xls",
+                            "size_bytes": 2411520, "exc_type": "InvalidFileException",
+                            "traceback": real_tb})
+    code, body, _ = admin.get("/api/logs?q=realistic%20failure%20probe")
+    real_ctx = (body.get("entries") or [{}])[0].get("context") or {}
+    check("a real extraction context is stored whole, traceback and all",
+          real_ctx.get("traceback") == real_tb and real_ctx.get("size_bytes") == 2411520,
+          str({k: str(v)[:40] for k, v in real_ctx.items()}))
+
+    code, report, _ = admin.get("/api/logs/export?levels=error")
+    check("the log exports as plain text", code == 200 and isinstance(report, str), f"got {code}")
+    if isinstance(report, str):
+        check("the export names its filter and its counts",
+              "DD Library activity log" in report and "levels=error" in report, report[:200])
+        check("the export inlines the traceback, not a JSON blob of one",
+              "corrupt_scan.pdf" in report and "traceback:" in report
+              and "Traceback (most recent call last)" in report,
+              report[:400])
+        check("the export reads oldest first",
+              report.index("Oldest first") < report.index("corrupt_scan.pdf"), "order")
+
+    carol = Client()
+    code, _, _ = admin.post("/api/users",
+                            {"username": "carol", "password": "analyst-pass-7", "role": "analyst"})
+    code, _, _ = carol.post("/api/login", {"username": "carol", "password": "analyst-pass-7"})
+    code, body, _ = carol.get("/api/logs?levels=error")
+    check("an analyst can read the log, so they can report a failure",
+          code == 200 and "entries" in body, f"got {code}")
+    code, body, _ = carol.post("/api/logs/clear", {"levels": []})
+    check("an analyst cannot clear the log", code == 403, f"got {code}")
+
+    before = admin.get("/api/logs")[1]["counts"]
+    code, body, _ = admin.post("/api/logs/clear", {"levels": ["error"]})
+    check("an admin can clear one level", code == 200 and body["removed"] == before["error"],
+          f"removed {body.get('removed')} of {before['error']}")
+    check("clearing errors leaves the rest of the log alone",
+          body["counts"]["error"] == 0 and body["counts"]["info"] == before["info"],
+          str(body.get("counts")))
+    code, body, _ = admin.post("/api/logs/clear", {"levels": []})
+    check("an admin can clear the whole log", code == 200 and body["counts"]["total"] == 0,
+          str(body.get("counts")))
+
     print("\n— audit trail —")
     code, body, _ = admin.get("/api/audit")
     actions = {e["action"] for e in body["entries"]}
     expected = {"login.success", "login.failure", "user.create", "apikey.add", "apikey.delete",
-                "archive.upload", "archive.extract", "storage.reset_index"}
+                "archive.upload", "archive.extract", "storage.reset_index", "log.clear"}
     missing = expected - actions
     check("every privileged action is audited", not missing, f"missing {missing}")
     check("failed logins are audited with the username",

@@ -103,6 +103,10 @@ async function refreshStatus() {
   renderUserChip(s.user);
   $("adminTabBtn").classList.toggle("hidden", s.user?.role !== "admin");
   $("accessQuickBtn").classList.toggle("hidden", s.user?.role !== "admin");
+  // Reading and exporting the log is for anyone signed in — the point is that an
+  // analyst who hits a failure can report it. Deleting it is destructive, so it
+  // matches the route's admin dependency rather than offering a button that 403s.
+  $("logClear").classList.toggle("hidden", s.user?.role !== "admin");
   $("corpusRoot").textContent = s.corpus_root || "not set";
   if (s.corpus_root && !$("ingestPath").value) $("ingestPath").value = s.corpus_root;
   $("carderModel").textContent = s.models.carder;
@@ -203,8 +207,16 @@ function renderBars(target, pairs) {
 
 /* ── live events ─────────────────────────────────────────────────────── */
 let statsTimer = null;
+let eventsOpenedOnce = false;
 function connectEvents() {
   const src = new EventSource("/api/events");
+  src.onopen = () => {
+    // Log lines are not replayed on the stream — history is a query — so a
+    // reconnect has to fetch whatever was written while it was down. The first
+    // open needs nothing: boot already loaded the log.
+    if (eventsOpenedOnce) catchUpLog();
+    eventsOpenedOnce = true;
+  };
   src.onmessage = (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
@@ -220,15 +232,259 @@ function connectEvents() {
   src.onerror = () => { src.close(); setTimeout(connectEvents, 2500); };
 }
 
-function appendLog(ev) {
+/* ── activity log ────────────────────────────────────────────────────── */
+/* The log is persisted server-side, so this view is a query over history rather
+   than a transcript of what happened while the tab was open. Changing a filter
+   re-queries: "errors only" has to reach failures that scrolled past hours ago,
+   which a client-side filter over the live stream cannot do. */
+const logState = { levels: [], source: "", q: "", entries: [], oldestId: null, counts: null };
+const LOG_MAX = 3000;
+
+function logMatches(ev) {
+  if (logState.levels.length && !logState.levels.includes(ev.level || "info")) return false;
+  if (logState.source && (ev.source || "") !== logState.source) return false;
+  if (logState.q) {
+    const hay = `${ev.message || ""} ${ev.context ? JSON.stringify(ev.context) : ""}`;
+    if (!hay.toLowerCase().includes(logState.q.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function logQueryString(extra = {}) {
+  const p = new URLSearchParams();
+  if (logState.levels.length) p.set("levels", logState.levels.join(","));
+  if (logState.source) p.set("source", logState.source);
+  if (logState.q) p.set("q", logState.q);
+  for (const [k, v] of Object.entries(extra)) if (v != null) p.set(k, v);
+  return p.toString();
+}
+
+function contextText(ctx) {
+  // Traceback last and unquoted: it is the part someone reads, and JSON-escaped
+  // newlines make it unreadable in exactly the case that matters.
+  const lines = [];
+  let tb = null;
+  for (const [k, v] of Object.entries(ctx)) {
+    if (k === "traceback") { tb = v; continue; }
+    if (Array.isArray(v)) {
+      lines.push(`${k}: (${v.length})`);
+      v.slice(0, 50).forEach((item) => lines.push(`  - ${item}`));
+      if (v.length > 50) lines.push(`  … ${v.length - 50} more`);
+    } else if (v && typeof v === "object") lines.push(`${k}: ${JSON.stringify(v)}`);
+    else lines.push(`${k}: ${v}`);
+  }
+  if (tb) lines.push("", String(tb).trimEnd());
+  return lines.join("\n");
+}
+
+function logRow(ev) {
+  const level = ev.level || "info";
+  const head = [el("span", "t", clock(ev.ts)), el("span", "m", ev.message)];
+  if (ev.source) head.splice(1, 0, el("span", "src", ev.source));
+  const ctx = ev.context && Object.keys(ev.context).length ? ev.context : null;
+  if (!ctx) {
+    const row = el("div", level);
+    row.append(...head);
+    return row;
+  }
+  const box = el("details", level);
+  const sum = el("summary");
+  sum.append(...head);
+  box.append(sum, el("pre", "ctx", contextText(ctx)));
+  return box;
+}
+
+function renderLog({ keepScroll = false } = {}) {
   const log = $("log");
-  const row = el("div", ev.level || "info");
-  row.append(el("span", "t", clock(ev.ts)), el("span", "m", ev.message));
-  log.append(row);
-  while (log.children.length > 600) log.firstChild.remove();
+  const wasAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const top = log.scrollTop;
+  log.textContent = "";
+  if (!logState.entries.length) {
+    log.append(el("div", "muted", logState.levels.length || logState.q || logState.source
+      ? "nothing matches this filter"
+      : "no activity recorded yet"));
+    return;
+  }
+  for (const ev of logState.entries) log.append(logRow(ev));
+  if (keepScroll) log.scrollTop = top;
+  else if ($("logAutoscroll").checked || wasAtBottom) log.scrollTop = log.scrollHeight;
+}
+
+function renderLogCounts() {
+  const c = logState.counts;
+  if (!c) return ($("logCounts").textContent = "");
+  const parts = [];
+  if (c.error) parts.push(`${nfmt(c.error)} error${c.error === 1 ? "" : "s"}`);
+  if (c.warn) parts.push(`${nfmt(c.warn)} warning${c.warn === 1 ? "" : "s"}`);
+  parts.push(`${nfmt(c.total)} kept`);
+  $("logCounts").textContent = parts.join(" · ");
+  const sel = $("logSource");
+  const want = ["", ...(c.sources || [])];
+  if (sel.options.length !== want.length) {
+    const current = sel.value;
+    sel.textContent = "";
+    for (const s of want) {
+      const o = el("option", null, s || "every source");
+      o.value = s;
+      sel.append(o);
+    }
+    sel.value = want.includes(current) ? current : "";
+  }
+}
+
+const logNewestId = () =>
+  logState.entries.reduce((n, e) => (e.id != null && e.id > n ? e.id : n), 0);
+
+/* The paging cursor is derived from what is actually on screen, never from what
+   was fetched. Trimming to LOG_MAX can discard part of a page, and a cursor that
+   advanced past discarded rows would make every further click page over history
+   nobody ever saw. */
+function syncOldestId() {
+  const ids = logState.entries.map((e) => e.id).filter((n) => n != null);
+  logState.oldestId = ids.length ? Math.min(...ids) : null;
+}
+
+async function loadLog({ older = false } = {}) {
+  try {
+    const qs = logQueryString(older ? { before_id: logState.oldestId, limit: 200 } : { limit: 300 });
+    const r = await api(`/api/logs?${qs}`);
+    const fetched = (r.entries || []).slice().reverse();   // server sends newest first
+    if (older) {
+      // Trim from the newest end, not the oldest: the click asked to see further
+      // back, so that is the end worth keeping.
+      logState.entries = fetched.concat(logState.entries).slice(0, LOG_MAX);
+    } else {
+      // A line can arrive over SSE while this request is in flight. Every stored
+      // line carries its row id, so anything already held that the query did not
+      // return is newer, not a duplicate — keep it rather than dropping a failure
+      // the operator just watched happen.
+      const seen = new Set(fetched.map((e) => e.id).filter((n) => n != null));
+      const newest = fetched.length ? Math.max(...fetched.map((e) => e.id ?? 0)) : 0;
+      const live = logState.entries.filter((e) => (e.id ?? Infinity) > newest && !seen.has(e.id));
+      logState.entries = fetched.concat(live);
+    }
+    syncOldestId();
+    logState.counts = r.counts;
+    renderLogCounts();
+    renderLog({ keepScroll: older });
+    $("logMore").disabled = !logState.oldestId || fetched.length === 0;
+    $("logHint").textContent = fetched.length === 0 && older
+      ? "no older lines"
+      : `keeping the last ${nfmt(r.retention)} lines`;
+  } catch (e) {
+    $("logHint").textContent = `could not load the log: ${e.message}`;
+  }
+}
+
+/* Called when the event stream reconnects. Lines written while it was down were
+   never streamed and are not replayed, so without this they would stay invisible
+   until a filter change or a reload — a failure disappearing from a live view is
+   the one thing this panel exists to prevent. Only what is newer than the newest
+   line held is fetched, so the view (including any "load older" pages) survives. */
+async function catchUpLog() {
+  const after = logNewestId();
+  if (!after) return loadLog();
+  try {
+    const LIMIT = 300;
+    const r = await api(`/api/logs?${logQueryString({ after_id: after, limit: LIMIT })}`);
+    const fetched = (r.entries || []).slice().reverse();
+    // A full page back means the gap may be longer than one page; a plain reload
+    // is then both simpler and correct.
+    if (fetched.length >= LIMIT) return loadLog();
+    for (const ev of fetched) appendLog(ev);
+    // After the appends, not before: appendLog adjusts the counts itself, so
+    // overwriting them first would count the caught-up lines twice.
+    logState.counts = r.counts;
+    renderLogCounts();
+  } catch { /* the next reconnect tries again */ }
+}
+
+function appendLog(ev) {
+  if (logState.counts) {
+    const lv = ev.level || "info";
+    if (lv in logState.counts) logState.counts[lv] += 1;
+    logState.counts.total += 1;
+    renderLogCounts();
+  }
+  if (!logMatches(ev)) return;
+  if (ev.id != null && logState.entries.some((e) => e.id === ev.id)) return;
+  logState.entries.push(ev);
+  if (logState.entries.length > LOG_MAX) logState.entries.shift();
+  const log = $("log");
+  if (log.children.length === 1 && log.firstChild.classList?.contains("muted")) log.textContent = "";
+  log.append(logRow(ev));
+  while (log.children.length > LOG_MAX) log.firstChild.remove();
   if ($("logAutoscroll").checked) log.scrollTop = log.scrollHeight;
 }
-$("logClear").onclick = () => ($("log").innerHTML = "");
+
+let logSearchTimer = null;
+$("logLevelFilter").onclick = (e) => {
+  const btn = e.target.closest("button[data-levels]");
+  if (!btn) return;
+  for (const b of $("logLevelFilter").querySelectorAll("button")) b.classList.toggle("on", b === btn);
+  logState.levels = btn.dataset.levels ? btn.dataset.levels.split(",") : [];
+  loadLog();
+};
+$("logSource").onchange = () => { logState.source = $("logSource").value; loadLog(); };
+$("logSearch").oninput = () => {
+  clearTimeout(logSearchTimer);
+  logSearchTimer = setTimeout(() => { logState.q = $("logSearch").value.trim(); loadLog(); }, 250);
+};
+$("logMore").onclick = () => loadLog({ older: true });
+
+async function logExportText() {
+  const res = await fetch(`/api/logs/export?${logQueryString({ limit: 2000 })}`, {
+    headers: authHeaders(),
+  });
+  if (res.status === 401) { location.replace("/login"); throw new Error("session expired"); }
+  if (!res.ok) throw new Error(await res.text());
+  return res.text();
+}
+
+$("logCopy").onclick = async () => {
+  try {
+    const text = await logExportText();
+    // The clipboard API needs a secure context, and this app is often reached over
+    // plain HTTP on a LAN address. Fall back to a hidden textarea rather than
+    // failing with a permissions error the operator can do nothing about.
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+    else {
+      const ta = el("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.append(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    toast(`Copied ${nfmt(text.split("\n").length)} lines — paste into the bug report`);
+  } catch (e) { toast(e.message, true); }
+};
+
+$("logDownload").onclick = async () => {
+  try {
+    const text = await logExportText();
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const a = el("a");
+    a.href = url;
+    a.download = `dd-library-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}.txt`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { toast(e.message, true); }
+};
+
+$("logClear").onclick = async () => {
+  const scope = logState.levels.length ? logState.levels.join(" and ") + " lines" : "the whole log";
+  if (!confirm(`Delete ${scope}? Exported or copied reports are unaffected.`)) return;
+  try {
+    const r = await api("/api/logs/clear", { method: "POST", body: { levels: logState.levels } });
+    toast(`Removed ${nfmt(r.removed)} line(s)`);
+    await loadLog();
+  } catch (e) { toast(e.message, true); }
+};
 
 const JOB_UI = { ingest: "ingest", sweep: "sweep", extract: "extract", sync: "sync" };
 
@@ -1399,5 +1655,6 @@ refreshStatus();
 loadDocs();
 loadArchives();
 loadConnections();
+loadLog();
 connectEvents();
 setInterval(refreshStatus, 20000);

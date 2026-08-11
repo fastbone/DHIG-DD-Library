@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 
 class Broker:
@@ -14,6 +14,10 @@ class Broker:
         self._subscribers: set[asyncio.Queue] = set()
         self._history: deque[dict] = deque(maxlen=history)
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Set by the app at startup to persist log lines, returning the stored row
+        # id. A hook rather than a direct `db` import: this module is deliberately
+        # dependency-free so it can be imported from anywhere, including from db.
+        self.sink: Callable[[dict], int | None] | None = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -54,8 +58,39 @@ class Broker:
                 # Slow consumer: drop rather than stall the producer.
                 pass
 
-    def log(self, message: str, level: str = "info", **extra: Any) -> None:
-        self.publish("log", level=level, message=message, **extra)
+    def log(
+        self,
+        message: str,
+        level: str = "info",
+        *,
+        source: str | None = None,
+        context: dict | None = None,
+        job_id: str | None = None,
+        **extra: Any,
+    ) -> None:
+        """Stream a log line, and persist it if a sink is registered.
+
+        ``context`` is the structured detail behind the sentence — the path that
+        failed, its extension and size, the exception type, a traceback. It rides
+        along on the event so the live view can expand a row, and it is what makes
+        an error reportable rather than merely visible.
+        """
+        # Stored first, then streamed, so the event carries the row id of the line
+        # it is a copy of. That is what lets a browser merge the live feed with a
+        # history query without showing the same line twice.
+        log_id = None
+        if self.sink is not None:
+            try:
+                log_id = self.sink(
+                    {"level": level, "message": message, "source": source,
+                     "context": context, "job_id": job_id}
+                )
+            except Exception:  # noqa: BLE001 — a log write must never break a job
+                log_id = None
+        self.publish(
+            "log", id=log_id, level=level, message=message, source=source, context=context,
+            job_id=job_id, **extra,
+        )
 
 
 broker = Broker()

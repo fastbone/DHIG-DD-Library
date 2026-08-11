@@ -14,6 +14,7 @@ import re
 import shutil
 import tarfile
 import time
+import traceback
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -290,8 +291,15 @@ class ExtractJob:
                 except Exception as exc:  # noqa: BLE001 — one bad member must not abort the rest
                     self.skipped += 1
                     dest.unlink(missing_ok=True)
-                    broker.log(f"  failed: {member.name}: {type(exc).__name__}: {exc}",
-                               level="warn")
+                    broker.log(
+                        f"  failed: {member.name}: {type(exc).__name__}: {exc}",
+                        level="warn",
+                        source="upload",
+                        job_id=self.id,
+                        context={"member": member.name,
+                                 "exc_type": type(exc).__name__,
+                                 "traceback": traceback.format_exc(limit=8)},
+                    )
                     continue
                 self.done += 1
                 if self.done % 25 == 0 or self.done == self.total:
@@ -321,7 +329,14 @@ class ExtractJob:
             db.execute("UPDATE archives SET status='failed', error=? WHERE id=?",
                        (msg[:400], self.archive_id))
             db.job_upsert(self.id, status="failed", message=msg, finished_at=time.time())
-            broker.log(f"Extraction failed: {msg}", level="error")
+            broker.log(
+                f"Extraction failed: {msg}",
+                level="error",
+                source="upload",
+                job_id=self.id,
+                context={"archive": arc["filename"], "exc_type": type(exc).__name__,
+                         "traceback": traceback.format_exc(limit=12)},
+            )
             self._publish("failed", msg)
             broker.publish("archives_dirty")
             return

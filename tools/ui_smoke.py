@@ -375,6 +375,123 @@ async def main() -> int:
         )
         await page.screenshot(path="/tmp/corpus-sync.png", full_page=True)
 
+        # ── the detailed activity log ─────────────────────────────────────
+        # Lines injected through the broker, which is the same funnel the real
+        # jobs use, so this exercises persistence → query → filter → export
+        # rather than a mock of it.
+        from app.events import broker as _broker
+
+        _broker.log("routine progress line, nothing wrong", source="ingest")
+        _broker.log("a caution worth noticing", level="warn", source="upload")
+        _broker.log(
+            "quarterly_pack.pdf: FileDataError: cannot open broken document",
+            level="error",
+            source="ingest",
+            job_id="ingest-uismoke1",
+            context={
+                "rel_path": "01_financial/quarterly_pack.pdf",
+                "ext": ".pdf",
+                "size_bytes": 91234,
+                "exc_type": "FileDataError",
+                "traceback": "Traceback (most recent call last):\n"
+                             "  File \"app/extract.py\", line 1, in extract_pdf\n"
+                             "    pymupdf.open(path)\n"
+                             "pymupdf.FileDataError: cannot open broken document",
+            },
+        )
+        await page.click('button[data-tab="sweep"]')
+        await page.evaluate("() => loadLog()")
+        await page.wait_for_timeout(500)
+
+        rows = await page.locator("#log > div, #log > details").count()
+        checks["log: stored lines are listed"] = rows >= 3
+        checks["log: counts are summarised in the header"] = (
+            "error" in (await page.inner_text("#logCounts"))
+        )
+        checks["log: a line with context is expandable"] = (
+            await page.locator("#log > details.error").count() >= 1
+        )
+        # Closed by default, so the traceback is one click away rather than in the
+        # way of the next line. Open it — a disclosure nobody can open is not one.
+        await page.click("#log details.error summary")
+        await page.wait_for_timeout(150)
+        detail = await page.inner_text("#log details.error[open] .ctx")
+        checks["log: the expanded detail carries the path and traceback"] = (
+            "01_financial/quarterly_pack.pdf" in detail
+            and "Traceback (most recent call last)" in detail
+        )
+        checks["log: the source is shown on the line"] = (
+            "ingest" in await page.inner_text("#log details.error summary")
+        )
+
+        # The error filter is the point of the feature: one click to the failures.
+        await page.click('#logLevelFilter button[data-levels="error"]')
+        await page.wait_for_timeout(500)
+        body_text = await page.inner_text("#log")
+        checks["log: the error filter hides everything else"] = (
+            "quarterly_pack.pdf" in body_text
+            and "routine progress line" not in body_text
+            and "a caution worth noticing" not in body_text
+        )
+        await page.click('#logLevelFilter button[data-levels="error,warn"]')
+        await page.wait_for_timeout(500)
+        body_text = await page.inner_text("#log")
+        checks["log: the problems filter keeps warnings too"] = (
+            "a caution worth noticing" in body_text and "routine progress line" not in body_text
+        )
+
+        await page.click('#logLevelFilter button[data-levels=""]')
+        await page.fill("#logSearch", "quarterly_pack")
+        await page.wait_for_timeout(700)
+        body_text = await page.inner_text("#log")
+        checks["log: the text filter narrows to matching lines"] = (
+            "quarterly_pack.pdf" in body_text and "routine progress line" not in body_text
+        )
+
+        # The export is what gets pasted into a bug report, so assert its content
+        # rather than that a button exists.
+        report = await page.evaluate("() => logExportText()")
+        checks["log: the export carries the traceback for a bug report"] = (
+            "DD Library activity log" in report
+            and "01_financial/quarterly_pack.pdf" in report
+            and "Traceback (most recent call last)" in report
+        )
+        checks["log: clearing is offered to an admin"] = (
+            await page.locator("#logClear:not(.hidden)").count() == 1
+        )
+
+        # The reconnect gap. Written straight to the table, deliberately bypassing
+        # the broker, so nothing is streamed — exactly the state of a line written
+        # while the event stream was down. Log lines are not replayed on reconnect,
+        # so catchUpLog is what has to find it.
+        await page.fill("#logSearch", "")
+        await page.wait_for_timeout(500)
+        db.log_record("error", "written while the stream was down", source="sync")
+        before_gap = await page.inner_text("#log")
+        await page.evaluate("() => catchUpLog()")
+        await page.wait_for_timeout(500)
+        after_gap = await page.inner_text("#log")
+        checks["log: a reconnect picks up lines written while the stream was down"] = (
+            "written while the stream was down" not in before_gap
+            and "written while the stream was down" in after_gap
+        )
+        checks["log: catching up does not duplicate lines already shown"] = (
+            after_gap.count("quarterly_pack.pdf: FileDataError") == 1
+        )
+        # The paging cursor must describe what is on screen. It once advanced to a
+        # page that trimming had discarded, so every further click paged over
+        # history nobody had seen.
+        cursor_ok = await page.evaluate(
+            """() => {
+                 const ids = logState.entries.map(e => e.id).filter(n => n != null);
+                 return !ids.length || logState.oldestId === Math.min(...ids);
+               }"""
+        )
+        checks["log: the paging cursor matches the oldest line displayed"] = cursor_ok
+        await page.fill("#logSearch", "")
+        await page.wait_for_timeout(500)
+        await page.screenshot(path="/tmp/sweep-log.png", full_page=True)
+
         for name, ok in checks.items():
             print(f"  {'PASS' if ok else 'FAIL'}  {name}")
             if not ok:
@@ -384,7 +501,7 @@ async def main() -> int:
     print("\nJS problems:", problems or "none")
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
-          "/tmp/corpus-connect.png /tmp/corpus-sync.png")
+          "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png")
     return 1 if problems else 0
 
 

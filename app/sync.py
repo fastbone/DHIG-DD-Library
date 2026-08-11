@@ -451,7 +451,14 @@ class SyncJob:
                 self.failed += 1
                 msg = str(event.get("msg", "")).strip()
                 if msg:
-                    broker.log(f"  {msg[:200]}", level="warn")
+                    broker.log(
+                        f"  {msg[:200]}",
+                        level="warn",
+                        source="sync",
+                        job_id=self.id,
+                        context={"rclone_level": level, "rclone_message": msg,
+                                 "object": event.get("object")},
+                    )
                     self._error_tail.append(msg)
                     del self._error_tail[:-20]
             return True
@@ -546,7 +553,9 @@ class SyncJob:
     async def run(self, *, then_ingest: bool = True) -> None:
         row = db.one("SELECT * FROM sync_connections WHERE id=?", (self.conn_id,))
         if row is None:
-            broker.log("Sync aborted: connection not found.", level="error")
+            broker.log("Sync aborted: connection not found.", level="error",
+                       source="sync", job_id=self.id,
+                       context={"connection_id": self.conn_id})
             return
         row = dict(row)
         label = row["label"]
@@ -611,7 +620,9 @@ class SyncJob:
         db.execute("UPDATE sync_connections SET status='failed', error=? WHERE id=?",
                    (msg[:400], self.conn_id))
         db.job_upsert(self.id, status="failed", message=msg, finished_at=time.time())
-        broker.log(f"Sync of {label!r} failed: {msg}", level="error")
+        broker.log(f"Sync of {label!r} failed: {msg}", level="error",
+                   source="sync", job_id=self.id,
+                   context={"connection_id": self.conn_id, "label": label, "error": msg})
         self._publish("failed", msg)
         broker.publish("sync_dirty")
 

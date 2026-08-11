@@ -87,6 +87,12 @@ class Settings:
     max_sync_delete: int = _env_int("DD_MAX_SYNC_DELETE", 500)
     sync_timeout_s: int = _env_int("DD_SYNC_TIMEOUT", 6 * 3600)
 
+    # --- activity log ----------------------------------------------------
+    # How many log lines to keep. A sweep over a large data room writes one line
+    # per problem file, and the point of keeping them is to still have the
+    # failures after a restart, so this is generous. 0 disables trimming.
+    log_retention: int = _env_int("DD_LOG_RETENTION", 20_000)
+
     def __post_init__(self) -> None:
         for d in (
             self.data_dir,
