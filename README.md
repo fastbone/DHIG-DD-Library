@@ -144,11 +144,13 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"   # → DD_SECRET_
 docker compose up -d
 ```
 
-Two volumes: `dd-data` holds the index, text mirror, uploads and generated
-documents (back this up), and `./corpus` is bind-mounted read-only at `/corpus`
-if you want to index a data room straight off the host rather than uploading it.
-For OCR, build with `INSTALL_OCR=true` (adds ~250 MB of Tesseract) and set
-`DD_OCR=1`.
+Three volumes: `dd-data` holds the index, text mirror, uploads and generated
+documents (back this up); `./corpus` is bind-mounted read-only at `/corpus` if
+you want to index a data room straight off the host rather than uploading it;
+and `dd-inbox` is a writable drop point at `/inbox` for external feeds — see
+*Feeding the corpus from outside the app*. All three are browsable from the
+folder picker. For OCR, build with `INSTALL_OCR=true` (adds ~250 MB of
+Tesseract) and set `DD_OCR=1`.
 
 The compose file publishes on `127.0.0.1:8412` only, and hardens the container
 because `run_python` executes model-authored code: read-only root filesystem,
@@ -356,6 +358,9 @@ backup of `/var/lib/docker/volumes/*_dd-data` while the container is stopped, or
 /out/dd-data.tgz /data`. Everything except uploads and deliverables can be
 rebuilt from the corpus by reindexing, at the cost of another indexing sweep.
 
+`dd-inbox` is staging, not a system of record: back it up only if the feed that
+fills it cannot simply re-send.
+
 ### Feeding the corpus from outside the app
 
 The container runs as uid/gid **10001** with every capability dropped, so a file
@@ -365,8 +370,36 @@ or SFTP feed, another container, a scheduled export — has to leave its output
 readable by that uid. A feed running as root with a `0077` umask produces a data
 room that indexes as zero documents.
 
-Make the drop readable at the source, which is one line in whatever does the
-copying:
+**The inbox.** `dd-inbox` is mounted writable at `/inbox` for exactly this. It is
+a named volume rather than a bind mount because Docker seeds a *new* named volume
+from the image — ownership included — and the image ships `/inbox` as
+`dd:dd 2775`. So the volume arrives owned by the runtime user instead of by
+root, which is the failure a bind-mounted host directory walks straight into. The
+setgid bit means files a feed creates inside inherit group 10001 even when the
+feed runs as some other uid.
+
+Seeding only happens the first time the volume is created. If you already had a
+`dd-inbox` volume, or you replace it with a bind mount, set the ownership once:
+
+```bash
+docker run --rm -v dd-library_dd-inbox:/inbox alpine chown -R 10001:10001 /inbox
+```
+
+The most robust way to fill it is to write as the runtime user in the first
+place, which needs no fixups afterwards:
+
+```bash
+docker run --rm -u 10001:10001 \
+  -v dd-library_dd-inbox:/inbox -v /srv/exports:/src:ro \
+  alpine cp -a /src/. /inbox/
+```
+
+Then point **Corpus → Ingest** at `/inbox` (it is in the folder picker) or set it
+as the corpus root. Nothing deletes from the inbox automatically — it is a
+staging area, so prune it on whatever schedule suits the feed.
+
+**Any writable path.** Whether you use the inbox or your own mount, make the drop
+readable at the source — one line in whatever does the copying:
 
 ```bash
 umask 022                     # in the feed's environment, before it writes
@@ -376,6 +409,10 @@ chmod -R a+rX /srv/data-room  # or afterwards, on the host
 `a+rX` is the right hammer: the capital `X` sets the execute bit on directories
 only, so the tree becomes traversable without marking every PDF executable. Use
 `chown -R 10001:10001` instead when the app must also write to that path.
+
+A feed that still writes as root with a restrictive umask defeats all of this —
+the setgid bit fixes group *ownership*, not the mode. That is what the access
+check below is for.
 
 To check the current state, sign in as an administrator and use **Admin → Corpus
 access**. It walks every configured root as the runtime user and lists exactly
@@ -405,7 +442,7 @@ Three suites, none of which spend a token or touch your real index — each uses
 its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 64 checks: auth, CSRF, keys, uploads, access, storage, audit
+python3 tools/api_smoke.py            # 65 checks: auth, CSRF, keys, uploads, access, storage, audit
 python3 tools/ui_smoke.py             # 27 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks: the container's runtime constraints
 ```
@@ -466,7 +503,7 @@ app/
   server.py       FastAPI routes and the access-control middleware
 web/              single-page UI plus the login page, no build step
 tools/            sample corpus, API smoke test, UI smoke test, container check
-Dockerfile        non-root, read-only /app, /data volume
+Dockerfile        non-root, read-only /app, /data and /inbox volumes
 docker-compose.yml  hardened runtime, localhost-published on 8412
 deploy/
   update.sh       host-side update: pull, build, swap, health-check, roll back

@@ -40,6 +40,28 @@ PASSES: list[str] = []
 FAILURES: list[str] = []
 
 
+def _probe_default_browse_roots():
+    """True if /inbox is a default browse root, None if there is no /inbox here.
+
+    Runs in a subprocess: the browse-root default is only consulted when
+    DD_BROWSE_ROOTS is unset, and this suite sets it process-wide.
+    """
+    import subprocess
+
+    if not Path("/inbox").is_dir():
+        return None
+    env = {k: v for k, v in os.environ.items() if k != "DD_BROWSE_ROOTS"}
+    env["DD_DATA_DIR"] = tempfile.mkdtemp(prefix="dd-inbox-probe-")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r)\n" % str(ROOT)
+         + "from app.config import settings\n"
+         + "print('/inbox' in [str(r) for r in settings.browse_roots])"],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    return out.stdout.strip() == "True"
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     (PASSES if ok else FAILURES).append(name)
     print(f"  {'PASS' if ok else 'FAIL'}  {name}{'' if ok else '  ← ' + detail}")
@@ -342,6 +364,15 @@ def main() -> int:
     check("an unreadable folder is reported rather than skipped in silence",
           denied >= 1 or os.geteuid() == 0,
           f"blocked={denied} (euid={os.geteuid()})")
+
+    # The feed inbox has to be reachable without configuration: compose names it
+    # in DD_BROWSE_ROOTS, but a non-Docker install relies on the default list.
+    inbox_default = _probe_default_browse_roots()
+    if inbox_default is None:
+        print("  SKIP  /inbox is a browsable root by default  ← no /inbox on this host")
+    else:
+        check("an existing /inbox is a browsable root by default", inbox_default,
+              "default roots did not include /inbox")
 
     code, body, _ = admin.get("/api/access-check")
     check("access check reports the runtime identity",
