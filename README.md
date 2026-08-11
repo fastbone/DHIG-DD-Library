@@ -89,6 +89,26 @@ flags like `draft` / `unsigned` / `scanned`). Live progress, a running cost
 meter, the activity log, and a preview of the corpus map the analyst will
 actually see — including what it costs per turn cached vs uncached.
 
+**The activity log is kept, not just streamed.** Every line an ingest, sweep,
+upload or sync produces is written to the index, so a failure is still findable
+after it scrolled past and after a restart. Filter to **problems** (warnings and
+errors) or **errors only** in one click, narrow by source or by text, and expand
+any line with a `▸ detail` marker to see the structured facts behind it — the
+failing path relative to the data room, its extension and size, the exception
+type, and the traceback.
+
+*copy for a bug report* / *download* produce a plain-text report of whatever the
+filter currently shows: oldest first, tracebacks inlined, with a header naming
+the filter and the counts. That output is meant to be pasted straight into an
+issue — the one-line message says what broke, and the context says which file and
+where in the code, which is the difference between a report someone can act on
+and a retyped fragment.
+
+Reading and exporting the log needs only a sign-in, so an analyst who hits a
+failure can report it. Clearing it is destructive and therefore admin-only; a
+clear honours the level filter, so *errors only* → *clear* drops the failures you
+have just reported and leaves the rest of the history intact.
+
 **Ask tab** — streaming answers with the reasoning summary, the tool trace
 (every search, read and computation), and a citations panel. Clicking any
 citation opens the source document at that exact page. With verification on,
@@ -289,6 +309,7 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_MAX_SYNC_DELETE` | `500` | Abort a sync that would delete more than this many mirrored files |
 | `DD_SYNC_TIMEOUT` | `21600` | Give up on one sync after this many seconds |
 | `DD_RCLONE_BIN` | `rclone` | The sync engine. Point at another binary for a newer version |
+| `DD_LOG_RETENTION` | `20000` | Activity-log lines kept before the oldest are trimmed. `0` keeps everything |
 
 Effort is worth a sweep of its own on your questions: `low` and `medium` are
 strong on Claude Opus 5 and much cheaper, while `xhigh` suits the hardest
@@ -592,7 +613,7 @@ app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
                   qa_log, users, sessions, api_keys, archives, sync_connections,
-                  audit)
+                  audit, logs)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
@@ -610,7 +631,8 @@ app/
   verify.py       re-read each cited span and judge the claim
   docgen.py       docx / xlsx / pptx / md from a block spec
   pricing.py      token accounting and the cost meter
-  events.py       in-process pub/sub behind the SSE progress stream
+  events.py       in-process pub/sub behind the SSE progress stream, and the
+                  sink that persists each log line to the `logs` table
   server.py       FastAPI routes and the access-control middleware
 web/              single-page UI plus the login page, no build step
 tools/            sample corpus, API / sync / UI smoke tests, container check,

@@ -10,6 +10,7 @@ is a behaviour someone could break by accident.
 from __future__ import annotations
 
 import io
+import json
 import os
 import secrets
 import sys
@@ -190,6 +191,10 @@ def build_zip() -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("deal/notes.txt", "Revenue EUR 412.6m in FY2024.\n" * 40)
         zf.writestr("deal/sub/more.md", "# Findings\n\nCustomer concentration 31%.\n" * 20)
+        # A supported extension over bytes that are not a PDF. Ingest must record
+        # it as a failed document and log the failure with enough structure to
+        # report — which is what the activity-log checks below read.
+        zf.writestr("deal/corrupt_scan.pdf", b"%PDF-1.4 truncated before anything useful")
         for name, content in _spreadsheet_fixtures().items():
             zf.writestr(name, content)
         zf.writestr("../escape.txt", "should never be written outside the target")
@@ -679,11 +684,97 @@ def main() -> int:
     code, body, _ = admin.get("/api/status")
     check("the corpus is empty after a reset", body["stats"]["documents"] == 0, str(body["stats"]))
 
+    print("\n— activity log —")
+    # The live SSE feed is a ring buffer, so the point of this table is that a
+    # failure is still there — and still exportable — after it scrolled past.
+    code, body, _ = admin.get("/api/logs?limit=500")
+    entries = body.get("entries", []) if code == 200 else []
+    check("the activity log is persisted and readable", code == 200 and len(entries) > 5,
+          f"got {code} with {len(entries)} entries")
+    check("counts are reported per level",
+          isinstance(body.get("counts"), dict) and "error" in body["counts"], str(body.get("counts")))
+
+    failure = next(
+        (e for e in entries if "corrupt_scan.pdf" in (e.get("message") or "")), None
+    )
+    check("an extraction failure is logged at error level",
+          failure is not None and failure["level"] == "error",
+          str(failure)[:200] if failure else "no line mentions the corrupt file")
+    ctx = (failure or {}).get("context") or {}
+    # The whole reason for the context column: a message says what broke, this says
+    # which file, how big, and where in the code — the difference between a report
+    # someone can act on and a retyped fragment of one line.
+    check("the failure carries the path, extension and traceback",
+          ctx.get("rel_path", "").endswith("corrupt_scan.pdf") and ctx.get("ext") == ".pdf"
+          and "Traceback" in (ctx.get("traceback") or ""),
+          str({k: str(v)[:60] for k, v in ctx.items()}))
+    check("the failure is attributed to a source and a job",
+          failure and failure.get("source") == "ingest" and failure.get("job_id"),
+          str(failure)[:160] if failure else "")
+    check("streamed and stored lines share an id, so the browser can dedupe them",
+          all(e.get("id") for e in entries[:20]), str(entries[:1])[:160])
+
+    code, body, _ = admin.get("/api/logs?levels=error")
+    only_errors = body.get("entries", [])
+    check("the error filter returns errors only",
+          code == 200 and only_errors and all(e["level"] == "error" for e in only_errors),
+          str({e["level"] for e in only_errors}))
+    code, body, _ = admin.get("/api/logs?levels=error,warn")
+    check("the problems filter returns warnings as well as errors",
+          code == 200 and {e["level"] for e in body["entries"]} <= {"error", "warn"},
+          str({e["level"] for e in body.get("entries", [])}))
+    code, body, _ = admin.get("/api/logs?levels=nonsense")
+    check("an unrecognised level is ignored rather than returning nothing",
+          code == 200 and len(body["entries"]) > 5, f"{len(body.get('entries', []))} entries")
+    code, body, _ = admin.get("/api/logs?q=corrupt_scan")
+    check("the text filter narrows to matching lines",
+          code == 200 and body["entries"] and all(
+              "corrupt_scan" in (e["message"] or "") + json.dumps(e["context"] or {})
+              for e in body["entries"]),
+          f"{len(body.get('entries', []))} entries")
+    code, body, _ = admin.get("/api/logs?source=ingest")
+    check("the source filter narrows to one subsystem",
+          code == 200 and body["entries"] and all(e["source"] == "ingest" for e in body["entries"]),
+          str({e["source"] for e in body.get("entries", [])}))
+
+    code, report, _ = admin.get("/api/logs/export?levels=error")
+    check("the log exports as plain text", code == 200 and isinstance(report, str), f"got {code}")
+    if isinstance(report, str):
+        check("the export names its filter and its counts",
+              "DD Library activity log" in report and "levels=error" in report, report[:200])
+        check("the export inlines the traceback, not a JSON blob of one",
+              "corrupt_scan.pdf" in report and "traceback:" in report
+              and "Traceback (most recent call last)" in report,
+              report[:400])
+        check("the export reads oldest first",
+              report.index("Oldest first") < report.index("corrupt_scan.pdf"), "order")
+
+    carol = Client()
+    code, _, _ = admin.post("/api/users",
+                            {"username": "carol", "password": "analyst-pass-7", "role": "analyst"})
+    code, _, _ = carol.post("/api/login", {"username": "carol", "password": "analyst-pass-7"})
+    code, body, _ = carol.get("/api/logs?levels=error")
+    check("an analyst can read the log, so they can report a failure",
+          code == 200 and "entries" in body, f"got {code}")
+    code, body, _ = carol.post("/api/logs/clear", {"levels": []})
+    check("an analyst cannot clear the log", code == 403, f"got {code}")
+
+    before = admin.get("/api/logs")[1]["counts"]
+    code, body, _ = admin.post("/api/logs/clear", {"levels": ["error"]})
+    check("an admin can clear one level", code == 200 and body["removed"] == before["error"],
+          f"removed {body.get('removed')} of {before['error']}")
+    check("clearing errors leaves the rest of the log alone",
+          body["counts"]["error"] == 0 and body["counts"]["info"] == before["info"],
+          str(body.get("counts")))
+    code, body, _ = admin.post("/api/logs/clear", {"levels": []})
+    check("an admin can clear the whole log", code == 200 and body["counts"]["total"] == 0,
+          str(body.get("counts")))
+
     print("\n— audit trail —")
     code, body, _ = admin.get("/api/audit")
     actions = {e["action"] for e in body["entries"]}
     expected = {"login.success", "login.failure", "user.create", "apikey.add", "apikey.delete",
-                "archive.upload", "archive.extract", "storage.reset_index"}
+                "archive.upload", "archive.extract", "storage.reset_index", "log.clear"}
     missing = expected - actions
     check("every privileged action is audited", not missing, f"missing {missing}")
     check("failed logins are audited with the username",

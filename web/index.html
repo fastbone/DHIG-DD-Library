@@ -185,11 +185,33 @@
       <div class="card-head">
         <h2>Activity</h2>
         <div class="row gap">
+          <span id="logCounts" class="small muted"></span>
           <label class="check"><input type="checkbox" id="logAutoscroll" checked> autoscroll</label>
-          <button class="ghost" id="logClear">clear</button>
         </div>
       </div>
+      <div class="row gap wrap log-filters">
+        <div class="seg" id="logLevelFilter" role="group" aria-label="Log level filter">
+          <button class="on" data-levels="">all</button>
+          <button data-levels="error,warn">problems</button>
+          <button data-levels="error">errors only</button>
+        </div>
+        <select id="logSource" title="Where the line came from">
+          <option value="">every source</option>
+        </select>
+        <input id="logSearch" type="search" placeholder="filter text or path…"
+               autocomplete="off" spellcheck="false">
+        <div class="grow"></div>
+        <button class="ghost" id="logCopy" title="Copy the filtered log, with tracebacks">
+          copy for a bug report</button>
+        <button class="ghost" id="logDownload" title="Download the filtered log as a text file">
+          download</button>
+        <button class="ghost" id="logClear" title="Delete the stored log lines">clear</button>
+      </div>
       <div id="log" class="log"></div>
+      <div class="row gap">
+        <button class="ghost small" id="logMore">load older lines</button>
+        <span id="logHint" class="small muted"></span>
+      </div>
     </div>
   </section>
 

@@ -236,6 +236,23 @@ CREATE TABLE IF NOT EXISTS audit (
     ip      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);
+
+-- The activity log, kept rather than only streamed. The live SSE feed is a
+-- 400-entry ring in memory, so the one failure worth reporting scrolls away and
+-- a restart loses it entirely. `context` carries the structured detail — path,
+-- extension, size, exception type, traceback — that makes an error reportable
+-- instead of merely visible.
+CREATE TABLE IF NOT EXISTS logs (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    level   TEXT NOT NULL,            -- info | success | warn | error
+    source  TEXT,                     -- ingest | sweep | sync | upload | ask | server | …
+    message TEXT NOT NULL,
+    context TEXT,                     -- JSON object, or NULL
+    job_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, ts DESC);
 """
 
 
@@ -409,3 +426,125 @@ def audit(action: str, actor: str | None = None, detail: str | None = None, ip: 
 
 def recent_audit(limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows("SELECT * FROM audit ORDER BY ts DESC LIMIT ?", (limit,))]
+
+
+# --- activity log --------------------------------------------------------
+
+LOG_LEVELS = ("info", "success", "warn", "error")
+_log_writes = 0
+
+
+def log_record(
+    level: str,
+    message: str,
+    source: str | None = None,
+    context: dict | None = None,
+    job_id: str | None = None,
+) -> int | None:
+    """Persist one activity-log line, returning its row id.
+
+    Never raises — a log line is not worth breaking a job over. The id is what
+    lets the streamed copy of this line and the stored one be recognised as the
+    same thing, so the browser can merge a live feed with a history query without
+    showing anything twice.
+    """
+    global _log_writes
+
+    try:
+        payload = json.dumps(context, default=str)[:20_000] if context else None
+        cur = execute(
+            "INSERT INTO logs(ts, level, source, message, context, job_id) VALUES(?,?,?,?,?,?)",
+            (time.time(), level if level in LOG_LEVELS else "info", source,
+             str(message)[:4000], payload, job_id),
+        )
+        _log_writes += 1
+        # Trimmed on a counter rather than on every insert: a sweep over a large
+        # data room writes thousands of lines and each trim is a scan.
+        if _log_writes % 500 == 0:
+            log_trim()
+        return cur.lastrowid
+    except Exception:  # noqa: BLE001 — logging is never worth an exception
+        return None
+
+
+def log_trim(keep: int | None = None) -> int:
+    """Drop the oldest rows beyond the retention cap. Returns rows removed."""
+    keep = keep if keep is not None else settings.log_retention
+    if keep <= 0:
+        return 0
+    # The subquery is the id of the keep-th newest row, so everything strictly
+    # older goes. It is NULL while fewer than `keep` rows exist, and `id < NULL`
+    # matches nothing — which is the behaviour wanted.
+    cur = execute(
+        "DELETE FROM logs WHERE id < (SELECT id FROM logs ORDER BY id DESC LIMIT 1 OFFSET ?)",
+        (keep - 1,),
+    )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def log_query(
+    *,
+    levels: Iterable[str] | None = None,
+    source: str | None = None,
+    query: str | None = None,
+    before_id: int | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Newest first. `before_id` pages backwards through the history."""
+    where = ["1=1"]
+    params: list = []
+    wanted = [lv for lv in (levels or []) if lv in LOG_LEVELS]
+    if wanted:
+        where.append(f"level IN ({','.join('?' * len(wanted))})")
+        params.extend(wanted)
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    if query:
+        where.append("(message LIKE ? OR context LIKE ?)")
+        params.extend([f"%{query}%"] * 2)
+    if before_id:
+        where.append("id < ?")
+        params.append(before_id)
+    params.append(max(1, min(limit, 2000)))
+    out: list[dict] = []
+    for r in rows(
+        f"SELECT * FROM logs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?", params
+    ):
+        d = dict(r)
+        raw = d.pop("context", None)
+        if raw:
+            try:
+                d["context"] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                d["context"] = {"raw": raw}
+        else:
+            d["context"] = None
+        out.append(d)
+    return out
+
+
+def log_counts() -> dict:
+    """Totals per level, so the UI can show "12 errors" without paging."""
+    counts = {lv: 0 for lv in LOG_LEVELS}
+    for r in rows("SELECT level, COUNT(*) AS n FROM logs GROUP BY level"):
+        if r["level"] in counts:
+            counts[r["level"]] = r["n"]
+    counts["total"] = sum(counts[lv] for lv in LOG_LEVELS)
+    counts["sources"] = [
+        r["source"] for r in rows(
+            "SELECT DISTINCT source FROM logs WHERE source IS NOT NULL ORDER BY source"
+        )
+    ]
+    return counts
+
+
+def log_clear(levels: Iterable[str] | None = None) -> int:
+    wanted = [lv for lv in (levels or []) if lv in LOG_LEVELS]
+    if wanted:
+        cur = execute(
+            f"DELETE FROM logs WHERE level IN ({','.join('?' * len(wanted))})", wanted
+        )
+    else:
+        cur = execute("DELETE FROM logs")
+    return max(cur.rowcount or 0, 0)

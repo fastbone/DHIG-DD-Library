@@ -219,12 +219,43 @@ tbody tr:last-child td { border-bottom: 0; }
   font-family: var(--mono); font-size: 12px; max-height: 340px; overflow-y: auto;
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
 }
-.log div { padding: 1px 0; display: flex; gap: 8px; }
+.log > div { padding: 1px 0; display: flex; gap: 8px; }
 .log .t { color: var(--ink-3); flex: none; }
 .log .m { white-space: pre-wrap; word-break: break-word; }
 .log .warn .m { color: var(--warn); }
 .log .error .m { color: var(--err); }
 .log .success .m { color: var(--ok); }
+.log .src { color: var(--ink-3); flex: none; }
+/* A line with structured context behind it is a disclosure, so the traceback is
+   one click away rather than 30 lines in the way of the next message. */
+.log details { display: block; padding: 1px 0; }
+.log details > summary {
+  display: flex; gap: 8px; cursor: pointer; list-style: none; align-items: baseline;
+}
+.log details > summary::-webkit-details-marker { display: none; }
+.log details > summary::after {
+  content: "▸ detail"; color: var(--ink-3); flex: none; font-size: 11px;
+}
+.log details[open] > summary::after { content: "▾ detail"; }
+.log details > summary:hover { background: var(--panel); }
+.log .ctx {
+  margin: 4px 0 8px 22px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--ink-2); max-height: 260px; overflow: auto;
+}
+.log-filters { margin-bottom: 10px; }
+.log-filters input[type=search] { flex: 1; min-width: 140px; }
+.grow { flex: 1; }
+/* Segmented control: the level filter is three exclusive choices, not a dropdown
+   to open — the whole point is that "errors only" is one click away. */
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
+.seg button {
+  border: 0; border-radius: 0; background: var(--panel-2); color: var(--ink-2);
+  padding: 6px 11px; font-size: 12px; box-shadow: none;
+}
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button:hover { background: var(--panel); }
+.seg button.on { background: var(--accent); color: var(--accent-ink); }
 .pre-scroll {
   max-height: 320px; overflow: auto; background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 8px; padding: 10px; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0;

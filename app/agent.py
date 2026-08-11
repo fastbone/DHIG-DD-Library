@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import time
+import traceback
 import uuid
 from typing import AsyncIterator
 
@@ -297,7 +298,13 @@ async def ask(
             "assistant_message": final_text,
         }
     except Exception as exc:  # noqa: BLE001
-        broker.log(f"ask failed: {type(exc).__name__}: {exc}", level="error")
+        broker.log(
+            f"ask failed: {type(exc).__name__}: {exc}",
+            level="error",
+            source="ask",
+            context={"exc_type": type(exc).__name__,
+                     "traceback": traceback.format_exc(limit=12)},
+        )
         yield {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
     finally:
         await client.close()

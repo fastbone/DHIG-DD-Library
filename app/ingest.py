@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,6 +179,27 @@ def scan(root: Path) -> ScanResult:
     return result
 
 
+def _file_context(path: Path, root: Path, **extra) -> dict:
+    """The facts about a file that a bug report needs and a sentence cannot hold.
+
+    Deliberately the relative path first: an absolute path under ``/data/sync/…``
+    tells the reader where the mirror lives, but the path *inside* the data room
+    is what identifies the document to whoever filed it.
+    """
+    ctx: dict = {"path": path.name}
+    try:
+        ctx["rel_path"] = str(path.relative_to(root))
+    except ValueError:
+        ctx["rel_path"] = str(path)
+    ctx["ext"] = path.suffix.lower()
+    try:
+        ctx["size_bytes"] = path.stat().st_size
+    except OSError:
+        pass
+    ctx.update({k: v for k, v in extra.items() if v is not None})
+    return ctx
+
+
 def _extract_one(path: Path, root: Path, ocr: bool) -> dict:
     """Blocking worker — runs in a thread."""
     stat = path.stat()
@@ -224,7 +246,16 @@ def _extract_one(path: Path, root: Path, ocr: bool) -> dict:
                 stat.st_size, stat.st_mtime, f"{type(exc).__name__}: {exc}"[:500], time.time(),
             ),
         )
-        return {**base, "error": f"{type(exc).__name__}: {exc}"}
+        # The traceback travels with the result so the log line can carry it.
+        # Without it "InvalidFileException: openpyxl does not support …" says
+        # what broke but not which extractor was reached or from where, which is
+        # the difference between a report someone can act on and one they cannot.
+        return {
+            **base,
+            "error": f"{type(exc).__name__}: {exc}",
+            "exc_type": type(exc).__name__,
+            "traceback": traceback.format_exc(limit=12),
+        }
 
     extract.write_mirror(doc_id, text)
     db.execute(
@@ -363,39 +394,55 @@ class IngestJob:
         the host, or Admin → Corpus access — is not something the operator can
         guess from a count.
         """
+        # The summary lines carry the *complete* path list in their context while
+        # the stream shows only the first few. The live view stays readable and a
+        # bug report still has every path in it.
         if found.denied_dirs:
             broker.log(
                 f"{len(found.denied_dirs)} folder(s) could not be read and were NOT scanned — "
                 "their contents are missing from this ingest. "
                 "Run Admin → Corpus access for the fix.",
                 level="error",
+                source="ingest",
+                job_id=self.id,
+                context={"reason": "unreadable_folder", "paths": found.denied_dirs},
             )
             for path in found.denied_dirs[:10]:
-                broker.log(f"  unreadable folder: {path}", level="error")
+                broker.log(f"  unreadable folder: {path}", level="error", source="ingest")
         if found.denied_files:
             broker.log(
                 f"{len(found.denied_files)} file(s) could not be read and were skipped.",
                 level="error",
+                source="ingest",
+                job_id=self.id,
+                context={"reason": "unreadable_file", "paths": found.denied_files},
             )
             for path in found.denied_files[:10]:
-                broker.log(f"  unreadable file: {path}", level="error")
+                broker.log(f"  unreadable file: {path}", level="error", source="ingest")
         if found.oversize:
             broker.log(
                 f"{len(found.oversize)} file(s) over the {settings.max_file_mb} MB limit "
                 "were skipped (raise DD_MAX_FILE_MB to include them).",
                 level="warn",
+                source="ingest",
+                job_id=self.id,
+                context={"reason": "oversize", "limit_mb": settings.max_file_mb,
+                         "paths": found.oversize},
             )
             for path in found.oversize[:5]:
-                broker.log(f"  too large: {path}", level="warn")
+                broker.log(f"  too large: {path}", level="warn", source="ingest")
         if found.dangling:
             broker.log(
                 f"{len(found.dangling)} symlink(s) point at nothing and were skipped.",
                 level="warn",
+                source="ingest",
+                job_id=self.id,
+                context={"reason": "broken_symlink", "paths": found.dangling},
             )
             for path in found.dangling[:5]:
-                broker.log(f"  broken link: {path}", level="warn")
+                broker.log(f"  broken link: {path}", level="warn", source="ingest")
         if found.empty:
-            broker.log(f"{found.empty} zero-byte file(s) skipped.", level="warn")
+            broker.log(f"{found.empty} zero-byte file(s) skipped.", level="warn", source="ingest")
         if not found.files and not found.blocked:
             # "No supported files" is only true when nothing was filtered out
             # later in the walk. A root holding nothing but oversize or
@@ -460,11 +507,33 @@ class IngestJob:
                     result = await asyncio.to_thread(_extract_one, path, self.root, self.ocr)
                 except Exception as exc:  # noqa: BLE001
                     self.failed += 1
-                    broker.log(f"{path.name}: {type(exc).__name__}: {exc}", level="error")
+                    broker.log(
+                        f"{path.name}: {type(exc).__name__}: {exc}",
+                        level="error",
+                        source="ingest",
+                        job_id=self.id,
+                        context=_file_context(path, self.root, exc_type=type(exc).__name__,
+                                              traceback=traceback.format_exc(limit=12)),
+                    )
                 else:
                     if result.get("error"):
                         self.failed += 1
-                        broker.log(f"{path.name}: {result['error']}", level="warn")
+                        # An extraction failure is an error, not a warning: the
+                        # document is in the catalogue with no text behind it, so
+                        # every question that needed it is silently unanswerable.
+                        broker.log(
+                            f"{path.name}: {result['error']}",
+                            level="error",
+                            source="ingest",
+                            job_id=self.id,
+                            context=_file_context(
+                                path, self.root,
+                                doc_id=result.get("id"),
+                                family=result.get("family"),
+                                exc_type=result.get("exc_type"),
+                                traceback=result.get("traceback"),
+                            ),
+                        )
                     elif result.get("skipped"):
                         self.skipped += 1
                     self.bytes_done += result.get("size_bytes", 0)

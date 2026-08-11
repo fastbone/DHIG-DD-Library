@@ -219,11 +219,12 @@ def vacuum(*, actor: str | None = None) -> dict:
 
 
 def housekeeping() -> dict:
-    """Cheap periodic maintenance: expire sessions."""
+    """Cheap periodic maintenance: expire sessions, trim the activity log."""
     from . import auth
 
     removed = auth.purge_expired_sessions()
-    return {"expired_sessions": removed, "at": time.time()}
+    trimmed = db.log_trim()
+    return {"expired_sessions": removed, "log_lines_trimmed": trimmed, "at": time.time()}
 
 
 OPERATIONS = {
