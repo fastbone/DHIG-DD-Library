@@ -21,6 +21,7 @@ import asyncio
 import json
 import re
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -43,6 +44,28 @@ def safe_label(label: str) -> str:
     """A directory-safe form of a connection label."""
     cleaned = _UNSAFE_LABEL.sub("-", (label or "").strip()).strip("-.")
     return cleaned[:48] or "library"
+
+
+def engine_version() -> dict:
+    """Whether the sync engine is actually installed, and which version.
+
+    Worth surfacing: a missing rclone is a deployment problem whose only other
+    symptom is that every sync fails at the first subprocess call.
+    """
+    path = shutil.which(settings.rclone_bin) or (
+        settings.rclone_bin if Path(settings.rclone_bin).is_file() else None
+    )
+    if not path:
+        return {"available": False, "version": None, "bin": settings.rclone_bin}
+    try:
+        out = subprocess.run(  # noqa: S603 — a fixed binary, no shell, no user input
+            [path, "version"], capture_output=True, text=True, timeout=10, check=False
+        )
+        first = (out.stdout or out.stderr or "").strip().splitlines()
+        version = first[0].strip() if first else None
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "version": None, "bin": path, "error": str(exc)[:200]}
+    return {"available": True, "version": version, "bin": path}
 
 
 # --- connections ---------------------------------------------------------

@@ -142,7 +142,15 @@ def wait_for_job(client: Client, predicate, timeout: float = 60) -> bool:
 def main() -> int:
     import uvicorn
 
+    from app import graph
     from app.server import app
+
+    # Point Microsoft Graph at a closed local port. The connection checks below
+    # want the *failure* path, and without this they would make a real call to
+    # login.microsoftonline.com — slow, and a hang on an offline machine. The
+    # sync suite covers the success path against a stub.
+    graph.LOGIN_HOST = "http://127.0.0.1:9"
+    graph.GRAPH = "http://127.0.0.1:9"
 
     config = uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="error")
     server = uvicorn.Server(config)
@@ -226,6 +234,14 @@ def main() -> int:
     check("the analyst can sign in", code == 200, str(body))
     code, _, _ = bob.get("/api/users")
     check("the analyst cannot reach admin routes", code == 403, f"got {code}")
+    # Connecting a library decides who can read a data room, so it sits with
+    # accounts and keys rather than with everyday ingest.
+    code, _, _ = bob.get("/api/sync/connections")
+    check("the analyst cannot list connected libraries", code == 403, f"got {code}")
+    code, _, _ = bob.post("/api/sync/connections",
+                          {"label": "x", "site_url": "https://c.sharepoint.com/sites/X",
+                           "tenant": "t", "client_id": "c", "secret": "s" * 12})
+    check("the analyst cannot connect a library", code == 403, f"got {code}")
     code, _, _ = bob.get("/api/documents")
     check("the analyst can use the library", code == 200)
     code, body, _ = admin.post("/api/users/bob", {"disabled": True})
@@ -313,6 +329,58 @@ def main() -> int:
     check("indexing a path outside the roots is refused", code == 403, f"got {code}")
     code, body, _ = admin.post("/api/corpus-root", {"path": str(root)})
     check("setting the corpus root inside the roots works", code == 200, str(body)[:160])
+
+    print("\n— connected libraries —")
+    # No tenant here, so the probe that follows creation will fail — which is
+    # itself worth asserting: a connection that cannot be reached is still stored
+    # and reported honestly rather than rejected or silently marked good.
+    client_secret = "sharepoint-client-secret-" + secrets.token_hex(6)
+    code, body, _ = admin.post("/api/sync/connections", {
+        "label": "DD Room", "site_url": "https://contoso.sharepoint.com/sites/ProjectX",
+        "tenant": "tenant-id", "client_id": "client-id", "secret": client_secret,
+    })
+    check("a library can be connected", code == 200 and body["connection"]["id"], str(body)[:200])
+    conn_id = body.get("connection", {}).get("id")
+    check("the connection is probed on creation", "test" in body, str(body)[:160])
+
+    code, body, _ = admin.get("/api/sync/connections")
+    serialised = str(body)
+    check("the client secret is never returned", client_secret not in serialised)
+    check("the secret is masked to its last four",
+          body["connections"][0]["secret_last4"] == client_secret[-4:], str(body)[:200])
+    check("the mirror lives under the sync root",
+          body["connections"][0]["mirror_dir"].startswith(body["sync_root"]), str(body)[:200])
+    check("whether the sync engine is installed is reported",
+          "available" in body["rclone"], str(body.get("rclone")))
+
+    code, body, _ = admin.post("/api/sync/connections", {
+        "label": "bad", "site_url": "not-a-url", "tenant": "t", "client_id": "c",
+        "secret": "x" * 12,
+    })
+    check("a malformed site URL is refused", code == 400, f"got {code}: {str(body)[:120]}")
+
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}",
+                               {"label": "DD Room 2026", "interval_minutes": 120})
+    check("a connection can be edited",
+          code == 200 and body["connection"]["interval_minutes"] == 120, str(body)[:160])
+    rotated = "rotated-secret-" + secrets.token_hex(4)
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"secret": rotated})
+    check("rotating the secret updates the mask",
+          code == 200 and body["connection"]["secret_last4"] == rotated[-4:], str(body)[:160])
+    code, body, _ = admin.get("/api/sync/connections")
+    check("the rotated secret is not returned either", rotated not in str(body))
+
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/test")
+    check("testing an unreachable library reports a reason, not a crash",
+          code == 200 and body["ok"] is False and body["note"], str(body)[:200])
+
+    code, body, _ = admin.delete("/api/sync/connections/does-not-exist")
+    check("deleting an unknown connection is a 404", code == 404, f"got {code}")
+    code, body, _ = admin.delete(f"/api/sync/connections/{conn_id}?drop_mirror=true")
+    check("a connection can be deleted with its mirror", code == 200 and body["deleted"] == conn_id,
+          str(body)[:160])
+    code, body, _ = admin.get("/api/sync/connections")
+    check("no connections remain", code == 200 and body["connections"] == [], str(body)[:160])
 
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
