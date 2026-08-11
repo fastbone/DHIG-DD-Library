@@ -266,6 +266,7 @@ class SyncJob:
         self.bytes_done = 0
         self.mirror: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
+        self._error_tail: list[str] = []
 
     def _publish(self, status: str = "running", message: str = "") -> None:
         broker.publish(
@@ -319,7 +320,9 @@ class SyncJob:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env,
         )
         proc = self._proc
-        tail: list[str] = []
+        # Shared with _consume_log, which puts JSON error lines back into it.
+        self._error_tail = []
+        tail = self._error_tail
 
         async def pump_stderr() -> None:
             assert proc.stderr is not None
@@ -372,11 +375,20 @@ class SyncJob:
             return False
         stats = event.get("stats")
         if not isinstance(stats, dict):
-            # Still swallow structured logs so they don't pile into the error tail.
+            # Structured logs are swallowed so routine notices ("config file not
+            # found") stay out of the error tail — but an error or critical line
+            # is usually the *only* statement of why the run failed, so it is put
+            # back into the tail rather than merely counted. rclone reports bad
+            # credentials exactly this way, and without this the failure would
+            # reach the operator as "exit code 1".
             level = event.get("level")
             if level in {"error", "critical"}:
                 self.failed += 1
-                broker.log(f"  {event.get('msg', '')[:200]}", level="warn")
+                msg = str(event.get("msg", "")).strip()
+                if msg:
+                    broker.log(f"  {msg[:200]}", level="warn")
+                    self._error_tail.append(msg)
+                    del self._error_tail[:-20]
             return True
         self.done = int(stats.get("transfers") or 0)
         checks = int(stats.get("checks") or 0)

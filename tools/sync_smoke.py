@@ -247,6 +247,17 @@ async def main() -> int:
     check("cancelling does not mark the connection failed",
           sync.get(cid)["status"] == "ok", sync.get(cid)["status"])
 
+    # A JSON-only critical line must still reach the operator. rclone reports
+    # unusable credentials that way and nowhere else, so swallowing it would turn
+    # "invalid_client" into "exit code 1".
+    scenario(FAKE_RCLONE_MODE="critical")
+    job = sync.SyncJob(cid)
+    await job.run(then_ingest=False)
+    err = sync.get(cid)["error"] or ""
+    check("a JSON-only critical line becomes the reported reason",
+          "invalid_client" in err, err)
+    check("the reason is not reduced to an exit code", "exit code" not in err, err)
+
     scenario(FAKE_RCLONE_MODE="badauth")
     job = sync.SyncJob(cid)
     await job.run(then_ingest=False)

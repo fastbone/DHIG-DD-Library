@@ -9,6 +9,9 @@ environment variables so one binary covers every scenario:
     FAKE_RCLONE_MODE=fail      emit an error and exit 1
     FAKE_RCLONE_MODE=hang      run until terminated (for cancellation)
     FAKE_RCLONE_MODE=badauth   fail the size probe the way bad credentials do
+    FAKE_RCLONE_MODE=critical  fail with only a JSON "critical" line, which is
+                               how the real rclone reports bad credentials
+                               during a transfer
 
     FAKE_RCLONE_FILES=3        files to "transfer"
     FAKE_RCLONE_DELETES=2      deletions to report in the stats
@@ -72,9 +75,16 @@ def do_size() -> int:
 
 
 def do_transfer() -> int:
-    # rclone logs a non-stats line first; sync.py must tolerate it.
-    sys.stderr.write("NOTICE: Config file not found - using defaults\n")
-    sys.stderr.flush()
+    # rclone logs a non-stats line first; sync.py must tolerate it. The real one
+    # emits this as JSON when --use-json-log is on, so send it that way too.
+    emit({"level": "notice", "msg": 'Config file "/dev/null" not found - using defaults'})
+
+    if MODE == "critical":
+        # Exactly how rclone reports credentials it cannot use during a transfer:
+        # one JSON critical line, no stats, no plain-text line anywhere.
+        emit({"level": "critical", "msg": 'Failed to create file system for ":onedrive:": '
+              "failed to get root: couldn't fetch token: invalid_client"})
+        return 1
 
     if MODE == "hang":
         emit({"level": "info", "msg": "starting", "stats": {"transfers": 0, "checks": 0,

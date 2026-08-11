@@ -53,6 +53,11 @@ bombs are refused rather than trusted, and each refusal is logged. `.zip`,
 `.tar`, `.tar.gz`, `.tar.bz2` and `.tar.xz` are accepted; an archive can extract
 and ingest in one step.
 
+Or connect a **SharePoint Online document library** and let it mirror itself. An
+administrator enters the site URL and an Entra app registration once, and the
+library is copied into the data folder and indexed like any other folder —
+manually, or on an interval. See *Connecting a SharePoint library* below.
+
 | Source | Extracted as | Anchors |
 |---|---|---|
 | PDF | text per page, optional OCR for scans | `p14` |
@@ -100,7 +105,59 @@ verdicts and its cost.
   documents whose files are gone, vacuum the database, delete an extracted
   corpus folder.
 - **Audit log.** Every sign-in, failed sign-in, account change, key change,
-  upload, extraction, question and storage operation, with actor and timestamp.
+  upload, extraction, sync, question and storage operation, with actor and
+  timestamp.
+
+Connected libraries are managed from the Corpus tab but are administrator-only
+for the same reason keys are: connecting one makes its contents readable to
+everyone who can sign in.
+
+## Connecting a SharePoint library
+
+The app mirrors the library to disk and then treats it as an ordinary corpus
+folder. Files are cached in full rather than as text alone, because two things
+need the original bytes: opening a citation at its source, and `run_python`
+computing over the real workbook instead of eyeballing extracted text.
+
+**In Entra ID**, once per tenant:
+
+1. Register an application (any name, no redirect URI needed — this is app-only
+   auth, so no user ever signs in to it).
+2. Add an **application** permission, not a delegated one, and grant admin
+   consent. **`Sites.Selected` is the right choice**: it grants nothing until an
+   administrator assigns the app to a specific site, so the blast radius is one
+   library. `Sites.Read.All` would hand the app every site in the tenant.
+3. Grant the app read access to the one site (`Grant-PnPAzureADAppSitePermission`
+   in PnP PowerShell, or `POST /sites/{id}/permissions` in Graph).
+4. Create a client secret and copy it — Entra shows it once.
+
+**In DD Library**, Corpus → SharePoint libraries → *Connect a library*: paste the
+site URL (as copied from the browser — a URL pointing at a folder inside the
+library is fine), the directory and application IDs, and the secret. The
+connection is tested immediately, so a wrong secret or a missing site permission
+is reported there and then.
+
+Then *sync now*, or set an interval. What happens on each sync:
+
+- the library's size is checked first, and a library over `DD_MAX_SYNC_GB` or
+  larger than the free space is refused before anything is fetched;
+- only the eleven indexable extensions are fetched by default — a data room is
+  full of `.msg`, images and video that ingest would ignore anyway;
+- deletions are mirrored, bounded by `DD_MAX_SYNC_DELETE` so a connection pointed
+  at the wrong library cannot empty the mirror in one run;
+- the mirror is then indexed, and documents whose files disappeared are dropped
+  from the catalogue.
+
+The client secret is encrypted at rest with `DD_SECRET_KEY` and is never returned
+to the browser — editing a connection leaves the field blank, meaning "keep it".
+It reaches the sync engine through its environment, never a config file and never
+the command line, which `ps` would expose to anything else on the host.
+
+Two things worth knowing: the app authenticates as itself, not as the person
+asking, so **SharePoint's own per-user permissions do not carry into DD Library** —
+anyone who can sign in can read anything that was synced. And Entra client secrets
+expire; when one does, syncs fail with `invalid_client` until it is replaced under
+*edit*.
 
 ## Accounts and access
 
@@ -207,11 +264,15 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_SESSION_TTL_HOURS` | `12` | Sliding session expiry |
 | `DD_COOKIE_SECURE` | `auto` | Marks the session cookie Secure when the request arrived over HTTPS. `1`/`0` force it |
 | `DD_LOGIN_MAX_ATTEMPTS` / `DD_LOGIN_LOCKOUT_SECONDS` | `8` / `300` | Sign-in throttle |
-| `DD_BROWSE_ROOTS` | extraction root + `/corpus` + cwd | Directories the folder picker may descend into |
+| `DD_BROWSE_ROOTS` | `/corpus` + cwd | External directories the folder picker may descend into. The extraction root and the sync root are always included |
 | `DD_MAX_UPLOAD_MB` | `4096` | Per-archive upload ceiling |
 | `DD_MAX_EXTRACT_GB` | `20` | Total uncompressed size ceiling |
 | `DD_MAX_ARCHIVE_MEMBERS` | `100000` | Member-count ceiling |
 | `DD_MAX_COMPRESSION_RATIO` | `200` | Above this an archive is treated as a decompression bomb |
+| `DD_MAX_SYNC_GB` | `50` | Refuse to mirror a library larger than this |
+| `DD_MAX_SYNC_DELETE` | `500` | Abort a sync that would delete more than this many mirrored files |
+| `DD_SYNC_TIMEOUT` | `21600` | Give up on one sync after this many seconds |
+| `DD_RCLONE_BIN` | `rclone` | The sync engine. Point at another binary for a newer version |
 
 Effort is worth a sweep of its own on your questions: `low` and `medium` are
 strong on Claude Opus 5 and much cheaper, while `xhigh` suits the hardest
@@ -234,6 +295,13 @@ Read this before pointing it at a live deal.
   single blob in the system prompt, so every user learns that every document
   exists. If your data room has folders only some people may see, run one
   instance per access tier with separate data volumes.
+- **A connected SharePoint library loses SharePoint's permissions.** The app
+  authenticates as itself, not as the person asking, so anything synced is
+  readable by anyone who can sign in — regardless of who could open it in
+  SharePoint. Scope the Entra app with `Sites.Selected` on the one library, and
+  connect only libraries whose whole contents everyone here may see.
+- **Back up `DD_SECRET_KEY` with the data volume** — it also encrypts the stored
+  SharePoint client secrets, not just API keys.
 - **`/api/documents/{id}/original` serves any indexed file** to any signed-in
   user, and the folder picker can descend into `DD_BROWSE_ROOTS` (administrators
   only). Both are intended; keep the roots narrow.
@@ -247,8 +315,8 @@ Read this before pointing it at a live deal.
   absolute paths, links, special files, oversized and over-ratio archives, and
   writes only under `data/uploads/extracted`. The limits are configurable; the
   defaults are deliberately not generous.
-- **Back up `DD_SECRET_KEY` with the data volume.** Without it the stored API
-  keys in that volume are unrecoverable.
+- Without `DD_SECRET_KEY` the encrypted secrets in that volume — API keys and
+  SharePoint client secrets alike — are unrecoverable and must be re-entered.
 - **Confirm data-retention terms with your Anthropic account team** before
   uploading privileged material, and note that Claude Fable 5 requires 30-day
   retention — stay on Claude Opus 5 if you are contractually zero-retention.
@@ -310,6 +378,14 @@ ranges Docker allocates from. Narrow it to the exact gateway if you want.
 If your proxy terminates TLS but does not forward `X-Forwarded-Proto`, set
 `DD_COOKIE_SECURE=1` explicitly rather than leaving it on `auto`.
 
+### Outbound access
+
+The container needs `api.anthropic.com`. Connecting a SharePoint library adds
+`login.microsoftonline.com`, `graph.microsoft.com` and `*.sharepoint.com` (Graph
+redirects downloads there). If the host restricts egress, that allowlist has to
+grow before the first sync — otherwise the connection test fails with a "cannot
+reach" message that looks like a credential problem.
+
 ### Updating
 
 `deploy/update.sh` runs on the docker host, from the checkout:
@@ -356,17 +432,24 @@ backup of `/var/lib/docker/volumes/*_dd-data` while the container is stopped, or
 /out/dd-data.tgz /data`. Everything except uploads and deliverables can be
 rebuilt from the corpus by reindexing, at the cost of another indexing sweep.
 
+Mirrors of connected libraries live in that volume too, under `data/sync`. They
+are worth *excluding* from a volume backup if size matters — they are a byte-for-
+byte copy of something SharePoint still holds, and a fresh sync rebuilds them.
+The connection rows themselves, including the encrypted client secrets, are in
+`index.sqlite3` and so are already covered by the snapshot above.
+
 ---
 
 ## Verifying it works
 
-Three suites, none of which spend a token or touch your real index — each uses
-its own temporary data directory.
+Four suites, none of which spend a token, touch your real index, or need a
+network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 53 checks: auth, CSRF, keys, uploads, storage, audit
-python3 tools/ui_smoke.py             # 25 checks: the browser front end, end to end
-tools/container_check.sh              # 6 checks: the container's runtime constraints
+python3 tools/api_smoke.py            # 71 checks: auth, CSRF, keys, uploads, sync, storage, audit
+python3 tools/sync_smoke.py           # 39 checks: connected libraries, end to end
+python3 tools/ui_smoke.py             # 34 checks: the browser front end, end to end
+tools/container_check.sh              # 7 checks: the container's runtime constraints
 ```
 
 `api_smoke.py` drives the real HTTP surface with a cookie-aware client:
@@ -379,13 +462,24 @@ rest, browsing outside the permitted roots is refused — as is naming such a pa
 directly to the corpus-root and ingest routes — and every privileged action
 lands in the audit log.
 
+`sync_smoke.py` covers connected libraries against a stub Graph and a fake
+rclone (`tools/fake_rclone.py`), so it needs no tenant and no network while still
+spawning the real subprocess and running the real ingest: a connection round-trips
+through encryption and is never echoed back, an API-key ciphertext cannot be
+reused as a client secret, progress parsing tracks transfers and unchanged files,
+remote deletions flow through to purging the index, a failure and a cancellation
+both leave the connection in a sane state, an oversized library is refused before
+anything is fetched, and the client secret reaches rclone through its environment
+rather than its command line.
+
 `ui_smoke.py` ingests the sample corpus, stamps synthetic cards, replaces the
 agent with a scripted event stream, and drives a real browser: sign-in,
 streaming answer, reasoning panel, tool trace, citation chips that open the
 source at the cited page, verdict badges, artifact download, the admin surfaces,
-and a drag-and-drop archive upload through to extraction. Screenshots land in
-`/tmp`. Requires `pip install playwright` and a Chromium binary (set
-`DD_CHROMIUM` if it is not at `/opt/pw-browsers/chromium`).
+a drag-and-drop archive upload through to extraction, and the connected-library
+pane — including that a sync event drives the sync progress bar and not the
+indexing one. Screenshots land in `/tmp`. Requires `pip install playwright` and a
+Chromium binary (set `DD_CHROMIUM` if it is not at `/opt/pw-browsers/chromium`).
 
 `container_check.sh` recreates the image's constraints without Docker — a
 read-only application directory, a separate writable data directory, the
@@ -402,13 +496,16 @@ unprivileged account.
 app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
-                  qa_log, users, sessions, api_keys, archives, audit)
+                  qa_log, users, sessions, api_keys, archives, sync_connections,
+                  audit)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
   extract.py      per-format extraction into the anchored text mirror
   ingest.py       walk → hash → extract → index → duplicate detection
   uploads.py      archive upload and hardened extraction
+  graph.py        the app-only Microsoft Graph calls rclone cannot make
+  sync.py         connected libraries: credentials, the mirror job, scheduling
   storage.py      disk usage and the reclaim operations
   manifest.py     the sweep (one card per document) and the corpus map
   search.py       BM25 search, catalogue browsing, corpus statistics
@@ -420,7 +517,8 @@ app/
   events.py       in-process pub/sub behind the SSE progress stream
   server.py       FastAPI routes and the access-control middleware
 web/              single-page UI plus the login page, no build step
-tools/            sample corpus, API smoke test, UI smoke test, container check
+tools/            sample corpus, API / sync / UI smoke tests, container check,
+                  fake rclone
 Dockerfile        non-root, read-only /app, /data volume
 docker-compose.yml  hardened runtime, localhost-published on 8412
 deploy/
@@ -472,3 +570,10 @@ invalidating existing passwords.
 - **Batch the sweep** — the Batch API halves indexing cost; live progress is
   what it trades away.
 - **Multi-user** — real auth, per-user access tiers, and a map filtered per tier.
+- **Delta sync** — each sync re-lists the library and ingest re-hashes the mirror.
+  Fine at this size; if it stops being fine, Graph's `/delta` endpoint gives
+  changed items only, and `occurrences.mtime`/`size_bytes` are already recorded
+  and unused, so ingest could skip unchanged files without reading them.
+- **More sources** — the connection abstraction is "fill a directory, then
+  ingest". Google Drive, Dropbox and S3 are all rclone backends already; each
+  would need its own credential fields and its own discovery step.
