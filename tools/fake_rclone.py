@@ -8,6 +8,7 @@ environment variables so one binary covers every scenario:
     FAKE_RCLONE_MODE=ok        transfer FAKE_RCLONE_FILES files, then exit 0
     FAKE_RCLONE_MODE=fail      emit an error and exit 1
     FAKE_RCLONE_MODE=hang      run until terminated (for cancellation)
+    FAKE_RCLONE_MODE=hangsize  hang during the `size` preflight, not the transfer
     FAKE_RCLONE_MODE=badauth   fail the size probe the way bad credentials do
     FAKE_RCLONE_MODE=critical  fail with only a JSON "critical" line, which is
                                how the real rclone reports bad credentials
@@ -64,6 +65,11 @@ def dump_env() -> None:
 
 
 def do_size() -> int:
+    if MODE == "hangsize":
+        # A listing that never returns. The real thing can do this against a huge
+        # library or a wedged connection, and it must still be cancellable.
+        while True:
+            time.sleep(0.2)
     if MODE == "badauth":
         sys.stderr.write(
             "ERROR : : error listing: invalid_client: AADSTS7000215: "

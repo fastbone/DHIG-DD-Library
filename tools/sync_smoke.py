@@ -178,10 +178,15 @@ async def main() -> int:
           sync.get(cid)["drive_id"] is None, sync.get(cid)["drive_id"])
     sync.update(cid, site_url=SITE)
     await sync.test(cid)
-    # Only the two fields that identify the drive invalidate it; everything else
-    # must leave it resolved, or every edit would cost a Graph round trip.
+    # Only a *changed* site or library invalidates it. The edit form submits every
+    # field on every save, so testing for presence would discard the drive on each
+    # Save and make an unrelated rename cost a Graph round trip.
     sync.update(cid, label="DD Room", interval_minutes=0, mirror_deletions=True)
     check("an edit that does not touch site or library keeps the resolved drive",
+          sync.get(cid)["drive_id"] == "drv-1", sync.get(cid)["drive_id"])
+    sync.update(cid, label="DD Room 2026", site_url=SITE, library="",
+                tenant="tid", client_id="cid")
+    check("resubmitting the same site and library keeps the resolved drive",
           sync.get(cid)["drive_id"] == "drv-1", sync.get(cid)["drive_id"])
     for field in ("label", "site_url", "tenant", "client_id"):
         try:
@@ -310,12 +315,52 @@ async def main() -> int:
           "invalid_client" in err, err)
     check("the reason is not reduced to an exit code", "exit code" not in err, err)
 
+    # Cancelling must work during the preflight too, not only the transfer. The
+    # preflight runs before any progress is published, so a hang there is the
+    # least visible way for a job to wedge — and it holds the one-sync-at-a-time
+    # lock while it does.
+    scenario(FAKE_RCLONE_MODE="hangsize")
+    job = sync.SyncJob(cid)
+    runner = asyncio.create_task(job.run(then_ingest=False))
+    await asyncio.sleep(0.8)
+    job.cancel.set()
+    try:
+        await asyncio.wait_for(runner, timeout=20)
+        check("a sync cancelled during the preflight stops promptly", True)
+    except asyncio.TimeoutError:
+        check("a sync cancelled during the preflight stops promptly", False,
+              "still running after 20s")
+
     scenario(FAKE_RCLONE_MODE="badauth")
     job = sync.SyncJob(cid)
     await job.run(then_ingest=False)
     check("a credential failure during preflight is reported, not crashed through",
           sync.get(cid)["status"] == "failed" and "AADSTS" in (sync.get(cid)["error"] or ""),
           sync.get(cid)["error"])
+
+    print("\n— a stale 'syncing' status does not stop the schedule —")
+    sync.update(cid, interval_minutes=60)
+    db.execute("UPDATE sync_connections SET status='syncing', last_sync_at=NULL WHERE id=?",
+               (cid,))
+    check("a connection stuck mid-sync is not due", sync.due_connections() == [])
+    cleared = sync.reset_interrupted()
+    check("startup clears the leftover status", cleared == 1 and
+          sync.get(cid)["status"] == "failed", sync.get(cid)["status"])
+    check("and the schedule picks it up again", len(sync.due_connections()) == 1)
+    check("the reason is recorded rather than silently reset",
+          "restart" in (sync.get(cid)["error"] or ""), sync.get(cid)["error"])
+    check("a second call finds nothing to clear", sync.reset_interrupted() == 0)
+
+    # And that it is actually wired into startup, not merely available: run the
+    # real lifespan and check the leftover status is gone when it comes up.
+    from app import server as _server
+
+    db.execute("UPDATE sync_connections SET status='syncing' WHERE id=?", (cid,))
+    async with _server.lifespan(_server.app):
+        pass
+    check("the app clears it on startup, not just on request",
+          sync.get(cid)["status"] != "syncing", sync.get(cid)["status"])
+    sync.update(cid, interval_minutes=0)
 
     print("\n— size limits —")
     scenario(FAKE_RCLONE_MODE="ok", FAKE_RCLONE_SIZE=999 * 10**9)
@@ -324,7 +369,39 @@ async def main() -> int:
     err = sync.get(cid)["error"] or ""
     check("a library over DD_MAX_SYNC_GB is refused before any transfer",
           "over the" in err and "GB limit" in err, err)
-    scenario(FAKE_RCLONE_SIZE=1 << 20)
+
+    # The free-space check must credit what the mirror already holds. A library
+    # that only just fitted the first time would otherwise be refused on every
+    # resync — including a no-op one — because its own mirror is what filled the
+    # disk. Simulated by claiming a library slightly larger than the free space
+    # while the mirror already holds more than the difference.
+    # The arithmetic matters. With a mirror holding H and F free afterwards, the
+    # old check refused when remote > F; the new one refuses when remote - H > F.
+    # So the two differ exactly for remote in (F, F + H] — hence a 32 MiB mirror
+    # and a library 16 MiB larger than the space left, which is comfortably
+    # inside that window in both directions.
+    import shutil as _shutil
+
+    mirror = Path(sync.get(cid)["mirror_dir"])
+    mirror.mkdir(parents=True, exist_ok=True)
+    (mirror / "already-here.bin").write_bytes(b"\0" * (32 << 20))
+    free_after = _shutil.disk_usage(_DATA).free
+    scenario(FAKE_RCLONE_SIZE=free_after + (16 << 20), FAKE_RCLONE_FILES=0)
+    job = sync.SyncJob(cid)
+    await job.run(then_ingest=False)
+    row = sync.get(cid)
+    check("a resync is not refused for space the mirror itself occupies",
+          row["status"] == "ok", f"status={row['status']} error={row['error']}")
+
+    # But a library genuinely larger than free space plus the mirror is refused.
+    scenario(FAKE_RCLONE_SIZE=free_after + (256 << 20))
+    job = sync.SyncJob(cid)
+    await job.run(then_ingest=False)
+    err = sync.get(cid)["error"] or ""
+    check("a library that genuinely will not fit is still refused",
+          "needs another" in err and "free" in err, err)
+    (mirror / "already-here.bin").unlink()
+    scenario(FAKE_RCLONE_SIZE=1 << 20, FAKE_RCLONE_FILES=1)
 
     print("\n— deleting a connection —")
     mirror = Path(sync.get(cid)["mirror_dir"])

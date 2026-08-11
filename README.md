@@ -139,8 +139,10 @@ is reported there and then.
 
 Then *sync now*, or set an interval. What happens on each sync:
 
-- the library's size is checked first, and a library over `DD_MAX_SYNC_GB` or
-  larger than the free space is refused before anything is fetched;
+- the library's size is checked first: one over `DD_MAX_SYNC_GB` is refused
+  outright, and so is one whose *not yet mirrored* bytes would not fit the free
+  space — what the mirror already holds is credited, or a library that only just
+  fitted the first time could never be synced again;
 - only the eleven indexable extensions are fetched by default — a data room is
   full of `.msg`, images and video that ingest would ignore anyway;
 - deletions are mirrored, bounded by `DD_MAX_SYNC_DELETE` so a connection pointed
@@ -525,7 +527,7 @@ network — each uses its own temporary data directory.
 
 ```bash
 python3 tools/api_smoke.py            # 89 checks: auth, CSRF, keys, uploads, access, sync, storage
-python3 tools/sync_smoke.py           # 55 checks: connected libraries, end to end
+python3 tools/sync_smoke.py           # 65 checks: connected libraries, end to end
 python3 tools/ui_smoke.py             # 36 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```

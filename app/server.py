@@ -86,6 +86,7 @@ async def lifespan(app: FastAPI):
     broker.bind_loop(asyncio.get_running_loop())
     auth.bootstrap()
     storage.housekeeping()
+    sync.reset_interrupted()
     if security.secret_key_source() == "file":
         broker.log(
             "DD_SECRET_KEY is not set — using data/secret.key. Set it explicitly in production; "

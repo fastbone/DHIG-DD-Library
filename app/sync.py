@@ -46,6 +46,42 @@ def safe_label(label: str) -> str:
     return cleaned[:48] or "library"
 
 
+def _dir_size(path: Path) -> int:
+    """Bytes already held on disk. Missing or unreadable counts as nothing."""
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def reset_interrupted() -> int:
+    """Clear connections left mid-sync by a crash or a redeploy.
+
+    `status='syncing'` is set when a job starts and cleared when it ends, so a
+    process that dies in between leaves it set forever — and `due_connections`
+    skips that status, which quietly stops the schedule for that connection until
+    someone syncs it by hand. Called once at startup, where a `syncing` row can
+    only be a leftover: nothing is running yet.
+    """
+    stale = db.rows("SELECT id, label FROM sync_connections WHERE status='syncing'")
+    if not stale:
+        return 0
+    db.execute(
+        "UPDATE sync_connections SET status='failed',"
+        " error='interrupted — the app restarted mid-sync' WHERE status='syncing'"
+    )
+    for row in stale:
+        broker.log(
+            f"{row['label']} was left mid-sync by a restart; it will sync again on schedule.",
+            level="warn",
+        )
+    return len(stale)
+
+
 def engine_version() -> dict:
     """Whether the sync engine is actually installed, and which version.
 
@@ -157,7 +193,8 @@ def create(
 
 
 def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
-    if get(conn_id) is None:
+    before = get(conn_id)
+    if before is None:
         raise SyncError("no such connection")
     # `library` is the one text column that may be cleared — an empty value means
     # "use the site's default library". For the rest an empty value is a mistake,
@@ -166,6 +203,7 @@ def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
     required = {"label", "site_url", "tenant", "client_id"}
     sets: list[str] = []
     params: list = []
+    applied: dict[str, object] = {}
     for column in ("label", "site_url", "library", "tenant", "client_id",
                    "only_supported_types", "mirror_deletions", "interval_minutes"):
         if column not in fields or fields[column] is None:
@@ -181,6 +219,7 @@ def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
                 if column in required:
                     raise SyncError(f"{column.replace('_', ' ')} cannot be empty")
                 value = None
+        applied[column] = value
         sets.append(f"{column}=?")
         params.append(value)
     if fields.get("secret"):
@@ -192,12 +231,15 @@ def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
     if fields.get("site_url"):
         graph.split_site_url(fields["site_url"])
     # The drive id is what rclone actually mirrors, and site URL + library are the
-    # two things that identify it. Change either and the stored id is stale, so it
-    # is discarded and the next sync re-resolves. Presence, not truthiness:
-    # clearing the library back to the site default is exactly such a change, and
-    # leaving the id in place would go on mirroring the previous library while the
-    # UI showed the new one — wrong data rather than an error.
-    if any(f in fields and fields[f] is not None for f in ("site_url", "library")):
+    # two things that identify it. When either genuinely changes the stored id is
+    # stale, so it is discarded and the next sync re-resolves — leaving it would go
+    # on mirroring the previous library while the UI showed the new one, which is
+    # wrong data rather than an error.
+    #
+    # Compared against the stored value, not merely present in the patch: the edit
+    # form submits every field on every save, so testing for presence discarded the
+    # id on each Save and made an unrelated rename cost a Graph round trip.
+    if any(f in applied and applied[f] != before[f] for f in ("site_url", "library")):
         sets += ["drive_id=NULL", "drive_name=NULL"]
     if not sets:
         return get(conn_id)
@@ -424,14 +466,39 @@ class SyncJob:
 
     # --- lifecycle -------------------------------------------------------
 
-    async def _preflight(self, row: dict, env: dict) -> None:
+    async def _preflight(self, row: dict, env: dict, mirror: Path) -> None:
         """Refuse a library that will not fit before fetching any of it."""
         args = ["size", ":onedrive:", "--json", *self._filters(row)]
-        proc = await asyncio.create_subprocess_exec(
+        # Registered and bounded like the transfer: a hung listing must be
+        # cancellable from the UI and must honour DD_SYNC_TIMEOUT, or the job sits
+        # there holding the one-sync-at-a-time lock with no way out.
+        self._proc = await asyncio.create_subprocess_exec(
             settings.rclone_bin, *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
         )
-        out, err = await proc.communicate()
+        proc = self._proc
+
+        async def watch_cancel() -> None:
+            await self.cancel.wait()
+            if proc.returncode is None:
+                proc.terminate()
+
+        canceller = asyncio.create_task(watch_cancel())
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(), timeout=settings.sync_timeout_s
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise SyncError(
+                f"listing the library exceeded DD_SYNC_TIMEOUT ({settings.sync_timeout_s}s)"
+            ) from None
+        finally:
+            canceller.cancel()
+            self._proc = None
+
+        if self.cancel.is_set():
+            return
         if proc.returncode != 0:
             detail = err.decode("utf-8", "replace").strip().splitlines()
             raise SyncError(f"could not size the library: {detail[-1] if detail else 'unknown'}")
@@ -447,10 +514,17 @@ class SyncJob:
                 f"the library is {remote_bytes / 1e9:.1f} GB, over the "
                 f"{settings.max_sync_gb} GB limit (raise DD_MAX_SYNC_GB if that is intended)"
             )
+        # Only the bytes not already mirrored have to fit. Comparing the whole
+        # library against free space refuses every resync of a library that only
+        # just fitted the first time — including a no-op one with nothing to fetch,
+        # since its own mirror is what consumed the space.
         free = shutil.disk_usage(settings.data_dir).free
-        if remote_bytes > free:
+        held = _dir_size(mirror)
+        needed = max(0, remote_bytes - held)
+        if needed > free:
             raise SyncError(
-                f"the library is {remote_bytes / 1e9:.1f} GB but only "
+                f"the library is {remote_bytes / 1e9:.1f} GB and {held / 1e9:.1f} GB is "
+                f"already mirrored, so it needs another {needed / 1e9:.1f} GB — only "
                 f"{free / 1e9:.1f} GB is free on the data volume"
             )
         self.total = count
@@ -460,8 +534,8 @@ class SyncJob:
         self.library_files = count
         self.library_bytes = remote_bytes
         broker.log(
-            f"{count} file(s), {remote_bytes / 1e9:.2f} GB to mirror "
-            f"({free / 1e9:.1f} GB free)."
+            f"{count} file(s), {remote_bytes / 1e9:.2f} GB in the library · "
+            f"{held / 1e9:.2f} GB already mirrored · {free / 1e9:.1f} GB free."
         )
         self._publish(message="starting transfer")
 
@@ -496,7 +570,7 @@ class SyncJob:
 
             mirror.mkdir(parents=True, exist_ok=True)
             env = self._env(row, secret)
-            await self._preflight(row, env)
+            await self._preflight(row, env, mirror)
 
             verb = "sync" if row["mirror_deletions"] else "copy"
             args = [
