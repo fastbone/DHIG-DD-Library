@@ -305,6 +305,57 @@ def main() -> int:
     code, body, _ = admin.post("/api/corpus-root", {"path": str(root)})
     check("setting the corpus root inside the roots works", code == 200, str(body)[:160])
 
+    print("\n— corpus access —")
+    from app import ingest as _ingest
+
+    # Regression: the walk used to test every component of the *absolute* path
+    # against SKIP_DIRS, which contained "data". Any root under a directory of
+    # that name — including the container's own /data volume, where every
+    # uploaded archive lands — therefore scanned as zero files and reported
+    # success. This is the shape of that bug, in a permitted root.
+    room = root / "deal-data" / "data" / "sub"
+    room.mkdir(parents=True, exist_ok=True)
+    (room / "memo.txt").write_text("quarterly revenue memo")
+    found = _ingest.scan(root)
+    check("a folder named 'data' is still scanned",
+          any(p.name == "memo.txt" for p in found.files),
+          str(sorted(p.name for p in found.files))[:200])
+
+    # …but the app's own output must never be ingested as source material.
+    Path(_TMP, "derived").mkdir(parents=True, exist_ok=True)
+    Path(_TMP, "derived", "deadbeef.md").write_text("mirror text, not a source document")
+    whole = _ingest.scan(Path(_TMP))
+    check("the text mirror is never re-ingested",
+          not any("derived" in p.parts for p in whole.files),
+          str([str(p) for p in whole.files if "derived" in p.parts])[:200])
+
+    # Unreadable paths must be reported, not silently dropped.
+    blind = root / "unreadable"
+    blind.mkdir(exist_ok=True)
+    (blind / "hidden.txt").write_text("invisible")
+    os.chmod(blind, 0o000)
+    try:
+        walked = _ingest.scan(root)
+        denied = walked.blocked
+    finally:
+        os.chmod(blind, 0o755)
+    check("an unreadable folder is reported rather than skipped in silence",
+          denied >= 1 or os.geteuid() == 0,
+          f"blocked={denied} (euid={os.geteuid()})")
+
+    code, body, _ = admin.get("/api/access-check")
+    check("access check reports the runtime identity",
+          code == 200 and "uid" in body.get("identity", {}), str(body)[:160])
+    check("access check inspects every configured root",
+          code == 200 and body.get("roots"), str(body)[:160])
+    code, body, _ = admin.get("/api/access-check?path=/etc")
+    check("access check honours the browse-root fence", code == 403, f"got {code}")
+    code, body, _ = anon.get("/api/access-check")
+    check("access check needs a session", code == 401, f"got {code}")
+    code, body, _ = admin.post("/api/access-repair", {"path": str(root)})
+    check("access repair runs and re-reports",
+          code == 200 and "repaired" in body and "host_commands" in body, str(body)[:160])
+
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
     check("storage usage reports areas and roots",
