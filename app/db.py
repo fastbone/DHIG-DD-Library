@@ -435,6 +435,36 @@ LOG_CONTEXT_MAX = 20_000
 _log_writes = 0
 
 
+def _clip_value(value, budget: int):
+    """Bound one context value to roughly `budget` characters, keeping its shape.
+
+    Every branch returns something bounded, including the fallback — that is what
+    makes the caller's loop terminate rather than give up and store nothing.
+    """
+    if isinstance(value, str):
+        if len(value) <= budget:
+            return value
+        return value[:budget] + f"… [{len(value) - budget} more characters]"
+    if isinstance(value, list):
+        # Bounded by total characters, not by item count: 100 long paths is 40 KB.
+        kept: list[str] = []
+        spent = 0
+        for item in value:
+            text = str(item)[: max(80, budget // 8)]
+            if spent + len(text) > budget:
+                break
+            kept.append(text)
+            spent += len(text)
+        if len(kept) < len(value):
+            kept.append(f"… [{len(value) - len(kept)} more]")
+        return kept
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    # Anything else (a dict, an object) becomes a clipped string. Unbounded nesting
+    # is the one shape that could otherwise defeat the budget.
+    return _clip_value(json.dumps(value, default=str), budget)
+
+
 def _log_context_json(context: dict) -> str:
     """Serialise a context object, shrinking the *object* if it is too large.
 
@@ -443,32 +473,34 @@ def _log_context_json(context: dict) -> str:
     it degrades to an opaque blob, losing the traceback and the path list at
     exactly the moment a bug report needs them. So oversize values are trimmed
     individually — with a marker saying so — and the result is always valid JSON.
+
+    The budget is applied and then *checked*, repeatedly. One pass is not enough
+    because JSON escaping is not size-preserving: a traceback is mostly newlines,
+    and each one doubles on the way out, so a first guess that looks like it fits
+    can serialise to twice the cap.
     """
     payload = json.dumps(context, default=str)
     if len(payload) <= LOG_CONTEXT_MAX:
         return payload
 
-    # Budget per value, so one enormous field cannot crowd out the rest.
-    budget = max(400, LOG_CONTEXT_MAX // max(len(context), 1))
-    shrunk: dict = {}
-    for key, value in context.items():
-        if isinstance(value, str) and len(value) > budget:
-            shrunk[key] = value[:budget] + f"… [{len(value) - budget} more characters]"
-        elif isinstance(value, list):
-            kept = [str(v)[:400] for v in value[:100]]
-            if len(value) > 100:
-                kept.append(f"… [{len(value) - 100} more]")
-            shrunk[key] = kept
-        else:
-            shrunk[key] = value
-    payload = json.dumps(shrunk, default=str)
-    if len(payload) <= LOG_CONTEXT_MAX:
-        return payload
-    # Still too big: keep the keys and say what was dropped, rather than storing
-    # something that will not parse.
+    n = max(len(context), 1)
+    # Reserve for framing — braces, quotes, commas and the key names themselves —
+    # rather than handing the whole cap to the values.
+    framing = sum(len(str(k)) + 6 for k in context) + 32
+    budget = max(120, (LOG_CONTEXT_MAX - framing) // n)
+    for _ in range(8):
+        shrunk = {k: _clip_value(v, budget) for k, v in context.items()}
+        payload = json.dumps(shrunk, default=str)
+        if len(payload) <= LOG_CONTEXT_MAX:
+            return payload
+        budget //= 2
+        if budget < 40:
+            break
+    # Only reachable with a pathological number of keys, where even 40 characters
+    # each will not fit. Keep it valid and say what happened.
     return json.dumps(
-        {"truncated": True, "keys": sorted(context), "note":
-         f"context exceeded {LOG_CONTEXT_MAX} characters and was not stored"}
+        {"truncated": True, "keys": sorted(str(k) for k in context)[:200], "note":
+         f"context exceeded {LOG_CONTEXT_MAX} characters and could not be shortened"}
     )
 
 

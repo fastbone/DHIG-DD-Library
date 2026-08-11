@@ -762,12 +762,18 @@ def main() -> int:
     # losing the traceback exactly when a bug report needs it.
     from app import db as _db
 
+    # Long paths deliberately: a list capped by item count rather than by
+    # characters passes a short-path test and still blows the column ten times
+    # over, and the fallback for "still too big" is a stub with no traceback in it.
     _db.log_record(
         "error", "oversize context probe", source="ingest",
         context={
             "rel_path": "deep/folder/enormous.pdf",
             "traceback": "Traceback (most recent call last):\n" + "  File 'x.py', line 1\n" * 3000,
-            "paths": [f"/corpus/f{i}/document {i}.pdf" for i in range(500)],
+            "paths": [
+                f"/corpus/{'deeply_nested_folder_'*8}{i}/Consolidated statements {i}.pdf"
+                for i in range(500)
+            ],
         },
     )
     code, body, _ = admin.get("/api/logs?q=oversize%20context%20probe")
@@ -777,11 +783,25 @@ def main() -> int:
           isinstance(ctx, dict) and "raw" not in ctx
           and ctx.get("rel_path") == "deep/folder/enormous.pdf",
           str(ctx)[:200])
-    check("an oversize context keeps a usable prefix of each field",
-          isinstance(ctx, dict)
+    check("an oversize context is shortened rather than abandoned",
+          isinstance(ctx, dict) and not ctx.get("truncated")
           and str(ctx.get("traceback", "")).startswith("Traceback (most recent call last)")
           and 0 < len(ctx.get("paths") or []) < 500,
           str({k: str(v)[:40] for k, v in (ctx or {}).items()}))
+    check("an oversize context fits the column it is stored in",
+          isinstance(ctx, dict) and len(json.dumps(ctx)) <= _db.LOG_CONTEXT_MAX,
+          f"{len(json.dumps(ctx)) if isinstance(ctx, dict) else 0} chars")
+    # And the shapes the app really produces are not shortened at all.
+    real_tb = "Traceback (most recent call last):\n" + "  File 'extract.py', line 5\n" * 12
+    _db.log_record("error", "realistic failure probe", source="ingest",
+                   context={"rel_path": "1.1.6/dhig_FinancialStatements.xls", "ext": ".xls",
+                            "size_bytes": 2411520, "exc_type": "InvalidFileException",
+                            "traceback": real_tb})
+    code, body, _ = admin.get("/api/logs?q=realistic%20failure%20probe")
+    real_ctx = (body.get("entries") or [{}])[0].get("context") or {}
+    check("a real extraction context is stored whole, traceback and all",
+          real_ctx.get("traceback") == real_tb and real_ctx.get("size_bytes") == 2411520,
+          str({k: str(v)[:40] for k, v in real_ctx.items()}))
 
     code, report, _ = admin.get("/api/logs/export?levels=error")
     check("the log exports as plain text", code == 200 and isinstance(report, str), f"got {code}")
