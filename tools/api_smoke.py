@@ -26,12 +26,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 _TMP = tempfile.mkdtemp(prefix="dd-apismoke-")
-os.environ["DD_DATA_DIR"] = _TMP
+# The data directory is named "data", matching the container's /data volume.
+# Not cosmetic: ingest once skipped every path with a component called "data",
+# so an upload extracted into the volume indexed nothing in Docker while this
+# suite — run against a bare temp dir — passed. Keep the shapes the same.
+_DATA = str(Path(_TMP) / "data")
+os.environ["DD_DATA_DIR"] = _DATA
 os.environ["DD_SECRET_KEY"] = secrets.token_urlsafe(32)
 os.environ.pop("DD_ADMIN_USER", None)
 os.environ.pop("DD_ADMIN_PASSWORD", None)
 os.environ.pop("ANTHROPIC_API_KEY", None)
-os.environ["DD_BROWSE_ROOTS"] = f"{_TMP}/uploads/extracted{os.pathsep}{ROOT}"
+os.environ["DD_BROWSE_ROOTS"] = f"{_DATA}/uploads/extracted{os.pathsep}{ROOT}"
 
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8097"))
 BASE = f"http://127.0.0.1:{PORT}"
@@ -267,6 +272,10 @@ def main() -> int:
         lambda s: s["stats"]["documents"] >= 2 and not s["jobs_running"],
         timeout=90,
     )
+    # Also the guard that ingest can index a corpus living inside the data
+    # directory at all — the extraction root is under it, as is any synced
+    # library. A scan() that skips the data volume shows up here as zero
+    # documents rather than as an error.
     check("auto-extract then auto-ingest indexes the contents", extracted)
 
     code, body, _ = admin.get("/api/archives")
@@ -275,7 +284,7 @@ def main() -> int:
     check("unsafe members were skipped, not written", arc and arc["n_skipped"] == 2,
           f"skipped={arc and arc['n_skipped']}")
     extract_dir = Path(arc["extract_dir"]) if arc else None
-    root = Path(_TMP) / "uploads" / "extracted"
+    root = Path(_DATA) / "uploads" / "extracted"
     escapes = list(root.parent.glob("escape.txt")) + list(Path(_TMP).glob("escape.txt")) \
         + list(Path("/").glob("abs.txt"))
     check("no member escaped the extraction root", not escapes, str(escapes))
@@ -343,7 +352,7 @@ def main() -> int:
     print(f"\n{len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:
         print("failed:", ", ".join(FAILURES))
-    print(f"(data dir {_TMP})")
+    print(f"(data dir {_DATA})")
     return 1 if FAILURES else 0
 
 

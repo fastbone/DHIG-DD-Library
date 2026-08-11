@@ -14,11 +14,15 @@ import time
 import uuid
 from pathlib import Path
 
-from . import db, extract
+from . import db, extract, security
 from .config import SUPPORTED_EXTS, settings
 from .events import broker
 
-SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "data", ".DS_Store"}
+# Junk directory names, matched against components *inside* the corpus root.
+# Deliberately no "data" here: the app's own data directory is excluded by
+# identity below, and matching that name would skip any corpus whose path
+# happens to contain it — which in Docker is every corpus on the data volume.
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".DS_Store"}
 _WORD = re.compile(r"[a-z0-9]{2,}")
 
 # Version noise that a data room sprays over otherwise identical filenames.
@@ -70,8 +74,30 @@ def jaccard(a: frozenset[int], b: frozenset[int]) -> float:
 def scan(root: Path) -> list[Path]:
     found: list[Path] = []
     limit = settings.max_file_mb * 1024 * 1024
+    # The app's own data directory is only inside the corpus when someone points
+    # the root at the project directory; skip it then so ingest doesn't index its
+    # own text mirror. Resolved once, into a component prefix, so the per-file
+    # test is a tuple compare rather than a path resolution.
+    #
+    # A corpus root *inside* the data volume is normal and must keep working —
+    # that is where uploaded archives are expanded and remote libraries are
+    # mirrored — so this deliberately does not fire when data_dir contains root.
+    data_prefix: tuple[str, ...] | None = None
+    resolved_root = root.resolve()
+    data_dir = settings.data_dir.resolve()
+    if data_dir != resolved_root and security.is_within(data_dir, resolved_root):
+        data_prefix = data_dir.relative_to(resolved_root).parts
+
     for p in root.rglob("*"):
-        if any(part in SKIP_DIRS or part.startswith("~$") for part in p.parts):
+        try:
+            rel = p.relative_to(root)
+        except ValueError:  # rglob shouldn't produce these, but don't assume
+            continue
+        # Matched relative to the root, so a junk name in the path *above* the
+        # corpus (a checkout under ~/node_modules, say) cannot hide the corpus.
+        if any(part in SKIP_DIRS or part.startswith("~$") for part in rel.parts):
+            continue
+        if data_prefix and rel.parts[: len(data_prefix)] == data_prefix:
             continue
         if not p.is_file():
             continue
