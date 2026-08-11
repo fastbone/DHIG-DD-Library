@@ -349,6 +349,12 @@ async def main() -> int:
         checks["sync: the secret field is a password field"] = (
             await page.get_attribute("#cxSecret", "type") == "password"
         )
+        # The help link is only worth having if it resolves. A dead link in a
+        # credentials form is worse than none — it is read as "there are no docs".
+        help_href = await page.get_attribute("#cxHelpLink", "href")
+        checks["sync: the form links to the setup guide"] = (
+            help_href is not None and help_href.endswith("/help/sharepoint")
+        )
         await page.screenshot(path="/tmp/corpus-connect.png", full_page=True)
         await page.click("#connectClose")
         await page.wait_for_timeout(200)
@@ -492,6 +498,47 @@ async def main() -> int:
         await page.wait_for_timeout(500)
         await page.screenshot(path="/tmp/sweep-log.png", full_page=True)
 
+        # Last, because it navigates away from the app. Same page deliberately: the
+        # guide sits behind the session cookie, and a fresh context would not have it.
+        resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
+        checks["help: the setup guide loads for a signed-in admin"] = (
+            resp is not None and resp.status == 200
+            and await page.locator("h1").count() == 1
+        )
+        guide_text = await page.inner_text("body")
+        checks["help: the guide covers the steps people miss"] = (
+            "Sites.Selected" in guide_text
+            and "Grant admin consent" in guide_text
+            and "Secret ID" in guide_text
+        )
+        # Reusing the app's stylesheet is meant to inherit its *tokens*. It also
+        # inherits its component rules, and the app's h3 is a 12px uppercase muted
+        # micro-label because in the app an h3 always labels a card. Unnoticed, that
+        # flattens every step title on this page into a label and the hierarchy with
+        # it — so assert a step heading still reads as a heading.
+        heading = await page.evaluate(
+            """() => {
+                 const h = document.querySelector('.doc-main .step h3');
+                 if (!h) return null;
+                 const s = getComputedStyle(h);
+                 return {transform: s.textTransform, size: parseFloat(s.fontSize),
+                         color: s.color, muted: getComputedStyle(
+                           document.querySelector('.pre-label')).color};
+               }"""
+        )
+        checks["help: step headings read as headings, not as the app's card labels"] = (
+            heading is not None and heading["transform"] == "none"
+            and heading["size"] >= 15 and heading["color"] != heading["muted"]
+        )
+        checks["help: the guide picked up the app stylesheet"] = (
+            # Unstyled, the body would be on the UA default with no padding column.
+            await page.evaluate(
+                "() => getComputedStyle(document.body).backgroundColor"
+            ) not in ("rgba(0, 0, 0, 0)", "")
+            and await page.locator(".doc-main .step").count() >= 7
+        )
+        await page.screenshot(path="/tmp/help-sharepoint.png", full_page=True)
+
         for name, ok in checks.items():
             print(f"  {'PASS' if ok else 'FAIL'}  {name}")
             if not ok:
@@ -501,7 +548,8 @@ async def main() -> int:
     print("\nJS problems:", problems or "none")
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
-          "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png")
+          "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
+          "/tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 
