@@ -9,19 +9,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import db, extract, security
+from . import db, extract
 from .config import SUPPORTED_EXTS, settings
 from .events import broker
 
-# Junk directory names, matched against components *inside* the corpus root.
-# Deliberately no "data" here: the app's own data directory is excluded by
-# identity below, and matching that name would skip any corpus whose path
-# happens to contain it — which in Docker is every corpus on the data volume.
+# Directory *names* pruned anywhere below the ingest root. Note what is not
+# here: "data". It used to be, and because the old walk tested every component
+# of an absolute path — not just the components below the root — it matched the
+# container's own ``/data`` mount and every host path like ``/srv/data/room``.
+# The effect was total and silent: an ingest of /data/uploads/extracted (which
+# is where every uploaded archive lands) found zero files and reported success.
+# The app's own data directory is excluded by resolved path instead, in _pruned.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", ".DS_Store"}
 _WORD = re.compile(r"[a-z0-9]{2,}")
 
@@ -71,45 +76,106 @@ def jaccard(a: frozenset[int], b: frozenset[int]) -> float:
     return inter / (len(a) + len(b) - inter)
 
 
-def scan(root: Path) -> list[Path]:
-    found: list[Path] = []
-    limit = settings.max_file_mb * 1024 * 1024
-    # The app's own data directory is only inside the corpus when someone points
-    # the root at the project directory; skip it then so ingest doesn't index its
-    # own text mirror. Resolved once, into a component prefix, so the per-file
-    # test is a tuple compare rather than a path resolution.
-    #
-    # A corpus root *inside* the data volume is normal and must keep working —
-    # that is where uploaded archives are expanded and remote libraries are
-    # mirrored — so this deliberately does not fire when data_dir contains root.
-    data_prefix: tuple[str, ...] | None = None
-    resolved_root = root.resolve()
-    data_dir = settings.data_dir.resolve()
-    if data_dir != resolved_root and security.is_within(data_dir, resolved_root):
-        data_prefix = data_dir.relative_to(resolved_root).parts
+@dataclass
+class ScanResult:
+    """What the walk found — and, as importantly, what it could not see."""
 
-    for p in root.rglob("*"):
+    files: list[Path] = field(default_factory=list)
+    denied_dirs: list[str] = field(default_factory=list)
+    denied_files: list[str] = field(default_factory=list)
+    oversize: list[str] = field(default_factory=list)
+    dangling: list[str] = field(default_factory=list)
+    empty: int = 0
+    unsupported: int = 0
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __iter__(self):
+        return iter(self.files)
+
+    @property
+    def blocked(self) -> int:
+        return len(self.denied_dirs) + len(self.denied_files)
+
+
+def _pruned(root: Path) -> set[Path]:
+    """Resolved directories never descended into, whatever they are named.
+
+    The app's own output — the text mirror and generated documents — would
+    otherwise be re-ingested as if it were source material when someone points
+    the ingester at the data folder. ``uploads/`` is deliberately *not* here:
+    extracted archives live under it and are exactly what we want to index.
+    """
+    out: set[Path] = set()
+    for d in (settings.derived_dir, settings.artifacts_dir):
         try:
-            rel = p.relative_to(root)
-        except ValueError:  # rglob shouldn't produce these, but don't assume
-            continue
-        # Matched relative to the root, so a junk name in the path *above* the
-        # corpus (a checkout under ~/node_modules, say) cannot hide the corpus.
-        if any(part in SKIP_DIRS or part.startswith("~$") for part in rel.parts):
-            continue
-        if data_prefix and rel.parts[: len(data_prefix)] == data_prefix:
-            continue
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in SUPPORTED_EXTS:
-            continue
-        try:
-            if p.stat().st_size > limit or p.stat().st_size == 0:
-                continue
+            out.add(d.resolve())
         except OSError:
             continue
-        found.append(p)
-    return sorted(found)
+    return out - {root.resolve()}
+
+
+def scan(root: Path) -> ScanResult:
+    """Recursive walk of `root`, reporting what it had to leave behind.
+
+    ``os.walk`` rather than ``Path.rglob`` for two reasons: it prunes skipped
+    directories instead of walking into them and filtering afterwards, and its
+    ``onerror`` hook surfaces the PermissionError that pathlib swallows. A
+    directory this process cannot read is the most common reason a data room
+    "ingests" as zero documents, and it must never again pass unremarked.
+    """
+    result = ScanResult()
+    limit = settings.max_file_mb * 1024 * 1024
+    pruned = _pruned(root)
+
+    def on_error(exc: OSError) -> None:
+        result.denied_dirs.append(str(getattr(exc, "filename", None) or root))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
+        here = Path(dirpath)
+        keep = []
+        for name in dirnames:
+            if name in SKIP_DIRS or name.startswith("~$"):
+                continue
+            try:
+                if (here / name).resolve() in pruned:
+                    continue
+            except OSError:
+                continue
+            keep.append(name)
+        dirnames[:] = sorted(keep)
+
+        for name in filenames:
+            if name.startswith("~$"):
+                continue
+            p = here / name
+            if p.suffix.lower() not in SUPPORTED_EXTS:
+                result.unsupported += 1
+                continue
+            try:
+                size = p.stat().st_size
+            except FileNotFoundError:
+                # A symlink pointing nowhere. Worth mentioning, but it is a
+                # broken corpus, not a permission the operator can grant.
+                result.dangling.append(str(p))
+                continue
+            except OSError:
+                result.denied_files.append(str(p))
+                continue
+            if size == 0:
+                result.empty += 1
+                continue
+            if size > limit:
+                result.oversize.append(str(p))
+                continue
+            if not os.access(p, os.R_OK, effective_ids=True):
+                result.denied_files.append(str(p))
+                continue
+            result.files.append(p)
+
+    result.files.sort()
+    return result
 
 
 def _extract_one(path: Path, root: Path, ocr: bool) -> dict:
@@ -285,7 +351,69 @@ class IngestJob:
         self.failed = 0
         self.skipped = 0
         self.total = 0
+        self.blocked = 0
         self.bytes_done = 0
+
+    def _report_blind_spots(self, found: ScanResult) -> None:
+        """Say out loud what the walk could not read.
+
+        A zero-file ingest that ends in green is indistinguishable from an empty
+        folder, and that ambiguity has cost real time. Permission problems are
+        logged at error level with the exact paths, because the fix — a chmod on
+        the host, or Admin → Corpus access — is not something the operator can
+        guess from a count.
+        """
+        if found.denied_dirs:
+            broker.log(
+                f"{len(found.denied_dirs)} folder(s) could not be read and were NOT scanned — "
+                "their contents are missing from this ingest. "
+                "Run Admin → Corpus access for the fix.",
+                level="error",
+            )
+            for path in found.denied_dirs[:10]:
+                broker.log(f"  unreadable folder: {path}", level="error")
+        if found.denied_files:
+            broker.log(
+                f"{len(found.denied_files)} file(s) could not be read and were skipped.",
+                level="error",
+            )
+            for path in found.denied_files[:10]:
+                broker.log(f"  unreadable file: {path}", level="error")
+        if found.oversize:
+            broker.log(
+                f"{len(found.oversize)} file(s) over the {settings.max_file_mb} MB limit "
+                "were skipped (raise DD_MAX_FILE_MB to include them).",
+                level="warn",
+            )
+            for path in found.oversize[:5]:
+                broker.log(f"  too large: {path}", level="warn")
+        if found.dangling:
+            broker.log(
+                f"{len(found.dangling)} symlink(s) point at nothing and were skipped.",
+                level="warn",
+            )
+            for path in found.dangling[:5]:
+                broker.log(f"  broken link: {path}", level="warn")
+        if found.empty:
+            broker.log(f"{found.empty} zero-byte file(s) skipped.", level="warn")
+        if not found.files and not found.blocked:
+            # "No supported files" is only true when nothing was filtered out
+            # later in the walk. A root holding nothing but oversize or
+            # zero-byte PDFs has plenty of supported files; saying otherwise
+            # sends the operator looking for the wrong problem.
+            filtered = len(found.oversize) + len(found.dangling) + found.empty
+            if filtered:
+                broker.log(
+                    f"Nothing ingestible under {self.root}: all {filtered} supported "
+                    "file(s) were skipped for the reasons above.",
+                    level="warn",
+                )
+            else:
+                broker.log(
+                    f"No supported files found under {self.root} "
+                    f"({found.unsupported} file(s) of other types were present).",
+                    level="warn",
+                )
 
     def _publish(self, message: str | None = None) -> None:
         broker.publish(
@@ -297,6 +425,7 @@ class IngestJob:
             done=self.done,
             failed=self.failed,
             skipped=self.skipped,
+            blocked=self.blocked,
             bytes_done=self.bytes_done,
             message=message or "",
         )
@@ -307,13 +436,16 @@ class IngestJob:
         broker.log(f"Scanning {self.root} …")
         self._publish("scanning")
 
-        paths = await asyncio.to_thread(scan, self.root)
+        found = await asyncio.to_thread(scan, self.root)
+        paths = found.files
         self.total = len(paths)
+        self.blocked = found.blocked
         total_bytes = sum(p.stat().st_size for p in paths)
         db.job_upsert(self.id, total=self.total, message=f"{self.total} files")
         broker.log(
             f"Found {self.total} supported files ({total_bytes / 1e9:.2f} GB) under {self.root}"
         )
+        self._report_blind_spots(found)
         self._publish(f"{self.total} files queued")
 
         sem = asyncio.Semaphore(settings.extract_workers)
@@ -370,11 +502,14 @@ class IngestJob:
             f"{self.failed} failed in {elapsed:.0f}s · "
             f"{dupes['exact_duplicates']} exact + {dupes['near_duplicate_extras']} near duplicates"
         )
+        if self.blocked:
+            msg += f" · {self.blocked} path(s) unreadable — check Admin → Corpus access"
         db.job_upsert(
             self.id, status="done", done=self.done, failed=self.failed,
             message=msg, finished_at=time.time(),
         )
         broker.log(msg, level="success")
         broker.publish("job", job_id=self.id, job_kind="ingest", status="done", total=self.total,
-                       done=self.done, failed=self.failed, skipped=self.skipped, message=msg)
+                       done=self.done, failed=self.failed, skipped=self.skipped,
+                       blocked=self.blocked, message=msg)
         broker.publish("stats_dirty")

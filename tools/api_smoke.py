@@ -59,6 +59,28 @@ PASSES: list[str] = []
 FAILURES: list[str] = []
 
 
+def _probe_default_browse_roots():
+    """True if /inbox is a default browse root, None if there is no /inbox here.
+
+    Runs in a subprocess: the browse-root default is only consulted when
+    DD_BROWSE_ROOTS is unset, and this suite sets it process-wide.
+    """
+    import subprocess
+
+    if not Path("/inbox").is_dir():
+        return None
+    env = {k: v for k, v in os.environ.items() if k != "DD_BROWSE_ROOTS"}
+    env["DD_DATA_DIR"] = tempfile.mkdtemp(prefix="dd-inbox-probe-")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r)\n" % str(ROOT)
+         + "from app.config import settings\n"
+         + "print('/inbox' in [str(r) for r in settings.browse_roots])"],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    return out.stdout.strip() == "True"
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     (PASSES if ok else FAILURES).append(name)
     print(f"  {'PASS' if ok else 'FAIL'}  {name}{'' if ok else '  ← ' + detail}")
@@ -344,6 +366,91 @@ def main() -> int:
     code, body, _ = admin.post("/api/corpus-root", {"path": str(root)})
     check("setting the corpus root inside the roots works", code == 200, str(body)[:160])
 
+    print("\n— corpus access —")
+    from app import ingest as _ingest
+
+    # Regression: the walk used to test every component of the *absolute* path
+    # against SKIP_DIRS, which contained "data". Any root under a directory of
+    # that name — including the container's own /data volume, where every
+    # uploaded archive lands — therefore scanned as zero files and reported
+    # success. This is the shape of that bug, in a permitted root.
+    room = root / "deal-data" / "data" / "sub"
+    room.mkdir(parents=True, exist_ok=True)
+    (room / "memo.txt").write_text("quarterly revenue memo")
+    found = _ingest.scan(root)
+    check("a folder named 'data' is still scanned",
+          any(p.name == "memo.txt" for p in found.files),
+          str(sorted(p.name for p in found.files))[:200])
+
+    # …but the app's own output must never be ingested as source material. Note
+    # the paths: the data directory is _DATA (_TMP/data), so the real text mirror
+    # is _DATA/derived. Writing to _TMP/derived would create an unrelated folder
+    # that scan() is right to pick up, and prove nothing.
+    Path(_DATA, "derived").mkdir(parents=True, exist_ok=True)
+    Path(_DATA, "derived", "deadbeef.md").write_text("mirror text, not a source document")
+    whole = _ingest.scan(Path(_DATA))
+    check("the text mirror is never re-ingested",
+          not any("derived" in p.parts for p in whole.files),
+          str([str(p) for p in whole.files if "derived" in p.parts])[:200])
+
+    # Unreadable paths must be reported, not silently dropped.
+    blind = root / "unreadable"
+    blind.mkdir(exist_ok=True)
+    (blind / "hidden.txt").write_text("invisible")
+    os.chmod(blind, 0o000)
+    try:
+        walked = _ingest.scan(root)
+        denied = walked.blocked
+    finally:
+        os.chmod(blind, 0o755)
+    check("an unreadable folder is reported rather than skipped in silence",
+          denied >= 1 or os.geteuid() == 0,
+          f"blocked={denied} (euid={os.geteuid()})")
+
+    # The feed inbox has to be reachable without configuration: compose names it
+    # in DD_BROWSE_ROOTS, but a non-Docker install relies on the default list.
+    inbox_default = _probe_default_browse_roots()
+    if inbox_default is None:
+        print("  SKIP  /inbox is a browsable root by default  ← no /inbox on this host")
+    else:
+        check("an existing /inbox is a browsable root by default", inbox_default,
+              "default roots did not include /inbox")
+
+    code, body, _ = admin.get("/api/access-check")
+    check("access check reports the runtime identity",
+          code == 200 and "uid" in body.get("identity", {}), str(body)[:160])
+    check("access check inspects every configured root",
+          code == 200 and body.get("roots"), str(body)[:160])
+    code, body, _ = admin.get("/api/access-check?path=/etc")
+    check("access check honours the browse-root fence", code == 403, f"got {code}")
+    code, body, _ = anon.get("/api/access-check")
+    check("access check needs a session", code == 401, f"got {code}")
+    code, body, _ = admin.post("/api/access-repair", {"path": str(root)})
+    check("access repair runs and re-reports",
+          code == 200 and "repaired" in body and "host_commands" in body, str(body)[:160])
+
+    # Repair must reach a fixed point. Opening a directory reveals its contents,
+    # which can themselves be locked, and one audit only lists MAX_ISSUES of
+    # them — so a single pass leaves nested paths broken while claiming they
+    # need a fix on the host. Only meaningful unprivileged; root reads anything.
+    from app import access as _access
+
+    nest = root / "nested-lock" / "inner" / "deeper"
+    nest.mkdir(parents=True, exist_ok=True)
+    (nest / "buried.txt").write_text("buried but ours")
+    for level in (nest, nest.parent, nest.parent.parent):
+        os.chmod(level, 0o000)
+    try:
+        healed = _access.repair([str(root)])
+        reachable = any(p.name == "buried.txt" for p in _ingest.scan(root).files)
+    finally:
+        for level in (nest.parent.parent, nest.parent, nest):
+            os.chmod(level, 0o755)
+    check("repair opens nested locked folders in one pass, not just the top one",
+          reachable and not healed["fixable"],
+          f"reachable={reachable} fixable_left={healed['fixable']} "
+          f"repaired={len(healed['repaired'])}")
+
     print("\n— connected libraries —")
     # No tenant here, so the probe that follows creation will fail — which is
     # itself worth asserting: a connection that cannot be reached is still stored
@@ -422,7 +529,11 @@ def main() -> int:
         admin.post(f"/api/jobs/{sync_job}/cancel")
     cleared = wait_for_job(admin, lambda s: not s["jobs_running"], timeout=30)
     check("cancelling the sync clears the running jobs", cleared)
-    code, body, _ = admin.post("/api/ingest", {"path": str(root)})
+    # Deliberately the archive's own folder rather than the whole extraction root:
+    # the corpus-access checks above scatter files across the root, and indexing
+    # those would leave documents behind whose files survive the extracted-folder
+    # deletion later — which is exactly what the purge check measures.
+    code, body, _ = admin.post("/api/ingest", {"path": str(extract_dir)})
     check("ingest works again once the sync is gone", code == 200, f"got {code}: {str(body)[:120]}")
     wait_for_job(admin, lambda s: not s["jobs_running"], timeout=60)
 

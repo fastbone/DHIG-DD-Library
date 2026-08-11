@@ -159,7 +159,7 @@ class Settings:
             roots += [self.extract_root, self.sync_root]
         else:
             roots = [self.extract_root, self.sync_root]
-            for candidate in (Path("/corpus"), Path.home() / "corpus", Path.cwd()):
+            for candidate in (Path("/corpus"), Path("/inbox"), Path.home() / "corpus", Path.cwd()):
                 if candidate.is_dir():
                     roots.append(candidate)
             if self.corpus_root:

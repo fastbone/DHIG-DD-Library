@@ -28,10 +28,11 @@ services:
 
     environment:
       DD_DATA_DIR: /data
-      # Where the folder picker may look. /corpus is the read-only mount below.
-      # The directories the app fills itself — /data/uploads/extracted and
+      # Where the folder picker may look. /corpus is the read-only mount below
+      # and /inbox is the writable drop point for external feeds. The two
+      # directories the app fills itself — /data/uploads/extracted and
       # /data/sync — are always browsable whatever this says.
-      DD_BROWSE_ROOTS: /corpus
+      DD_BROWSE_ROOTS: /corpus:/inbox
       # uvicorn only honours X-Forwarded-* from these addresses. The proxy talks
       # to the published loopback port, so its requests arrive from the docker
       # bridge gateway — not 127.0.0.1 as seen from inside the container.
@@ -45,6 +46,12 @@ services:
       # Optional: an existing data room from the host, mounted read-only so the
       # app can index it but nothing in the container can modify it.
       - ./corpus:/corpus:ro
+      # Drop point for external feeds (rsync, SFTP, scheduled exports). Writable,
+      # and seeded from the image as uid/gid 10001 so the app can actually read
+      # what lands here — which a root-owned bind mount does not guarantee.
+      # A feed still has to write with a sane umask; see the README, and use
+      # Admin → Corpus access when something arrives unreadable anyway.
+      - dd-inbox:/inbox
 
     # run_python executes model-authored code. These are the guardrails that
     # make that acceptable; loosen them only deliberately.
@@ -72,3 +79,4 @@ services:
 
 volumes:
   dd-data:
+  dd-inbox:

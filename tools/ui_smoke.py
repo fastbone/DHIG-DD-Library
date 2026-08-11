@@ -279,6 +279,17 @@ async def main() -> int:
         )
         await page.screenshot(path="/tmp/admin.png", full_page=True)
 
+        # Corpus access: the check must run against the live filesystem and say
+        # who the process is, since that uid is what a host-side chown needs.
+        await page.click("#accessCheckBtn")
+        await page.wait_for_timeout(1500)
+        identity = await page.inner_text("#accessIdentity")
+        checks["admin: access check reports the runtime uid"] = "uid" in identity
+        checks["admin: access check reports each root"] = (
+            await page.locator("#accessReport .rowitem").count() >= 1
+        )
+        await page.screenshot(path="/tmp/admin-access.png", full_page=True)
+
         # Store a (fake) API key through the UI and confirm it is masked.
         await page.fill("#keyLabel", "smoke-key")
         await page.fill("#keyValue", "sk-ant-api03-uismoke-" + "x" * 40)
@@ -372,8 +383,8 @@ async def main() -> int:
 
     print("\nJS problems:", problems or "none")
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
-          "/tmp/admin-key.png /tmp/corpus-upload.png /tmp/corpus-connect.png "
-          "/tmp/corpus-sync.png")
+          "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
+          "/tmp/corpus-connect.png /tmp/corpus-sync.png")
     return 1 if problems else 0
 
 

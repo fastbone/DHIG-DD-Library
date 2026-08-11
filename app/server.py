@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (
+    access,
     agent,
     auth,
     credentials,
@@ -466,6 +467,64 @@ async def browse(path: str = Query(""), _: dict = Depends(auth.require_admin)):
         "dirs": [{"name": c.name, "path": str(c.resolve())} for c in entries],
         "supported_files_here": counts,
     }
+
+
+# --- corpus access -------------------------------------------------------
+
+
+class AccessBody(BaseModel):
+    path: str | None = None
+
+
+def _access_targets(raw: str | None) -> list[str] | None:
+    """Resolve the path to inspect, or None for "every configured root".
+
+    A path outside the browse roots is not walked — that fence holds here as
+    everywhere else — but it is not a 403 either: pointing the ingester at an
+    unfenced directory is one of the two ways a corpus silently comes up empty,
+    and refusing to name the problem would defeat the purpose of the check.
+    """
+    if not raw or not raw.strip():
+        return None
+    target = Path(raw).expanduser()
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        raise HTTPException(400, f"cannot resolve path: {raw}") from exc
+    roots = settings.browse_roots
+    if not any(resolved == r or security.is_within(resolved, r) for r in roots):
+        raise HTTPException(
+            403,
+            f"{resolved} is outside the permitted roots ("
+            + ", ".join(str(r) for r in roots)
+            + "). Add it to DD_BROWSE_ROOTS, or ingest from a folder inside one of them.",
+        )
+    return [str(resolved)]
+
+
+@app.get("/api/access-check")
+async def access_check(path: str = Query(""), _: dict = Depends(auth.require_admin)):
+    """Report every corpus path this process cannot read."""
+    return await asyncio.to_thread(access.check, _access_targets(path))
+
+
+@app.post("/api/access-repair")
+async def access_repair(body: AccessBody, admin: dict = Depends(auth.require_admin)):
+    """Chmod what the app owns into readability; report the rest as host commands."""
+    result = await asyncio.to_thread(access.repair, _access_targets(body.path))
+    db.audit(
+        "corpus.access_repair",
+        actor=admin["username"],
+        detail=f"repaired={len(result['repaired'])} remaining={result['blocked']}",
+    )
+    if result["repaired"]:
+        broker.log(f"Repaired permissions on {len(result['repaired'])} path(s).", level="success")
+    if result["blocked"]:
+        broker.log(
+            f"{result['blocked']} path(s) still unreadable — they need a fix on the Docker host.",
+            level="warn",
+        )
+    return result
 
 
 # --- ingest / sweep ------------------------------------------------------

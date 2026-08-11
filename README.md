@@ -201,11 +201,13 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"   # → DD_SECRET_
 docker compose up -d
 ```
 
-Two volumes: `dd-data` holds the index, text mirror, uploads and generated
-documents (back this up), and `./corpus` is bind-mounted read-only at `/corpus`
-if you want to index a data room straight off the host rather than uploading it.
-For OCR, build with `INSTALL_OCR=true` (adds ~250 MB of Tesseract) and set
-`DD_OCR=1`.
+Three volumes: `dd-data` holds the index, text mirror, uploads and generated
+documents (back this up); `./corpus` is bind-mounted read-only at `/corpus` if
+you want to index a data room straight off the host rather than uploading it;
+and `dd-inbox` is a writable drop point at `/inbox` for external feeds — see
+*Feeding the corpus from outside the app*. All three are browsable from the
+folder picker. For OCR, build with `INSTALL_OCR=true` (adds ~250 MB of
+Tesseract) and set `DD_OCR=1`.
 
 The compose file publishes on `127.0.0.1:8412` only, and hardens the container
 because `run_python` executes model-authored code: read-only root filesystem,
@@ -264,7 +266,7 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_SESSION_TTL_HOURS` | `12` | Sliding session expiry |
 | `DD_COOKIE_SECURE` | `auto` | Marks the session cookie Secure when the request arrived over HTTPS. `1`/`0` force it |
 | `DD_LOGIN_MAX_ATTEMPTS` / `DD_LOGIN_LOCKOUT_SECONDS` | `8` / `300` | Sign-in throttle |
-| `DD_BROWSE_ROOTS` | `/corpus` + cwd | External directories the folder picker may descend into. The extraction root and the sync root are always included |
+| `DD_BROWSE_ROOTS` | `/corpus` + `/inbox` + cwd | External directories the folder picker may descend into. The extraction root and the sync root are always included |
 | `DD_MAX_UPLOAD_MB` | `4096` | Per-archive upload ceiling |
 | `DD_MAX_EXTRACT_GB` | `20` | Total uncompressed size ceiling |
 | `DD_MAX_ARCHIVE_MEMBERS` | `100000` | Member-count ceiling |
@@ -438,6 +440,82 @@ byte copy of something SharePoint still holds, and a fresh sync rebuilds them.
 The connection rows themselves, including the encrypted client secrets, are in
 `index.sqlite3` and so are already covered by the snapshot above.
 
+`dd-inbox` is staging, not a system of record: back it up only if the feed that
+fills it cannot simply re-send.
+
+### Feeding the corpus from outside the app
+
+The container runs as uid/gid **10001** with every capability dropped, so a file
+it cannot read is a file that does not exist as far as indexing is concerned.
+Anything that writes into a mounted corpus from outside — a host shell, an rsync
+or SFTP feed, another container, a scheduled export — has to leave its output
+readable by that uid. A feed running as root with a `0077` umask produces a data
+room that indexes as zero documents.
+
+**The inbox.** `dd-inbox` is mounted writable at `/inbox` for exactly this. It is
+a named volume rather than a bind mount because Docker seeds a *new* named volume
+from the image — ownership included — and the image ships `/inbox` as
+`dd:dd 2775`. So the volume arrives owned by the runtime user instead of by
+root, which is the failure a bind-mounted host directory walks straight into. The
+setgid bit means files a feed creates inside inherit group 10001 even when the
+feed runs as some other uid.
+
+Seeding only happens the first time the volume is created. If you already had a
+`dd-inbox` volume, or you replace it with a bind mount, set the ownership once:
+
+```bash
+docker run --rm -v dd-library_dd-inbox:/inbox alpine chown -R 10001:10001 /inbox
+```
+
+The most robust way to fill it is to write as the runtime user in the first
+place, which needs no fixups afterwards:
+
+```bash
+docker run --rm -u 10001:10001 \
+  -v dd-library_dd-inbox:/inbox -v /srv/exports:/src:ro \
+  alpine cp -a /src/. /inbox/
+```
+
+Then point **Corpus → Ingest** at `/inbox` (it is in the folder picker) or set it
+as the corpus root. Nothing deletes from the inbox automatically — it is a
+staging area, so prune it on whatever schedule suits the feed.
+
+**Any writable path.** Whether you use the inbox or your own mount, make the drop
+readable at the source — one line in whatever does the copying:
+
+```bash
+umask 022                     # in the feed's environment, before it writes
+chmod -R a+rX /srv/data-room  # or afterwards, on the host
+```
+
+`a+rX` is the right hammer: the capital `X` sets the execute bit on directories
+only, so the tree becomes traversable without marking every PDF executable. Use
+`chown -R 10001:10001` instead when the app must also write to that path.
+
+A feed that still writes as root with a restrictive umask defeats all of this —
+the setgid bit fixes group *ownership*, not the mode. That is what the access
+check below is for.
+
+To check the current state, sign in as an administrator and use **Admin → Corpus
+access**. It walks every configured root as the runtime user and lists exactly
+what it cannot read, with each path's owner and mode. *Fix what I can* repairs
+the one case the container is permitted to repair — a path the app itself owns,
+on a writable mount, whose mode locks it out — re-auditing after each pass,
+because opening a directory can reveal more locked paths inside it.
+
+For the rest it prints host-side commands. The path in them is derived from
+`/proc/self/mountinfo` and is a *hint*: it is where the mount sits inside its
+source filesystem, which equals the host path only when that filesystem is
+mounted at `/` on the host. The panel says which device it came from — check it
+before running a recursive `chmod`. It cannot do more than that by design: `chown` needs `CAP_CHOWN`,
+`chmod` on someone else's file needs `CAP_FOWNER`, both are dropped, and
+`/corpus` is mounted read-only. A button that silently needed those privileges
+would be a worse security posture than a button that tells you what to run.
+
+Ingest reports the same thing in its log: unreadable folders are listed at error
+level and counted in the completion message, rather than quietly reducing the
+document count.
+
 ---
 
 ## Verifying it works
@@ -446,10 +524,10 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 80 checks: auth, CSRF, keys, uploads, sync, storage, audit
+python3 tools/api_smoke.py            # 89 checks: auth, CSRF, keys, uploads, access, sync, storage
 python3 tools/sync_smoke.py           # 55 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 34 checks: the browser front end, end to end
-tools/container_check.sh              # 7 checks: the container's runtime constraints
+python3 tools/ui_smoke.py             # 36 checks: the browser front end, end to end
+tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 
 `api_smoke.py` drives the real HTTP surface with a cookie-aware client:
@@ -460,7 +538,10 @@ immediately, a stored API key round-trips through encryption and is never echoed
 back, an archive with a `../` member extracts its safe files and refuses the
 rest, browsing outside the permitted roots is refused — as is naming such a path
 directly to the corpus-root and ingest routes — and every privileged action
-lands in the audit log.
+lands in the audit log. It also pins the ingest walk: a folder named `data` is
+scanned like any other, the app's own text mirror never re-enters the corpus as
+source material, and an unreadable folder is reported rather than skipped in
+silence.
 
 `sync_smoke.py` covers connected libraries against a stub Graph and a fake
 rclone (`tools/fake_rclone.py`), so it needs no tenant and no network while still
@@ -502,6 +583,7 @@ app/
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
   extract.py      per-format extraction into the anchored text mirror
+  access.py       corpus readability diagnosis and the repairs we are allowed
   ingest.py       walk → hash → extract → index → duplicate detection
   uploads.py      archive upload and hardened extraction
   graph.py        the app-only Microsoft Graph calls rclone cannot make
@@ -519,7 +601,7 @@ app/
 web/              single-page UI plus the login page, no build step
 tools/            sample corpus, API / sync / UI smoke tests, container check,
                   fake rclone
-Dockerfile        non-root, read-only /app, /data volume
+Dockerfile        non-root, read-only /app, /data and /inbox volumes
 docker-compose.yml  hardened runtime, localhost-published on 8412
 deploy/
   update.sh       host-side update: pull, build, swap, health-check, roll back
@@ -542,6 +624,16 @@ from version-stripped filenames and identical first units; only those pairs get
 a Jaccard comparison. A renamed near-duplicate with a different first page will
 be missed. That is the documented trade-off for staying linear across thousands
 of documents.
+
+**The ingest walk must never fail silently.** It is recursive, and the two ways
+it can return nothing while reporting success have both bitten: a name-based
+skip list matched against the *absolute* path (so `data` in the list excluded
+the container's own `/data` volume and every host path like `/srv/data/room`),
+and `Path.rglob` swallowing the `PermissionError` from a directory the runtime
+user cannot read. Hence `os.walk` with an `onerror` hook, directory names
+matched only below the root, the app's own output excluded by resolved path, and
+a `ScanResult` that carries what the walk could not see so the job can say so.
+Keep that property: a zero-document ingest must always explain itself.
 
 **Writes are serialised.** SQLite allows one writer; ingest is multi-threaded.
 All writes go through a single lock in `db.py` — without it, an explicit
