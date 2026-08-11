@@ -36,15 +36,26 @@ COPY README.md ./
 #
 # The gid is pinned as well as the uid: docker-compose.yml mounts a tmpfs over
 # /home/dd with uid/gid 10001, and a tmpfs is root-owned unless told otherwise.
+# /inbox is the drop point for external feeds, and its ownership here is load
+# bearing. Docker seeds a *new* named volume from whatever the image has at the
+# mount path, ownership and mode included — so creating it as dd:dd 2775 is what
+# makes the volume arrive writable by the runtime user instead of root-owned.
+# The setgid bit means files a feed creates inside inherit group 10001 even when
+# it runs as another uid, which is half of what the app needs to read them (the
+# other half is the feed's umask; see the README).
+#
+# This only applies the first time the volume is created. An inbox volume that
+# already exists keeps whatever ownership it has.
 RUN groupadd --system --gid 10001 dd \
  && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/dd dd \
- && mkdir -p /data /corpus \
- && chown -R dd:dd /data \
+ && mkdir -p /data /corpus /inbox \
+ && chown -R dd:dd /data /inbox \
+ && chmod 2775 /inbox \
  && chmod -R a-w /app
 
 USER dd
 
-VOLUME ["/data", "/corpus"]
+VOLUME ["/data", "/corpus", "/inbox"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

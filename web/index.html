@@ -55,6 +55,7 @@
         <div class="row gap">
           <button id="ingestBtn" class="primary">Ingest</button>
           <button id="dedupeBtn" class="ghost">Re-run dedupe</button>
+          <button id="accessQuickBtn" class="ghost hidden">Check access</button>
         </div>
         <div id="ingestProgress" class="progress-wrap hidden">
           <div class="progress"><div class="bar" id="ingestBar"></div></div>
@@ -299,6 +300,22 @@
           text and requires a new sweep; “Reset index” drops the text mirror too and requires a
           full re-ingest.
         </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Corpus access</h2>
+          <span class="muted small" id="accessIdentity"></span></div>
+        <p class="muted small">
+          Files copied onto a mounted volume from outside the app — a host shell, an rsync feed,
+          another container — often arrive owned by <code>root</code> and unreadable here. Such
+          folders are skipped during ingest, so a full data room can index as zero documents.
+          This checks every configured root and repairs what it is allowed to.
+        </p>
+        <div class="row gap">
+          <button class="primary" id="accessCheckBtn">Check access</button>
+          <button class="ghost hidden" id="accessRepairBtn">Fix what I can</button>
+        </div>
+        <div id="accessReport" style="margin-top:12px"></div>
       </div>
 
       <div class="card">

@@ -102,6 +102,7 @@ async function refreshStatus() {
   state.csrf = s.user?.csrf || state.csrf;
   renderUserChip(s.user);
   $("adminTabBtn").classList.toggle("hidden", s.user?.role !== "admin");
+  $("accessQuickBtn").classList.toggle("hidden", s.user?.role !== "admin");
   $("corpusRoot").textContent = s.corpus_root || "not set";
   if (s.corpus_root && !$("ingestPath").value) $("ingestPath").value = s.corpus_root;
   $("carderModel").textContent = s.models.carder;
@@ -906,6 +907,98 @@ const AREA_COLOURS = ["#0f766e", "#2dd4bf", "#a5610a", "#7b848e", "#196b3c"];
 async function loadAdmin() {
   await Promise.all([loadKeys(), loadUsers(), loadStorage(), loadAudit()]);
 }
+
+/* ── corpus access ───────────────────────────────────────────────────── */
+function renderAccess(r) {
+  const id = r.identity;
+  $("accessIdentity").textContent =
+    `running as ${id.user} (uid ${id.uid}, gid ${id.gid}) · umask ${id.umask}`;
+  $("accessRepairBtn").classList.toggle("hidden", !r.fixable);
+
+  const box = $("accessReport");
+  box.innerHTML = "";
+
+  if (r.repaired) {
+    const n = r.repaired.length;
+    const rest = r.fixable
+      ? `${r.fixable} more can still be repaired here — run it again.`
+      : r.blocked ? `${r.blocked} still need a fix on the host.` : "Everything is readable now.";
+    box.append(el("div", n ? "notice" : "notice warn",
+      n ? `Repaired ${n} path(s). ${rest}`
+        : "Nothing could be repaired from inside the container."));
+    if (r.repair_incomplete) {
+      box.append(el("div", "notice warn",
+        "Stopped before finishing — the tree was still yielding repairable paths. Run it again."));
+    }
+  }
+
+  if (r.ok) {
+    box.append(el("div", "notice", `All ${nfmt(r.supported_files)} supported file(s) across ${r.roots.length} root(s) are readable.`));
+  } else if (r.blocked) {
+    box.append(el("div", "notice warn",
+      `${nfmt(r.blocked)} path(s) unreadable — their documents are missing from every ingest.`));
+  }
+
+  for (const root of r.roots) {
+    const card = el("div", "rowitem" + (root.blocked ? "" : " active"));
+    const meta = el("div", "meta");
+    const tags = [];
+    if (root.read_only_mount) tags.push('<span class="tag dupe">read-only mount</span>');
+    if (!root.in_browse_roots) tags.push('<span class="tag bad">outside DD_BROWSE_ROOTS</span>');
+    if (!root.exists) tags.push('<span class="tag bad">missing</span>');
+    if (root.truncated) tags.push('<span class="tag dupe">partial scan</span>');
+    meta.innerHTML = `<div class="t">${esc(root.root)} ${tags.join(" ")}</div>
+      <div class="muted small">${nfmt(root.supported_files)} supported files ·
+        ${root.blocked ? `<b>${nfmt(root.blocked)} unreadable</b>` : "all readable"}
+        ${root.fixable ? ` · ${nfmt(root.fixable)} repairable here` : ""}</div>` +
+      (root.source_path && root.source_path !== root.root
+        ? `<div class="doc-path">mounted from ${esc(root.mount?.source || "?")} at
+             ${esc(root.source_path)} — likely the host path, verify before using</div>` : "");
+    for (const i of root.issues) {
+      const line = el("div", "muted small");
+      line.innerHTML = `&nbsp;&nbsp;${esc(i.kind)} <code>${esc(i.mode)}</code>
+        ${esc(i.owner)} — ${esc(i.problem)}
+        ${i.fixable ? '<span class="tag">fixable</span>' : ""}
+        <div class="doc-path">${esc(i.path)}${i.detail ? " — " + esc(i.detail) : ""}</div>`;
+      meta.append(line);
+    }
+    card.append(meta);
+    box.append(card);
+  }
+
+  if (r.host_commands?.length) {
+    box.append(el("h3", null, "Run on the Docker host"));
+    const note = el("p", "muted small",
+      "The container drops every capability and mounts the corpus read-only, so it cannot chown "
+      + "or chmod paths it does not own. These commands do it from outside:");
+    const pre = el("pre", "pre-scroll");
+    pre.textContent = r.host_commands.join("\n");
+    box.append(note, pre);
+  }
+}
+
+async function runAccess(method) {
+  const btns = [$("accessCheckBtn"), $("accessRepairBtn"), $("accessQuickBtn")];
+  for (const b of btns) if (b) b.disabled = true;
+  try {
+    const path = $("ingestPath").value.trim();
+    const r = method === "repair"
+      ? await api("/api/access-repair", { method: "POST", body: { path } })
+      : await api(`/api/access-check?path=${encodeURIComponent(path)}`);
+    renderAccess(r);
+    if (method === "repair" && r.repaired.length) { refreshStatus(); }
+  } catch (e) {
+    $("accessReport").innerHTML = `<div class="notice warn">${esc(e.message)}</div>`;
+  }
+  for (const b of btns) if (b) b.disabled = false;
+}
+
+$("accessCheckBtn").onclick = () => runAccess("check");
+$("accessRepairBtn").onclick = () => runAccess("repair");
+$("accessQuickBtn").onclick = () => {
+  document.querySelector('[data-tab="admin"]').click();
+  runAccess("check");
+};
 
 async function loadKeys() {
   let r;
