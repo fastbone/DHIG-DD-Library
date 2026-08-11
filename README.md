@@ -381,8 +381,14 @@ To check the current state, sign in as an administrator and use **Admin → Corp
 access**. It walks every configured root as the runtime user and lists exactly
 what it cannot read, with each path's owner and mode. *Fix what I can* repairs
 the one case the container is permitted to repair — a path the app itself owns,
-on a writable mount, whose mode locks it out — and prints host-side commands for
-the rest. It cannot do more than that by design: `chown` needs `CAP_CHOWN`,
+on a writable mount, whose mode locks it out — re-auditing after each pass,
+because opening a directory can reveal more locked paths inside it.
+
+For the rest it prints host-side commands. The path in them is derived from
+`/proc/self/mountinfo` and is a *hint*: it is where the mount sits inside its
+source filesystem, which equals the host path only when that filesystem is
+mounted at `/` on the host. The panel says which device it came from — check it
+before running a recursive `chmod`. It cannot do more than that by design: `chown` needs `CAP_CHOWN`,
 `chmod` on someone else's file needs `CAP_FOWNER`, both are dropped, and
 `/corpus` is mounted read-only. A button that silently needed those privileges
 would be a worse security posture than a button that tells you what to run.
@@ -399,7 +405,7 @@ Three suites, none of which spend a token or touch your real index — each uses
 its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 63 checks: auth, CSRF, keys, uploads, access, storage, audit
+python3 tools/api_smoke.py            # 64 checks: auth, CSRF, keys, uploads, access, storage, audit
 python3 tools/ui_smoke.py             # 27 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks: the container's runtime constraints
 ```

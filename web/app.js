@@ -920,9 +920,16 @@ function renderAccess(r) {
 
   if (r.repaired) {
     const n = r.repaired.length;
+    const rest = r.fixable
+      ? `${r.fixable} more can still be repaired here — run it again.`
+      : r.blocked ? `${r.blocked} still need a fix on the host.` : "Everything is readable now.";
     box.append(el("div", n ? "notice" : "notice warn",
-      n ? `Repaired ${n} path(s). ${r.blocked ? r.blocked + " still need a fix on the host." : "Everything is readable now."}`
+      n ? `Repaired ${n} path(s). ${rest}`
         : "Nothing could be repaired from inside the container."));
+    if (r.repair_incomplete) {
+      box.append(el("div", "notice warn",
+        "Stopped before finishing — the tree was still yielding repairable paths. Run it again."));
+    }
   }
 
   if (r.ok) {
@@ -944,8 +951,9 @@ function renderAccess(r) {
       <div class="muted small">${nfmt(root.supported_files)} supported files ·
         ${root.blocked ? `<b>${nfmt(root.blocked)} unreadable</b>` : "all readable"}
         ${root.fixable ? ` · ${nfmt(root.fixable)} repairable here` : ""}</div>` +
-      (root.host_path && root.host_path !== root.root
-        ? `<div class="doc-path">on the host: ${esc(root.host_path)}</div>` : "");
+      (root.source_path && root.source_path !== root.root
+        ? `<div class="doc-path">mounted from ${esc(root.mount?.source || "?")} at
+             ${esc(root.source_path)} — likely the host path, verify before using</div>` : "");
     for (const i of root.issues) {
       const line = el("div", "muted small");
       line.innerHTML = `&nbsp;&nbsp;${esc(i.kind)} <code>${esc(i.mode)}</code>

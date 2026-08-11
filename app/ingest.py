@@ -397,11 +397,23 @@ class IngestJob:
         if found.empty:
             broker.log(f"{found.empty} zero-byte file(s) skipped.", level="warn")
         if not found.files and not found.blocked:
-            broker.log(
-                f"No supported files found under {self.root} "
-                f"({found.unsupported} file(s) of other types were present).",
-                level="warn",
-            )
+            # "No supported files" is only true when nothing was filtered out
+            # later in the walk. A root holding nothing but oversize or
+            # zero-byte PDFs has plenty of supported files; saying otherwise
+            # sends the operator looking for the wrong problem.
+            filtered = len(found.oversize) + len(found.dangling) + found.empty
+            if filtered:
+                broker.log(
+                    f"Nothing ingestible under {self.root}: all {filtered} supported "
+                    "file(s) were skipped for the reasons above.",
+                    level="warn",
+                )
+            else:
+                broker.log(
+                    f"No supported files found under {self.root} "
+                    f"({found.unsupported} file(s) of other types were present).",
+                    level="warn",
+                )
 
     def _publish(self, message: str | None = None) -> None:
         broker.publish(

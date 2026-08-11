@@ -39,6 +39,9 @@ from .config import SUPPORTED_EXTS, settings
 MAX_ENTRIES = 200_000
 # Issues are capped in the payload; the *counts* remain exact.
 MAX_ISSUES = 60
+# Repair re-audits after each pass, because opening a directory can reveal more
+# locked paths inside it. Bounded so a pathological tree cannot spin forever.
+MAX_REPAIR_PASSES = 12
 
 
 def _owner(st: os.stat_result) -> str:
@@ -83,10 +86,16 @@ def identity() -> dict:
 def _mounts() -> list[tuple[str, dict]]:
     """(mount_point, info) from /proc/self/mountinfo, longest path first.
 
-    ``root`` is the path *inside the source filesystem* that was mounted, which
-    for a Docker bind mount or named volume is the host-side path. That makes it
-    the single most useful thing to show an operator who has to run chmod on the
-    host: it turns "/corpus is unreadable" into a command they can paste.
+    Field 4 is the mount's ``root``: the path of the mounted directory *within
+    its source filesystem*. For a Docker bind mount or named volume that is very
+    close to the host path an operator needs — but it is not the same thing, and
+    treating it as one is wrong whenever the source sits on a filesystem that is
+    not mounted at ``/`` on the host. A bind of ``/srv/room`` where ``/srv`` is
+    its own filesystem reports ``/room``.
+
+    So it is carried as ``source_root``, paired with the device it belongs to,
+    and presented as a hint to verify rather than an answer to paste blindly.
+    There is no way to resolve the true host path from inside the container.
     """
     out: list[tuple[str, dict]] = []
     try:
@@ -104,7 +113,7 @@ def _mounts() -> list[tuple[str, dict]]:
                 "read_only": "ro" in fields[5].split(","),
                 "fstype": post.split()[0],
                 "source": post.split()[1],
-                "host_path": fields[3].replace("\\040", " "),
+                "source_root": fields[3].replace("\\040", " "),
             }
         except (IndexError, ValueError):
             continue
@@ -120,17 +129,21 @@ def mount_for(path: Path) -> dict:
         if resolved == point or resolved.startswith(point.rstrip("/") + "/"):
             return info
     return {"mount_point": "", "options": "", "read_only": False,
-            "fstype": "", "source": "", "host_path": ""}
+            "fstype": "", "source": "", "source_root": ""}
 
 
-def host_path_for(path: Path) -> str:
-    """Best-effort container path → host path, for the commands we print."""
+def source_path_for(path: Path) -> str:
+    """Where `path` sits inside its source filesystem.
+
+    A *candidate* host path, not a certainty — see :func:`_mounts`. Callers must
+    label it as needing verification rather than presenting it as fact.
+    """
     info = mount_for(path)
-    point, host_root = info.get("mount_point", ""), info.get("host_path", "")
-    if not point or not host_root:
+    point, src_root = info.get("mount_point", ""), info.get("source_root", "")
+    if not point or not src_root:
         return ""
     rest = str(path)[len(point):].lstrip("/")
-    return str(Path(host_root) / rest) if rest else host_root
+    return str(Path(src_root) / rest) if rest else src_root
 
 
 @dataclass
@@ -159,7 +172,7 @@ class RootReport:
     in_browse_roots: bool = False
     read_only_mount: bool = False
     mount: dict = field(default_factory=dict)
-    host_path: str = ""
+    source_path: str = ""
     supported_files: int = 0
     other_files: int = 0
     denied_dirs: int = 0
@@ -183,7 +196,7 @@ class RootReport:
             "in_browse_roots": self.in_browse_roots,
             "read_only_mount": self.read_only_mount,
             "mount": self.mount,
-            "host_path": self.host_path,
+            "source_path": self.source_path,
             "supported_files": self.supported_files,
             "other_files": self.other_files,
             "denied_dirs": self.denied_dirs,
@@ -241,7 +254,7 @@ def audit_root(root: Path, skip_dirs: set[str] | None = None) -> RootReport:
     report.is_dir = root.is_dir()
     report.mount = mount_for(root)
     report.read_only_mount = bool(report.mount.get("read_only"))
-    report.host_path = host_path_for(root)
+    report.source_path = source_path_for(root)
     if not report.exists:
         report.issues.append(Issue(str(root), "dir", "does not exist"))
         return report
@@ -317,16 +330,26 @@ def host_commands(reports: list[RootReport], me: dict) -> list[str]:
     for rep in reports:
         if not rep.blocked:
             continue
-        target = rep.host_path or rep.root
-        note = f"# {rep.root}"
-        if rep.host_path and rep.host_path != rep.root:
-            note += f"  (on the host: {rep.host_path})"
-        cmds.append(note)
-        cmds.append(f"sudo chmod -R a+rX {target!r}".replace("'", '"'))
+        target = rep.source_path or rep.root
+        cmds.append(f"# {rep.root} — {rep.blocked} unreadable path(s)")
+        if rep.source_path and rep.source_path != rep.root:
+            src = rep.mount.get("source") or "its source filesystem"
+            fstype = rep.mount.get("fstype") or "?"
+            cmds.append(
+                f"#   mounted from {src} ({fstype}), at {rep.source_path} within it."
+            )
+            cmds.append(
+                "#   That is the host path when that filesystem is mounted at / on the "
+                "host;"
+            )
+            cmds.append(
+                "#   otherwise prefix it with its host mount point. Check before running."
+            )
+        cmds.append(f'sudo chmod -R a+rX "{target}"')
         if not rep.read_only_mount:
             cmds.append(
-                f"sudo chown -R {me['uid']}:{me['gid']} {target!r}".replace("'", '"')
-                + "   # only if the app must also write here"
+                f'sudo chown -R {me["uid"]}:{me["gid"]} "{target}"'
+                "   # only if the app must also write here"
             )
     return cmds
 
@@ -357,27 +380,47 @@ def repair(paths: list[str] | None = None) -> dict:
     that matters, and quietly making a data room world-readable on a host that
     other services share is not a repair anyone asked for.
     """
+    targets = _targets(paths)
     me = identity()
-    before = [audit_root(p) for p in _targets(paths)]
     fixed: list[str] = []
     failed: list[dict] = []
+    attempted: set[str] = set()
+    incomplete = False
 
-    for rep in before:
-        for issue in rep.issues:
-            if not issue.fixable:
-                continue
-            target = Path(issue.path)
-            try:
-                mode = stat.S_IMODE(target.stat().st_mode)
-                want = mode | stat.S_IRUSR | (stat.S_IXUSR if issue.kind == "dir" else 0)
-                if want != mode:
-                    os.chmod(target, want)
-                fixed.append(issue.path)
-            except OSError as exc:
-                failed.append({"path": issue.path, "error": f"{type(exc).__name__}: {exc}"})
+    # Repeat until nothing new is repairable. One pass is not enough, for two
+    # reasons that compound: opening a directory reveals its contents, which may
+    # themselves be locked (a feed that ran with umask 077 produces exactly this
+    # nesting), and a single audit caps its issue list at MAX_ISSUES while
+    # counting every problem. A single-pass repair on a tree of app-owned 0000
+    # directories fixes the top one, reports the newly exposed child as still
+    # broken, and prints host commands for something it could have fixed itself.
+    for _ in range(MAX_REPAIR_PASSES):
+        progressed = False
+        for rep in (audit_root(p) for p in targets):
+            for issue in rep.issues:
+                if not issue.fixable or issue.path in attempted:
+                    continue
+                attempted.add(issue.path)
+                progressed = True
+                target = Path(issue.path)
+                try:
+                    mode = stat.S_IMODE(target.stat().st_mode)
+                    want = mode | stat.S_IRUSR | (stat.S_IXUSR if issue.kind == "dir" else 0)
+                    if want != mode:
+                        os.chmod(target, want)
+                    fixed.append(issue.path)
+                except OSError as exc:
+                    failed.append({"path": issue.path, "error": f"{type(exc).__name__}: {exc}"})
+        if not progressed:
+            break
+    else:
+        # Ran out of passes with work still being found. Say so rather than
+        # letting the final count imply the tree is as repaired as it can be.
+        incomplete = any(r.fixable for r in (audit_root(p) for p in targets))
 
     after = check(paths)
     after["repaired"] = fixed
     after["repair_failed"] = failed
+    after["repair_incomplete"] = incomplete
     after["unfixable"] = max(0, after["blocked"])
     return after

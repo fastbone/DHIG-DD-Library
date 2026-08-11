@@ -356,6 +356,28 @@ def main() -> int:
     check("access repair runs and re-reports",
           code == 200 and "repaired" in body and "host_commands" in body, str(body)[:160])
 
+    # Repair must reach a fixed point. Opening a directory reveals its contents,
+    # which can themselves be locked, and one audit only lists MAX_ISSUES of
+    # them — so a single pass leaves nested paths broken while claiming they
+    # need a fix on the host. Only meaningful unprivileged; root reads anything.
+    from app import access as _access
+
+    nest = root / "nested-lock" / "inner" / "deeper"
+    nest.mkdir(parents=True, exist_ok=True)
+    (nest / "buried.txt").write_text("buried but ours")
+    for level in (nest, nest.parent, nest.parent.parent):
+        os.chmod(level, 0o000)
+    try:
+        healed = _access.repair([str(root)])
+        reachable = any(p.name == "buried.txt" for p in _ingest.scan(root).files)
+    finally:
+        for level in (nest.parent.parent, nest.parent, nest):
+            os.chmod(level, 0o755)
+    check("repair opens nested locked folders in one pass, not just the top one",
+          reachable and not healed["fixable"],
+          f"reachable={reachable} fixable_left={healed['fixable']} "
+          f"repaired={len(healed['repaired'])}")
+
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
     check("storage usage reports areas and roots",
