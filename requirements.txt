@@ -4,6 +4,7 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 python-multipart>=0.0.9   # multipart archive upload
 cryptography>=41         # AES-GCM for API keys at rest
+httpx>=0.27              # Microsoft Graph calls (also an anthropic dependency)
 
 # extraction
 pymupdf>=1.24          # PDF text + optional OCR textpage

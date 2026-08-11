@@ -77,6 +77,16 @@ class Settings:
     max_archive_members: int = _env_int("DD_MAX_ARCHIVE_MEMBERS", 100_000)
     max_compression_ratio: int = _env_int("DD_MAX_COMPRESSION_RATIO", 200)
 
+    # --- remote library sync (SharePoint) --------------------------------
+    rclone_bin: str = os.environ.get("DD_RCLONE_BIN", "rclone")
+    # Refuse to start a sync whose remote side is larger than this. The mirror is
+    # a full second copy of the library on the data volume.
+    max_sync_gb: int = _env_int("DD_MAX_SYNC_GB", 50)
+    # A sync mirrors deletions, so a connection pointed at the wrong library
+    # could empty the mirror. rclone aborts past this many deletions in one run.
+    max_sync_delete: int = _env_int("DD_MAX_SYNC_DELETE", 500)
+    sync_timeout_s: int = _env_int("DD_SYNC_TIMEOUT", 6 * 3600)
+
     def __post_init__(self) -> None:
         for d in (
             self.data_dir,
@@ -85,6 +95,7 @@ class Settings:
             self.uploads_dir,
             self.archives_dir,
             self.extract_root,
+            self.sync_root,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -116,6 +127,15 @@ class Settings:
         return self.uploads_dir / "extracted"
 
     @property
+    def sync_root(self) -> Path:
+        """Where remote libraries are mirrored, one directory per connection.
+
+        Each mirror is an ordinary corpus root, so everything downstream of
+        ingest treats a synced library exactly like a local folder.
+        """
+        return self.data_dir / "sync"
+
+    @property
     def state_path(self) -> Path:
         return self.data_dir / "settings.json"
 
@@ -125,13 +145,20 @@ class Settings:
 
         Deliberately narrow: without this the picker is a filesystem browser for
         anyone who can reach the app. Override with DD_BROWSE_ROOTS (os.pathsep
-        separated).
+        separated) to say which *external* directories are in bounds.
+
+        The two directories the app fills itself — expanded archives and synced
+        libraries — are always in bounds, whatever DD_BROWSE_ROOTS says. They
+        contain nothing the app did not put there, and leaving them out of an
+        explicit list is a misconfiguration whose only symptom is that uploads
+        and syncs cannot be indexed.
         """
         raw = os.environ.get("DD_BROWSE_ROOTS")
         if raw:
             roots = [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+            roots += [self.extract_root, self.sync_root]
         else:
-            roots = [self.extract_root]
+            roots = [self.extract_root, self.sync_root]
             for candidate in (Path("/corpus"), Path.home() / "corpus", Path.cwd()):
                 if candidate.is_dir():
                     roots.append(candidate)

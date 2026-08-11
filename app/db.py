@@ -191,6 +191,42 @@ CREATE TABLE IF NOT EXISTS archives (
     extracted_at  REAL
 );
 
+-- Remote corpus sources (SharePoint Online document libraries today). One row
+-- per connected library; the client secret is encrypted with the instance key
+-- under its own AAD (see security.py). The mirror on disk is an ordinary corpus
+-- root, so nothing downstream of ingest knows a document came from here.
+CREATE TABLE IF NOT EXISTS sync_connections (
+    id                   TEXT PRIMARY KEY,
+    kind                 TEXT NOT NULL DEFAULT 'sharepoint',
+    label                TEXT NOT NULL,
+    site_url             TEXT NOT NULL,
+    library              TEXT,               -- library (drive) name; NULL = the default one
+    tenant               TEXT NOT NULL,
+    client_id            TEXT NOT NULL,
+    secret_nonce         BLOB NOT NULL,
+    secret_ciphertext    BLOB NOT NULL,
+    secret_last4         TEXT NOT NULL,
+    secret_expires_at    REAL,               -- Entra secrets expire; warn before they do
+    drive_id             TEXT,               -- resolved from site_url, re-resolvable
+    drive_name           TEXT,
+    mirror_dir           TEXT NOT NULL,
+    only_supported_types INTEGER NOT NULL DEFAULT 1,
+    mirror_deletions     INTEGER NOT NULL DEFAULT 1,
+    interval_minutes     INTEGER NOT NULL DEFAULT 0,   -- 0 = manual only
+    status               TEXT NOT NULL DEFAULT 'new',  -- new|ok|syncing|failed
+    error                TEXT,
+    last_sync_at         REAL,
+    last_sync_seconds    REAL,
+    last_test_at         REAL,
+    last_test_ok         INTEGER,
+    last_test_note       TEXT,
+    n_files              INTEGER DEFAULT 0,
+    n_deleted            INTEGER DEFAULT 0,
+    bytes_total          INTEGER DEFAULT 0,
+    created_at           REAL NOT NULL,
+    created_by           TEXT
+);
+
 CREATE TABLE IF NOT EXISTS audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      REAL NOT NULL,
