@@ -48,6 +48,37 @@ PUBLIC_PATHS = {
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
+SCHEDULER_TICK_S = 60
+
+
+async def scheduler() -> None:
+    """Start syncs for connections whose interval has elapsed.
+
+    Deliberately dumb: one tick a minute, one sync at a time, and a connection
+    that is already syncing or blocked by a running ingest is simply left for the
+    next tick. A due sync that cannot start is not an error — it is a sync that
+    happens a minute later.
+    """
+    while True:
+        try:
+            await asyncio.sleep(SCHEDULER_TICK_S)
+            for conn in sync.due_connections():
+                try:
+                    start_sync_job(conn["id"], actor="schedule")
+                except sync.SyncError:
+                    break  # something is already running; try again next tick
+                else:
+                    broker.log(
+                        f"Scheduled sync of {conn['label']} "
+                        f"(every {conn['interval_minutes']} min)."
+                    )
+                    break  # one at a time
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a bad tick must not end the loop
+            broker.log(f"Sync scheduler tick failed: {exc}", level="warn")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
@@ -63,7 +94,11 @@ async def lifespan(app: FastAPI):
     broker.log(
         f"Server ready · {auth.user_count()} account(s) · credentials: {credentials.source()}"
     )
-    yield
+    ticker = asyncio.create_task(scheduler())
+    try:
+        yield
+    finally:
+        ticker.cancel()
 
 
 app = FastAPI(title="DD Library", lifespan=lifespan, docs_url=None, redoc_url=None)

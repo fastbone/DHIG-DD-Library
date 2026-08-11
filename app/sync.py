@@ -271,7 +271,7 @@ class SyncJob:
         broker.publish(
             "job", job_id=self.id, job_kind="sync", status=status, total=self.total,
             done=self.done, failed=self.failed, skipped=self.skipped,
-            bytes_done=self.bytes_done, message=message,
+            deleted=self.deleted, bytes_done=self.bytes_done, message=message,
         )
 
     # --- rclone plumbing -------------------------------------------------
