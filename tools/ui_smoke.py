@@ -511,6 +511,25 @@ async def main() -> int:
             and "Grant admin consent" in guide_text
             and "Secret ID" in guide_text
         )
+        # Reusing the app's stylesheet is meant to inherit its *tokens*. It also
+        # inherits its component rules, and the app's h3 is a 12px uppercase muted
+        # micro-label because in the app an h3 always labels a card. Unnoticed, that
+        # flattens every step title on this page into a label and the hierarchy with
+        # it — so assert a step heading still reads as a heading.
+        heading = await page.evaluate(
+            """() => {
+                 const h = document.querySelector('.doc-main .step h3');
+                 if (!h) return null;
+                 const s = getComputedStyle(h);
+                 return {transform: s.textTransform, size: parseFloat(s.fontSize),
+                         color: s.color, muted: getComputedStyle(
+                           document.querySelector('.pre-label')).color};
+               }"""
+        )
+        checks["help: step headings read as headings, not as the app's card labels"] = (
+            heading is not None and heading["transform"] == "none"
+            and heading["size"] >= 15 and heading["color"] != heading["muted"]
+        )
         checks["help: the guide picked up the app stylesheet"] = (
             # Unstyled, the body would be on the UA default with no padding column.
             await page.evaluate(
