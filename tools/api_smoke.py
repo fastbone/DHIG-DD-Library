@@ -26,12 +26,31 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 _TMP = tempfile.mkdtemp(prefix="dd-apismoke-")
-os.environ["DD_DATA_DIR"] = _TMP
+# The data directory is named "data", matching the container's /data volume.
+# Not cosmetic: ingest once skipped every path with a component called "data",
+# so an upload extracted into the volume indexed nothing in Docker while this
+# suite — run against a bare temp dir — passed. Keep the shapes the same.
+_DATA = str(Path(_TMP) / "data")
+os.environ["DD_DATA_DIR"] = _DATA
 os.environ["DD_SECRET_KEY"] = secrets.token_urlsafe(32)
 os.environ.pop("DD_ADMIN_USER", None)
 os.environ.pop("DD_ADMIN_PASSWORD", None)
 os.environ.pop("ANTHROPIC_API_KEY", None)
-os.environ["DD_BROWSE_ROOTS"] = f"{_TMP}/uploads/extracted{os.pathsep}{ROOT}"
+os.environ["DD_BROWSE_ROOTS"] = f"{_DATA}/uploads/extracted{os.pathsep}{ROOT}"
+
+# A sync engine that never finishes, so a sync can be held in flight while other
+# requests are made against it. The job scrubs its child's environment, so the
+# scenario travels in the binary path rather than an environment variable.
+_HANGING_RCLONE = Path(_TMP) / "hanging_rclone.py"
+_HANGING_RCLONE.write_text(
+    "#!/usr/bin/env python3\n"
+    "import os, runpy, sys\n"
+    "os.environ['FAKE_RCLONE_MODE'] = 'hang'\n"
+    f"sys.argv[0] = {str(ROOT / 'tools' / 'fake_rclone.py')!r}\n"
+    f"runpy.run_path({str(ROOT / 'tools' / 'fake_rclone.py')!r}, run_name='__main__')\n"
+)
+_HANGING_RCLONE.chmod(0o755)
+os.environ["DD_RCLONE_BIN"] = str(_HANGING_RCLONE)
 
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8097"))
 BASE = f"http://127.0.0.1:{PORT}"
@@ -159,7 +178,15 @@ def wait_for_job(client: Client, predicate, timeout: float = 60) -> bool:
 def main() -> int:
     import uvicorn
 
+    from app import graph
     from app.server import app
+
+    # Point Microsoft Graph at a closed local port. The connection checks below
+    # want the *failure* path, and without this they would make a real call to
+    # login.microsoftonline.com — slow, and a hang on an offline machine. The
+    # sync suite covers the success path against a stub.
+    graph.LOGIN_HOST = "http://127.0.0.1:9"
+    graph.GRAPH = "http://127.0.0.1:9"
 
     config = uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="error")
     server = uvicorn.Server(config)
@@ -243,6 +270,14 @@ def main() -> int:
     check("the analyst can sign in", code == 200, str(body))
     code, _, _ = bob.get("/api/users")
     check("the analyst cannot reach admin routes", code == 403, f"got {code}")
+    # Connecting a library decides who can read a data room, so it sits with
+    # accounts and keys rather than with everyday ingest.
+    code, _, _ = bob.get("/api/sync/connections")
+    check("the analyst cannot list connected libraries", code == 403, f"got {code}")
+    code, _, _ = bob.post("/api/sync/connections",
+                          {"label": "x", "site_url": "https://c.sharepoint.com/sites/X",
+                           "tenant": "t", "client_id": "c", "secret": "s" * 12})
+    check("the analyst cannot connect a library", code == 403, f"got {code}")
     code, _, _ = bob.get("/api/documents")
     check("the analyst can use the library", code == 200)
     code, body, _ = admin.post("/api/users/bob", {"disabled": True})
@@ -289,6 +324,10 @@ def main() -> int:
         lambda s: s["stats"]["documents"] >= 2 and not s["jobs_running"],
         timeout=90,
     )
+    # Also the guard that ingest can index a corpus living inside the data
+    # directory at all — the extraction root is under it, as is any synced
+    # library. A scan() that skips the data volume shows up here as zero
+    # documents rather than as an error.
     check("auto-extract then auto-ingest indexes the contents", extracted)
 
     code, body, _ = admin.get("/api/archives")
@@ -297,7 +336,7 @@ def main() -> int:
     check("unsafe members were skipped, not written", arc and arc["n_skipped"] == 2,
           f"skipped={arc and arc['n_skipped']}")
     extract_dir = Path(arc["extract_dir"]) if arc else None
-    root = Path(_TMP) / "uploads" / "extracted"
+    root = Path(_DATA) / "uploads" / "extracted"
     escapes = list(root.parent.glob("escape.txt")) + list(Path(_TMP).glob("escape.txt")) \
         + list(Path("/").glob("abs.txt"))
     check("no member escaped the extraction root", not escapes, str(escapes))
@@ -343,10 +382,13 @@ def main() -> int:
           any(p.name == "memo.txt" for p in found.files),
           str(sorted(p.name for p in found.files))[:200])
 
-    # …but the app's own output must never be ingested as source material.
-    Path(_TMP, "derived").mkdir(parents=True, exist_ok=True)
-    Path(_TMP, "derived", "deadbeef.md").write_text("mirror text, not a source document")
-    whole = _ingest.scan(Path(_TMP))
+    # …but the app's own output must never be ingested as source material. Note
+    # the paths: the data directory is _DATA (_TMP/data), so the real text mirror
+    # is _DATA/derived. Writing to _TMP/derived would create an unrelated folder
+    # that scan() is right to pick up, and prove nothing.
+    Path(_DATA, "derived").mkdir(parents=True, exist_ok=True)
+    Path(_DATA, "derived", "deadbeef.md").write_text("mirror text, not a source document")
+    whole = _ingest.scan(Path(_DATA))
     check("the text mirror is never re-ingested",
           not any("derived" in p.parts for p in whole.files),
           str([str(p) for p in whole.files if "derived" in p.parts])[:200])
@@ -409,6 +451,100 @@ def main() -> int:
           f"reachable={reachable} fixable_left={healed['fixable']} "
           f"repaired={len(healed['repaired'])}")
 
+    print("\n— connected libraries —")
+    # No tenant here, so the probe that follows creation will fail — which is
+    # itself worth asserting: a connection that cannot be reached is still stored
+    # and reported honestly rather than rejected or silently marked good.
+    client_secret = "sharepoint-client-secret-" + secrets.token_hex(6)
+    code, body, _ = admin.post("/api/sync/connections", {
+        "label": "DD Room", "site_url": "https://contoso.sharepoint.com/sites/ProjectX",
+        "tenant": "tenant-id", "client_id": "client-id", "secret": client_secret,
+    })
+    check("a library can be connected", code == 200 and body["connection"]["id"], str(body)[:200])
+    conn_id = body.get("connection", {}).get("id")
+    check("the connection is probed on creation", "test" in body, str(body)[:160])
+
+    code, body, _ = admin.get("/api/sync/connections")
+    serialised = str(body)
+    check("the client secret is never returned", client_secret not in serialised)
+    check("the secret is masked to its last four",
+          body["connections"][0]["secret_last4"] == client_secret[-4:], str(body)[:200])
+    check("the mirror lives under the sync root",
+          body["connections"][0]["mirror_dir"].startswith(body["sync_root"]), str(body)[:200])
+    check("whether the sync engine is installed is reported",
+          "available" in body["rclone"], str(body.get("rclone")))
+
+    code, body, _ = admin.post("/api/sync/connections", {
+        "label": "bad", "site_url": "not-a-url", "tenant": "t", "client_id": "c",
+        "secret": "x" * 12,
+    })
+    check("a malformed site URL is refused", code == 400, f"got {code}: {str(body)[:120]}")
+
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}",
+                               {"label": "DD Room 2026", "interval_minutes": 120})
+    check("a connection can be edited",
+          code == 200 and body["connection"]["interval_minutes"] == 120, str(body)[:160])
+    rotated = "rotated-secret-" + secrets.token_hex(4)
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"secret": rotated})
+    check("rotating the secret updates the mask",
+          code == 200 and body["connection"]["secret_last4"] == rotated[-4:], str(body)[:160])
+    code, body, _ = admin.get("/api/sync/connections")
+    check("the rotated secret is not returned either", rotated not in str(body))
+
+    # The patch route drops nulls so untouched fields keep their value, which is
+    # why the form sends "" to mean "back to the site's default library".
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"library": "DD Room"})
+    check("a library can be named", code == 200 and body["connection"]["library"] == "DD Room",
+          str(body)[:160])
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"library": ""})
+    check("an empty library clears it rather than being ignored",
+          code == 200 and body["connection"]["library"] is None, str(body)[:160])
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"label": ""})
+    check("an empty label is refused rather than nulling a required column",
+          code == 400, f"got {code}: {str(body)[:120]}")
+
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/test")
+    check("testing an unreachable library reports a reason, not a crash",
+          code == 200 and body["ok"] is False and body["note"], str(body)[:200])
+
+    # A sync holds the corpus root and indexes its own mirror, so nothing else
+    # may index at the same time. Held in flight with a sync engine that never
+    # returns; the drive id is set directly because resolving it would need Graph.
+    from app import db as _db
+
+    _db.execute("UPDATE sync_connections SET drive_id='drv-1' WHERE id=?", (conn_id,))
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/sync")
+    sync_job = body.get("job_id") if code == 200 else None
+    check("a sync starts", code == 200 and sync_job, str(body)[:160])
+    running = wait_for_job(
+        admin, lambda s: any(k.startswith("sync-") for k in s["jobs_running"]), timeout=30
+    )
+    check("the sync shows up as a running job", running)
+    code, body, _ = admin.post("/api/ingest", {"path": str(root)})
+    check("a manual ingest is refused while a sync is running", code == 409,
+          f"got {code}: {str(body)[:120]}")
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/sync")
+    check("a second sync is refused", code == 409, f"got {code}: {str(body)[:120]}")
+    if sync_job:
+        admin.post(f"/api/jobs/{sync_job}/cancel")
+    cleared = wait_for_job(admin, lambda s: not s["jobs_running"], timeout=30)
+    check("cancelling the sync clears the running jobs", cleared)
+    # Deliberately the archive's own folder rather than the whole extraction root:
+    # the corpus-access checks above scatter files across the root, and indexing
+    # those would leave documents behind whose files survive the extracted-folder
+    # deletion later — which is exactly what the purge check measures.
+    code, body, _ = admin.post("/api/ingest", {"path": str(extract_dir)})
+    check("ingest works again once the sync is gone", code == 200, f"got {code}: {str(body)[:120]}")
+    wait_for_job(admin, lambda s: not s["jobs_running"], timeout=60)
+
+    code, body, _ = admin.delete("/api/sync/connections/does-not-exist")
+    check("deleting an unknown connection is a 404", code == 404, f"got {code}")
+    code, body, _ = admin.delete(f"/api/sync/connections/{conn_id}?drop_mirror=true")
+    check("a connection can be deleted with its mirror", code == 200 and body["deleted"] == conn_id,
+          str(body)[:160])
+    code, body, _ = admin.get("/api/sync/connections")
+    check("no connections remain", code == 200 and body["connections"] == [], str(body)[:160])
+
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
     check("storage usage reports areas and roots",
@@ -447,7 +583,7 @@ def main() -> int:
     print(f"\n{len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:
         print("failed:", ", ".join(FAILURES))
-    print(f"(data dir {_TMP})")
+    print(f"(data dir {_DATA})")
     return 1 if FAILURES else 0
 
 

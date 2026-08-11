@@ -321,6 +321,60 @@ async def main() -> int:
         checks["upload: archive reports extracted files"] = "files" in archive_text
         await page.screenshot(path="/tmp/corpus-upload.png", full_page=True)
 
+        # Connected libraries: the pane renders, the connect form opens, and a
+        # sync job event drives the *sync* bar. That last one is the cheap guard
+        # against a missing JOB_UI entry, which would silently move the sweep bar
+        # instead and look like the sync had gone haywire.
+        checks["sync: the libraries pane is visible to an admin"] = (
+            await page.locator("#syncSection:not(.hidden)").count() == 1
+        )
+        checks["sync: an empty list says so"] = "no libraries connected" in (
+            await page.inner_text("#syncList")
+        )
+        await page.click("#addConnectionBtn")
+        await page.wait_for_timeout(300)
+        checks["sync: the connect form opens"] = (
+            await page.locator("#connectModal.open").count() == 1
+        )
+        # Saving without a secret must be refused in the browser, before a request.
+        await page.fill("#cxLabel", "Project X")
+        await page.fill("#cxSite", "https://contoso.sharepoint.com/sites/ProjectX")
+        await page.fill("#cxTenant", "tenant-id")
+        await page.fill("#cxClientId", "client-id")
+        await page.click("#connectSave")
+        await page.wait_for_timeout(400)
+        checks["sync: a missing client secret is caught before submitting"] = (
+            "secret is required" in await page.inner_text("#connectStatus")
+        )
+        checks["sync: the secret field is a password field"] = (
+            await page.get_attribute("#cxSecret", "type") == "password"
+        )
+        await page.screenshot(path="/tmp/corpus-connect.png", full_page=True)
+        await page.click("#connectClose")
+        await page.wait_for_timeout(200)
+        checks["sync: the form closes"] = await page.locator("#connectModal.open").count() == 0
+
+        # onJob is a top-level function in a classic script, so it is a global.
+        await page.evaluate(
+            """() => onJob({kind: "job", job_id: "sync-abc12345", job_kind: "sync",
+                                     status: "running", total: 10, done: 4, failed: 0,
+                                     skipped: 2, deleted: 1, bytes_done: 2048,
+                                     message: "4 transferred"})"""
+        )
+        await page.wait_for_timeout(200)
+        checks["sync: a sync job drives the sync bar"] = (
+            await page.locator("#syncProgress:not(.hidden)").count() == 1
+            and await page.get_attribute("#syncBar", "style") == "width: 40%;"
+        )
+        sync_meta = await page.inner_text("#syncMeta")
+        checks["sync: progress reports transfers, unchanged and deletions"] = (
+            "4 / 10" in sync_meta and "2 unchanged" in sync_meta and "1 deleted" in sync_meta
+        )
+        checks["sync: the sweep bar was not touched"] = (
+            await page.locator("#sweepProgress.hidden").count() == 1
+        )
+        await page.screenshot(path="/tmp/corpus-sync.png", full_page=True)
+
         for name, ok in checks.items():
             print(f"  {'PASS' if ok else 'FAIL'}  {name}")
             if not ok:
@@ -329,7 +383,8 @@ async def main() -> int:
 
     print("\nJS problems:", problems or "none")
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
-          "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png")
+          "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
+          "/tmp/corpus-connect.png /tmp/corpus-sync.png")
     return 1 if problems else 0
 
 

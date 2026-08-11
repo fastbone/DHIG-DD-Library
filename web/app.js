@@ -215,6 +215,7 @@ function connectEvents() {
       statsTimer = setTimeout(() => { refreshStatus(); loadDocs(); }, 400);
     }
     else if (ev.kind === "archives_dirty") loadArchives();
+    else if (ev.kind === "sync_dirty") loadConnections();
   };
   src.onerror = () => { src.close(); setTimeout(connectEvents, 2500); };
 }
@@ -229,7 +230,7 @@ function appendLog(ev) {
 }
 $("logClear").onclick = () => ($("log").innerHTML = "");
 
-const JOB_UI = { ingest: "ingest", sweep: "sweep", extract: "extract" };
+const JOB_UI = { ingest: "ingest", sweep: "sweep", extract: "extract", sync: "sync" };
 
 function onJob(ev) {
   const which = JOB_UI[ev.job_kind] || "sweep";
@@ -242,6 +243,7 @@ function onJob(ev) {
   // "skipped" means unchanged files during ingest, but refused members during
   // extraction — same field, different meaning.
   if (ev.skipped) bits.push(`${ev.skipped} ${which === "extract" ? "refused" : "unchanged"}`);
+  if (ev.job_kind === "sync" && ev.deleted) bits.push(`${ev.deleted} deleted`);
   if (ev.failed) bits.push(`${ev.failed} failed`);
   if (ev.bytes_done && ev.status === "running") bits.push(bytes(ev.bytes_done));
   if (ev.usage?.cost_usd != null) bits.push(money(ev.usage.cost_usd));
@@ -251,7 +253,7 @@ function onJob(ev) {
   if (cancelBtn) cancelBtn.dataset.job = ev.job_id;
   if (ev.status !== "running") {
     hideProgress(which);
-    setTimeout(() => { refreshStatus(); loadDocs(); loadArchives(); }, 300);
+    setTimeout(() => { refreshStatus(); loadDocs(); loadArchives(); loadConnections(); }, 300);
   }
 }
 function hideProgress(which) {
@@ -259,7 +261,7 @@ function hideProgress(which) {
   if (btn && $(btn)) $(btn).disabled = false;
 }
 
-for (const which of ["ingest", "sweep", "extract"]) {
+for (const which of ["ingest", "sweep", "extract", "sync"]) {
   const btn = $(which + "Cancel");
   if (!btn) continue;
   btn.onclick = async (e) => {
@@ -431,6 +433,166 @@ async function loadArchives() {
     box.append(row);
   }
 }
+
+/* ── connected SharePoint libraries ──────────────────────────────────── */
+const INTERVALS = { 0: "manual", 60: "hourly", 240: "every 4h", 720: "every 12h", 1440: "daily" };
+
+async function loadConnections() {
+  // Admin-only route: for an analyst this 403s, and the section stays hidden.
+  let r;
+  try { r = await api("/api/sync/connections"); } catch { return; }
+  $("syncSection").classList.remove("hidden");
+  const engine = r.rclone || {};
+  $("syncHint").innerHTML = engine.available
+    ? `Mirrored into <code>${esc(r.sync_root)}</code>, then indexed like any other folder ·
+       up to ${r.max_sync_gb} GB`
+    : `<span class="tag bad">rclone not installed</span> the sync engine is missing
+       (<code>${esc(engine.bin || "rclone")}</code>), so syncing will fail — rebuild the image`;
+
+  const box = $("syncList");
+  box.innerHTML = "";
+  if (!r.connections.length) {
+    box.innerHTML = `<span class="muted small">no libraries connected yet</span>`;
+    return;
+  }
+  for (const c of r.connections) {
+    const row = el("div", "rowitem");
+    const tag =
+      c.status === "syncing" ? `<span class="tag dupe">syncing</span>`
+      : c.status === "failed" ? `<span class="tag bad">failed</span>`
+      : c.last_test_ok === false ? `<span class="tag flag">unreachable</span>`
+      : c.last_sync_at ? `<span class="tag">${nfmt(c.n_files)} files</span>`
+      : `<span class="tag dupe">never synced</span>`;
+    const meta = el("div", "meta");
+    meta.innerHTML = `<div class="t">${esc(c.label)} ${tag}</div>
+      <div class="muted small">
+        ${esc(c.drive_name || c.library || "default library")} ·
+        secret …${esc(c.secret_last4)} ·
+        ${INTERVALS[c.interval_minutes] || `every ${c.interval_minutes} min`}
+        ${c.last_sync_at ? "· synced " + new Date(c.last_sync_at * 1000).toLocaleString() : ""}
+        ${c.bytes_total ? "· " + bytes(c.bytes_total) : ""}
+        ${c.n_deleted ? `· <span class="tag flag">${c.n_deleted} removed remotely</span>` : ""}
+      </div>
+      <div class="doc-path">${esc(c.site_url)}</div>
+      ${c.error ? `<div class="muted small">${esc(c.error.slice(0, 160))}</div>` : ""}
+      ${c.last_test_note && c.last_test_ok === false
+        ? `<div class="muted small">${esc(c.last_test_note.slice(0, 160))}</div>` : ""}`;
+
+    const actions = el("div", "actions");
+    const syncBtn = el("button", "primary", "sync now");
+    syncBtn.onclick = async () => {
+      try {
+        await api(`/api/sync/connections/${c.id}/sync`, { method: "POST" });
+        $("syncProgress").classList.remove("hidden");
+        $("syncMeta").textContent = "starting …";
+      } catch (e) { toast(e.message, true); }
+    };
+    const testBtn = el("button", "ghost", "test");
+    testBtn.onclick = async () => {
+      testBtn.disabled = true;
+      try {
+        const out = await api(`/api/sync/connections/${c.id}/test`, { method: "POST" });
+        toast(out.ok ? out.note : out.note, !out.ok);
+        loadConnections();
+      } catch (e) { toast(e.message, true); } finally { testBtn.disabled = false; }
+    };
+    const editBtn = el("button", "ghost", "edit");
+    editBtn.onclick = () => openConnectModal(c);
+    const useBtn = el("button", "ghost", "use as corpus");
+    useBtn.onclick = async () => {
+      try {
+        await api("/api/corpus-root", { method: "POST", body: { path: c.mirror_dir } });
+        $("ingestPath").value = c.mirror_dir;
+        toast("Corpus root set — press Ingest");
+        refreshStatus();
+      } catch (e) { toast(e.message, true); }
+    };
+    const delBtn = el("button", "danger", "remove");
+    delBtn.onclick = async () => {
+      const withMirror = confirm(
+        `Remove the connection to ${c.label}?\n\n` +
+        `OK = also delete the mirrored files at ${c.mirror_dir}\n` +
+        `Cancel = keep the mirrored files on disk`);
+      try {
+        await api(`/api/sync/connections/${c.id}?drop_mirror=${withMirror}`, { method: "DELETE" });
+        loadConnections(); refreshStatus();
+      } catch (e) { toast(e.message, true); }
+    };
+    actions.append(syncBtn, testBtn, editBtn, useBtn, delBtn);
+    row.append(meta, actions);
+    box.append(row);
+  }
+}
+
+let editingConnection = null;
+
+function openConnectModal(conn = null) {
+  editingConnection = conn;
+  $("connectTitle").textContent = conn ? `Edit ${conn.label}` : "Connect a SharePoint library";
+  $("connectSave").textContent = conn ? "Save" : "Connect";
+  // On edit the stored secret is not retrievable, so blank means "keep it".
+  $("cxSecretHint").textContent = conn ? "leave blank to keep the stored one" : "";
+  $("cxLabel").value = conn?.label || "";
+  $("cxSite").value = conn?.site_url || "";
+  $("cxLibrary").value = conn?.library || "";
+  $("cxTenant").value = conn?.tenant || "";
+  $("cxClientId").value = conn?.client_id || "";
+  $("cxSecret").value = "";
+  $("cxSupportedOnly").checked = conn ? conn.only_supported_types : true;
+  $("cxMirrorDeletions").checked = conn ? conn.mirror_deletions : true;
+  $("cxInterval").value = String(conn?.interval_minutes ?? 0);
+  $("connectStatus").textContent = "";
+  $("connectModal").classList.add("open");
+}
+
+function closeConnectModal() {
+  $("connectModal").classList.remove("open");
+  $("cxSecret").value = "";
+  editingConnection = null;
+}
+
+$("addConnectionBtn").onclick = () => openConnectModal();
+$("connectClose").onclick = closeConnectModal;
+
+$("connectSave").onclick = async () => {
+  const body = {
+    label: $("cxLabel").value.trim(),
+    site_url: $("cxSite").value.trim(),
+    // Empty string, never null: the patch route drops nulls so that untouched
+    // fields keep their stored value, which would make clearing this impossible.
+    // The server reads "" as "back to the site's default library".
+    library: $("cxLibrary").value.trim(),
+    tenant: $("cxTenant").value.trim(),
+    client_id: $("cxClientId").value.trim(),
+    only_supported_types: $("cxSupportedOnly").checked,
+    mirror_deletions: $("cxMirrorDeletions").checked,
+    interval_minutes: Number($("cxInterval").value),
+  };
+  const secret = $("cxSecret").value;
+  if (secret) body.secret = secret;
+  if (!editingConnection && !secret) {
+    $("connectStatus").textContent = "a client secret is required";
+    return;
+  }
+  $("connectSave").disabled = true;
+  $("connectStatus").textContent = editingConnection ? "saving …" : "connecting and testing …";
+  try {
+    if (editingConnection) {
+      await api(`/api/sync/connections/${editingConnection.id}`, { method: "POST", body });
+      toast("Connection updated");
+    } else {
+      const out = await api("/api/sync/connections", { method: "POST", body });
+      toast(out.test?.ok ? `Connected — ${out.test.note}` : `Stored, but ${out.test?.note}`,
+            !out.test?.ok);
+    }
+    closeConnectModal();
+    loadConnections();
+  } catch (e) {
+    $("connectStatus").textContent = e.message;
+  } finally {
+    $("connectSave").disabled = false;
+  }
+};
 
 /* ── folder picker ───────────────────────────────────────────────────── */
 $("browseBtn").onclick = () => openPicker($("ingestPath").value || "");
@@ -1236,5 +1398,6 @@ $("refreshAudit").onclick = loadAudit;
 refreshStatus();
 loadDocs();
 loadArchives();
+loadConnections();
 connectEvents();
 setInterval(refreshStatus, 20000);

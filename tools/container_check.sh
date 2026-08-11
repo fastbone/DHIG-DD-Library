@@ -146,6 +146,21 @@ print('probe:', settings.has_api_key())
   chmod 755 "$UNREADABLE"
 fi
 
+# The image installs rclone for mirroring connected libraries. Reported rather
+# than failed: outside the image it is legitimately absent, and the app says so
+# in the UI instead of failing at the first sync.
+OUT=$(run_in_app "python3 -c \"
+from app import sync
+v = sync.engine_version()
+print('available' if v['available'] else 'missing', v.get('version') or v['bin'])
+\"" 2>&1 | tail -1)
+if [[ "$OUT" == available* ]]; then
+  pass "the sync engine is present (${OUT#available })"
+else
+  echo "  note  rclone is not installed here, so syncing would fail: $OUT"
+  echo "        the image installs it; the app reports its absence in the UI."
+fi
+
 OUT=$(run_in_app "python3 -c \"
 from app import db, tools
 db.init()

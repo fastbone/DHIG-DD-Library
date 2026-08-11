@@ -24,12 +24,14 @@ from . import (
     credentials,
     db,
     extract,
+    graph,
     ingest,
     manifest,
     pricing,
     search,
     security,
     storage,
+    sync,
     uploads,
 )
 from .config import SUPPORTED_EXTS, WORKSTREAMS, settings
@@ -47,12 +49,44 @@ PUBLIC_PATHS = {
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
+SCHEDULER_TICK_S = 60
+
+
+async def scheduler() -> None:
+    """Start syncs for connections whose interval has elapsed.
+
+    Deliberately dumb: one tick a minute, one sync at a time, and a connection
+    that is already syncing or blocked by a running ingest is simply left for the
+    next tick. A due sync that cannot start is not an error — it is a sync that
+    happens a minute later.
+    """
+    while True:
+        try:
+            await asyncio.sleep(SCHEDULER_TICK_S)
+            for conn in sync.due_connections():
+                try:
+                    start_sync_job(conn["id"], actor="schedule")
+                except sync.SyncError:
+                    break  # something is already running; try again next tick
+                else:
+                    broker.log(
+                        f"Scheduled sync of {conn['label']} "
+                        f"(every {conn['interval_minutes']} min)."
+                    )
+                    break  # one at a time
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a bad tick must not end the loop
+            broker.log(f"Sync scheduler tick failed: {exc}", level="warn")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
     broker.bind_loop(asyncio.get_running_loop())
     auth.bootstrap()
     storage.housekeeping()
+    sync.reset_interrupted()
     if security.secret_key_source() == "file":
         broker.log(
             "DD_SECRET_KEY is not set — using data/secret.key. Set it explicitly in production; "
@@ -62,7 +96,11 @@ async def lifespan(app: FastAPI):
     broker.log(
         f"Server ready · {auth.user_count()} account(s) · credentials: {credentials.source()}"
     )
-    yield
+    ticker = asyncio.create_task(scheduler())
+    try:
+        yield
+    finally:
+        ticker.cancel()
 
 
 app = FastAPI(title="DD Library", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -323,6 +361,9 @@ async def status(request: Request):
         "supported_extensions": sorted(SUPPORTED_EXTS),
         "archive_extensions": list(uploads.ARCHIVE_SUFFIXES),
         "max_upload_mb": settings.max_upload_mb,
+        # Counts only: the connection list itself is admin-only, but the Corpus
+        # tab needs to know whether to mention connected libraries at all.
+        "connected_libraries": db.scalar("SELECT COUNT(*) FROM sync_connections"),
         "workstreams": WORKSTREAMS,
         "stats": search.stats(),
         "manifest": {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed")},
@@ -507,6 +548,12 @@ async def start_ingest(body: IngestBody, request: Request):
             raise HTTPException(400, f"not a directory: {root}")
     if any(k.startswith("ingest-") for k in JOBS):
         raise HTTPException(409, "an ingest job is already running")
+    # A sync chains its own ingest and switches the corpus root to its mirror, so
+    # starting one by hand mid-sync would have two ingests writing the index and
+    # fighting over which root is current. During rclone's phase only the sync job
+    # is registered, so checking for a running ingest is not enough.
+    if any(k.startswith("sync-") for k in JOBS):
+        raise HTTPException(409, "a library sync is running — it will index its mirror itself")
     settings.set_corpus_root(str(root))
     db.audit("ingest.start", actor=actor(request), detail=str(root))
     job = ingest.IngestJob(root, ocr=body.ocr or settings.ocr_enabled)
@@ -633,6 +680,132 @@ async def delete_archive(archive_id: str, request: Request, drop_extracted: bool
             archive_id, drop_extracted=drop_extracted, actor=actor(request)
         )
     except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+# --- connected libraries (SharePoint) ------------------------------------
+#
+# Admin-only, like API keys and accounts: connecting a library makes its contents
+# readable to everyone who can sign in, which is a decision about who sees the
+# data room rather than a day-to-day ingest action.
+
+
+class ConnectionBody(BaseModel):
+    label: str
+    site_url: str
+    tenant: str
+    client_id: str
+    secret: str
+    library: str | None = None
+    only_supported_types: bool = True
+    mirror_deletions: bool = True
+    interval_minutes: int = 0
+
+
+class ConnectionPatch(BaseModel):
+    label: str | None = None
+    site_url: str | None = None
+    library: str | None = None
+    tenant: str | None = None
+    client_id: str | None = None
+    secret: str | None = None
+    only_supported_types: bool | None = None
+    mirror_deletions: bool | None = None
+    interval_minutes: int | None = None
+
+
+@app.get("/api/sync/connections")
+async def list_connections(_: dict = Depends(auth.require_admin)):
+    return {
+        "connections": sync.listing(),
+        "sync_root": str(settings.sync_root),
+        "max_sync_gb": settings.max_sync_gb,
+        "rclone": sync.engine_version(),
+    }
+
+
+@app.post("/api/sync/connections")
+async def add_connection(body: ConnectionBody, admin: dict = Depends(auth.require_admin)):
+    try:
+        conn = sync.create(
+            label=body.label, site_url=body.site_url, tenant=body.tenant,
+            client_id=body.client_id, secret=body.secret, library=body.library,
+            only_supported_types=body.only_supported_types,
+            mirror_deletions=body.mirror_deletions,
+            interval_minutes=body.interval_minutes, actor=admin["username"],
+        )
+    except (sync.SyncError, graph.GraphError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Probe immediately: a connection that cannot reach its library is worth
+    # finding out about now, not on the first sync.
+    verdict = await sync.test(conn["id"], actor=admin["username"])
+    return {"connection": verdict.get("connection") or conn, "test": {
+        "ok": verdict["ok"], "note": verdict["note"]}}
+
+
+@app.post("/api/sync/connections/{conn_id}")
+async def edit_connection(
+    conn_id: str, body: ConnectionPatch, admin: dict = Depends(auth.require_admin)
+):
+    try:
+        conn = sync.update(
+            conn_id, actor=admin["username"],
+            **body.model_dump(exclude_none=True),
+        )
+    except (sync.SyncError, graph.GraphError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"connection": conn}
+
+
+@app.post("/api/sync/connections/{conn_id}/test")
+async def test_connection(conn_id: str, admin: dict = Depends(auth.require_admin)):
+    try:
+        return await sync.test(conn_id, actor=admin["username"])
+    except sync.SyncError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/sync/connections/{conn_id}/sync")
+async def start_sync(conn_id: str, admin: dict = Depends(auth.require_admin)):
+    if sync.get(conn_id) is None:
+        raise HTTPException(404, "no such connection")
+    try:
+        return {"job_id": start_sync_job(conn_id, actor=admin["username"])}
+    except sync.SyncError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def start_sync_job(conn_id: str, *, actor: str | None) -> str:
+    """Start a sync, registered so it shows up and can be cancelled.
+
+    One at a time: two syncs would fight over the mirror, and the ingest each
+    chains would fight over the corpus root.
+    """
+    if any(k.startswith("sync-") for k in JOBS):
+        raise sync.SyncError("a sync is already running")
+    if any(k.startswith("ingest-") for k in JOBS):
+        raise sync.SyncError("an ingest is already running — it would clash with the sync")
+    job = sync.SyncJob(conn_id, actor=actor)
+    JOBS[job.id] = job
+
+    async def runner():
+        try:
+            await job.run()
+        finally:
+            JOBS.pop(job.id, None)
+            manifest.invalidate_manifest()
+
+    asyncio.create_task(runner())
+    return job.id
+
+
+@app.delete("/api/sync/connections/{conn_id}")
+async def delete_connection(
+    conn_id: str, drop_mirror: bool = False, admin: dict = Depends(auth.require_admin)
+):
+    try:
+        return sync.delete(conn_id, drop_mirror=drop_mirror, actor=admin["username"])
+    except sync.SyncError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 

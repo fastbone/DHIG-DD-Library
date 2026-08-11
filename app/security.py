@@ -35,7 +35,12 @@ _DKLEN = 32
 def _maxmem(n: int, r: int) -> int:
     return int(128 * n * r * 1.5)
 
+# Additional authenticated data, one constant per kind of secret. `_AAD` is the
+# original (Anthropic API keys) and stays the default so existing ciphertexts
+# keep decrypting.
 _AAD = b"dd-library/secret/v1"
+AAD_API_KEY = _AAD
+AAD_CONNECTION = b"dd-library/connection/v1"
 _KEY_SALT = b"dd-library/instance-key/v1"
 
 _cached_key: bytes | None = None
@@ -130,14 +135,21 @@ def secret_key_source() -> str:
     return "file" if (settings.data_dir / "secret.key").exists() else "unset"
 
 
-def encrypt(plaintext: str) -> tuple[bytes, bytes]:
-    """Returns (nonce, ciphertext)."""
+def encrypt(plaintext: str, aad: bytes = _AAD) -> tuple[bytes, bytes]:
+    """Returns (nonce, ciphertext).
+
+    `aad` binds a ciphertext to the kind of secret it holds. All secrets share
+    one instance key, so without it a row moved from one table to another would
+    still decrypt — an API key pasted into the connection table would be used as
+    a client secret, and vice versa. Each caller passes its own constant.
+    """
     nonce = os.urandom(12)
-    return nonce, AESGCM(instance_key()).encrypt(nonce, plaintext.encode("utf-8"), _AAD)
+    return nonce, AESGCM(instance_key()).encrypt(nonce, plaintext.encode("utf-8"), aad)
 
 
-def decrypt(nonce: bytes, ciphertext: bytes) -> str:
-    return AESGCM(instance_key()).decrypt(bytes(nonce), bytes(ciphertext), _AAD).decode("utf-8")
+def decrypt(nonce: bytes, ciphertext: bytes, aad: bytes = _AAD) -> str:
+    """Raises cryptography.exceptions.InvalidTag if `aad` is not the one used to encrypt."""
+    return AESGCM(instance_key()).decrypt(bytes(nonce), bytes(ciphertext), aad).decode("utf-8")
 
 
 # --- paths ---------------------------------------------------------------

@@ -20,6 +20,33 @@ RUN apt-get update \
     fi \
  && rm -rf /var/lib/apt/lists/*
 
+# rclone mirrors connected SharePoint libraries. It runs as the unprivileged user,
+# needs no capabilities, and writes only under /data — its configuration arrives
+# entirely through the environment, so there is no config file for it to own.
+#
+# Pinned upstream, deliberately not Debian's package: app-only auth for
+# SharePoint (`client_credentials`) landed in rclone 1.69.0, and trixie ships
+# 1.60.1, which cannot authenticate without a browser at all — so `apt install
+# rclone` would build an image where every sync fails on credentials. Checked
+# against the published SHA256SUMS; unzipped with python3 rather than adding
+# `unzip` to the image.
+ARG RCLONE_VERSION=1.75.0
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) rarch=amd64 ;; \
+      arm64) rarch=arm64 ;; \
+      *) echo "no rclone build for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    base="rclone-v${RCLONE_VERSION}-linux-${rarch}"; \
+    cd /tmp; \
+    curl -fsSL -o rclone.zip "https://downloads.rclone.org/v${RCLONE_VERSION}/${base}.zip"; \
+    curl -fsSL -o SHA256SUMS "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS"; \
+    grep " ${base}.zip\$" SHA256SUMS | sed "s# ${base}.zip# rclone.zip#" | sha256sum -c -; \
+    python3 -c "import zipfile; zipfile.ZipFile('rclone.zip').extractall('.')"; \
+    install -m 0755 "${base}/rclone" /usr/local/bin/rclone; \
+    rm -rf rclone.zip SHA256SUMS "${base}"; \
+    rclone version | head -1
+
 WORKDIR /app
 
 COPY requirements.txt ./

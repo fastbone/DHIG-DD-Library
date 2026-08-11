@@ -81,6 +81,21 @@
           <div class="progress-meta"><span id="extractMeta"></span><button class="link" id="extractCancel">cancel</button></div>
         </div>
         <div id="archiveList" class="rowlist" style="margin-top:12px"></div>
+
+        <div id="syncSection" class="hidden">
+          <h3>SharePoint libraries</h3>
+          <p class="muted small" id="syncHint">
+            Mirrored into the data folder, then indexed like any other folder.
+          </p>
+          <div id="syncProgress" class="progress-wrap hidden">
+            <div class="progress"><div class="bar" id="syncBar"></div></div>
+            <div class="progress-meta"><span id="syncMeta"></span><button class="link" id="syncCancel">cancel</button></div>
+          </div>
+          <div id="syncList" class="rowlist" style="margin-top:12px"></div>
+          <div class="row gap" style="margin-top:10px">
+            <button class="ghost" id="addConnectionBtn">Connect a library…</button>
+          </div>
+        </div>
       </div>
 
       <div class="card">
@@ -365,6 +380,66 @@
     <div class="row between">
       <button class="ghost" id="pickerUp">↑ parent</button>
       <button class="primary" id="pickerUse">Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<div id="connectModal" class="modal">
+  <div class="modal-body">
+    <div class="row between">
+      <h3 id="connectTitle">Connect a SharePoint library</h3>
+      <button class="ghost" id="connectClose">close</button>
+    </div>
+    <p class="muted small">
+      Needs an Entra ID app registration with an <em>application</em> permission on the
+      site — <code>Sites.Selected</code> granted on this one library, not
+      <code>Sites.Read.All</code>. The client secret is stored encrypted and never
+      shown again.
+    </p>
+    <div class="field">
+      <label for="cxLabel">Name</label>
+      <input id="cxLabel" type="text" placeholder="Project X data room">
+    </div>
+    <div class="field">
+      <label for="cxSite">Site URL</label>
+      <input id="cxSite" type="text" spellcheck="false"
+             placeholder="https://contoso.sharepoint.com/sites/ProjectX">
+    </div>
+    <div class="field">
+      <label for="cxLibrary">Library <span class="muted small">optional — the default one if blank</span></label>
+      <input id="cxLibrary" type="text" spellcheck="false" placeholder="Documents">
+    </div>
+    <div class="field">
+      <label for="cxTenant">Directory (tenant) ID</label>
+      <input id="cxTenant" type="text" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="cxClientId">Application (client) ID</label>
+      <input id="cxClientId" type="text" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="cxSecret">Client secret <span class="muted small" id="cxSecretHint"></span></label>
+      <input id="cxSecret" type="password" spellcheck="false" autocomplete="new-password">
+    </div>
+    <div class="row wrap gap">
+      <label class="check"><input type="checkbox" id="cxSupportedOnly" checked>
+        only fetch indexable file types</label>
+      <label class="check"><input type="checkbox" id="cxMirrorDeletions" checked>
+        mirror deletions</label>
+    </div>
+    <div class="field">
+      <label for="cxInterval">Sync automatically</label>
+      <select id="cxInterval">
+        <option value="0" selected>manually only</option>
+        <option value="60">every hour</option>
+        <option value="240">every 4 hours</option>
+        <option value="720">every 12 hours</option>
+        <option value="1440">daily</option>
+      </select>
+    </div>
+    <div class="row between">
+      <span class="muted small" id="connectStatus"></span>
+      <button class="primary" id="connectSave">Connect</button>
     </div>
   </div>
 </div>
