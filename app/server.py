@@ -488,6 +488,12 @@ async def start_ingest(body: IngestBody, request: Request):
             raise HTTPException(400, f"not a directory: {root}")
     if any(k.startswith("ingest-") for k in JOBS):
         raise HTTPException(409, "an ingest job is already running")
+    # A sync chains its own ingest and switches the corpus root to its mirror, so
+    # starting one by hand mid-sync would have two ingests writing the index and
+    # fighting over which root is current. During rclone's phase only the sync job
+    # is registered, so checking for a running ingest is not enough.
+    if any(k.startswith("sync-") for k in JOBS):
+        raise HTTPException(409, "a library sync is running — it will index its mirror itself")
     settings.set_corpus_root(str(root))
     db.audit("ingest.start", actor=actor(request), detail=str(root))
     job = ingest.IngestJob(root, ocr=body.ocr or settings.ocr_enabled)

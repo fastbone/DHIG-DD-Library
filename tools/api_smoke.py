@@ -38,6 +38,20 @@ os.environ.pop("DD_ADMIN_PASSWORD", None)
 os.environ.pop("ANTHROPIC_API_KEY", None)
 os.environ["DD_BROWSE_ROOTS"] = f"{_DATA}/uploads/extracted{os.pathsep}{ROOT}"
 
+# A sync engine that never finishes, so a sync can be held in flight while other
+# requests are made against it. The job scrubs its child's environment, so the
+# scenario travels in the binary path rather than an environment variable.
+_HANGING_RCLONE = Path(_TMP) / "hanging_rclone.py"
+_HANGING_RCLONE.write_text(
+    "#!/usr/bin/env python3\n"
+    "import os, runpy, sys\n"
+    "os.environ['FAKE_RCLONE_MODE'] = 'hang'\n"
+    f"sys.argv[0] = {str(ROOT / 'tools' / 'fake_rclone.py')!r}\n"
+    f"runpy.run_path({str(ROOT / 'tools' / 'fake_rclone.py')!r}, run_name='__main__')\n"
+)
+_HANGING_RCLONE.chmod(0o755)
+os.environ["DD_RCLONE_BIN"] = str(_HANGING_RCLONE)
+
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8097"))
 BASE = f"http://127.0.0.1:{PORT}"
 
@@ -370,9 +384,47 @@ def main() -> int:
     code, body, _ = admin.get("/api/sync/connections")
     check("the rotated secret is not returned either", rotated not in str(body))
 
+    # The patch route drops nulls so untouched fields keep their value, which is
+    # why the form sends "" to mean "back to the site's default library".
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"library": "DD Room"})
+    check("a library can be named", code == 200 and body["connection"]["library"] == "DD Room",
+          str(body)[:160])
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"library": ""})
+    check("an empty library clears it rather than being ignored",
+          code == 200 and body["connection"]["library"] is None, str(body)[:160])
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}", {"label": ""})
+    check("an empty label is refused rather than nulling a required column",
+          code == 400, f"got {code}: {str(body)[:120]}")
+
     code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/test")
     check("testing an unreachable library reports a reason, not a crash",
           code == 200 and body["ok"] is False and body["note"], str(body)[:200])
+
+    # A sync holds the corpus root and indexes its own mirror, so nothing else
+    # may index at the same time. Held in flight with a sync engine that never
+    # returns; the drive id is set directly because resolving it would need Graph.
+    from app import db as _db
+
+    _db.execute("UPDATE sync_connections SET drive_id='drv-1' WHERE id=?", (conn_id,))
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/sync")
+    sync_job = body.get("job_id") if code == 200 else None
+    check("a sync starts", code == 200 and sync_job, str(body)[:160])
+    running = wait_for_job(
+        admin, lambda s: any(k.startswith("sync-") for k in s["jobs_running"]), timeout=30
+    )
+    check("the sync shows up as a running job", running)
+    code, body, _ = admin.post("/api/ingest", {"path": str(root)})
+    check("a manual ingest is refused while a sync is running", code == 409,
+          f"got {code}: {str(body)[:120]}")
+    code, body, _ = admin.post(f"/api/sync/connections/{conn_id}/sync")
+    check("a second sync is refused", code == 409, f"got {code}: {str(body)[:120]}")
+    if sync_job:
+        admin.post(f"/api/jobs/{sync_job}/cancel")
+    cleared = wait_for_job(admin, lambda s: not s["jobs_running"], timeout=30)
+    check("cancelling the sync clears the running jobs", cleared)
+    code, body, _ = admin.post("/api/ingest", {"path": str(root)})
+    check("ingest works again once the sync is gone", code == 200, f"got {code}: {str(body)[:120]}")
+    wait_for_job(admin, lambda s: not s["jobs_running"], timeout=60)
 
     code, body, _ = admin.delete("/api/sync/connections/does-not-exist")
     check("deleting an unknown connection is a 404", code == 404, f"got {code}")

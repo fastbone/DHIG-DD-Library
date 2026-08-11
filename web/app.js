@@ -557,7 +557,10 @@ $("connectSave").onclick = async () => {
   const body = {
     label: $("cxLabel").value.trim(),
     site_url: $("cxSite").value.trim(),
-    library: $("cxLibrary").value.trim() || null,
+    // Empty string, never null: the patch route drops nulls so that untouched
+    // fields keep their stored value, which would make clearing this impossible.
+    // The server reads "" as "back to the site's default library".
+    library: $("cxLibrary").value.trim(),
     tenant: $("cxTenant").value.trim(),
     client_id: $("cxClientId").value.trim(),
     only_supported_types: $("cxSupportedOnly").checked,

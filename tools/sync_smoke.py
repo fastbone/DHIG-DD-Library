@@ -152,6 +152,20 @@ async def main() -> int:
     check("the verdict is stored", sync.get(cid)["last_test_ok"] is True)
     check("the drive id is resolved and remembered", sync.get(cid)["drive_id"] == "drv-1")
 
+    # An empty library means "the site's default one". It has to be clearable, or
+    # a connection pointed at a named library can never be pointed back.
+    sync.update(cid, library="DD Room")
+    check("a named library is stored", sync.get(cid)["library"] == "DD Room")
+    sync.update(cid, library="")
+    check("an empty library clears back to the default", sync.get(cid)["library"] is None,
+          sync.get(cid)["library"])
+    for field in ("label", "site_url", "tenant", "client_id"):
+        try:
+            sync.update(cid, **{field: "   "})
+            check(f"an empty {field} is refused", False, "accepted")
+        except sync.SyncError:
+            check(f"an empty {field} is refused", True)
+
     sync.update(cid, secret="wrong-secret")
     result = await sync.test(cid)
     check("a bad secret tests not-ok without raising", result["ok"] is False, result["note"])
@@ -214,6 +228,20 @@ async def main() -> int:
           "--include *.xlsx" in dumped.get("_argv", ""), dumped.get("_argv"))
     check("a deletion ceiling is passed when mirroring deletions",
           "--max-delete" in dumped.get("_argv", ""), dumped.get("_argv"))
+
+    check("the row records the library's size, not this run's transfers",
+          sync.get(cid)["n_files"] == 4 and sync.get(cid)["bytes_total"] > 0,
+          f"n_files={sync.get(cid)['n_files']} bytes={sync.get(cid)['bytes_total']}")
+
+    # The case that made this wrong: a second sync with nothing to move. The row
+    # must still describe the library rather than reporting "0 files".
+    scenario(FAKE_RCLONE_FILES=0, FAKE_RCLONE_WRITE_DIR=None)
+    job = sync.SyncJob(cid)
+    await job.run(then_ingest=False)
+    row = sync.get(cid)
+    check("an incremental sync that moves nothing keeps the file count",
+          row["n_files"] == 4, f"n_files={row['n_files']}")
+    check("and keeps the byte total", row["bytes_total"] > 0, f"bytes={row['bytes_total']}")
 
     print("\n— deletions drop documents from the index —")
     for name in ("finance/model.xlsx", "legal/spa.md"):

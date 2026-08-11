@@ -159,20 +159,30 @@ def create(
 def update(conn_id: str, *, actor: str | None = None, **fields) -> dict:
     if get(conn_id) is None:
         raise SyncError("no such connection")
+    # `library` is the one text column that may be cleared — an empty value means
+    # "use the site's default library". For the rest an empty value is a mistake,
+    # and nulling them would either break the row (label is NOT NULL) or leave a
+    # connection that cannot authenticate.
+    required = {"label", "site_url", "tenant", "client_id"}
     sets: list[str] = []
     params: list = []
     for column in ("label", "site_url", "library", "tenant", "client_id",
                    "only_supported_types", "mirror_deletions", "interval_minutes"):
-        if column in fields and fields[column] is not None:
-            value = fields[column]
-            if column in {"only_supported_types", "mirror_deletions"}:
-                value = int(bool(value))
-            elif column == "interval_minutes":
-                value = max(0, int(value))
-            elif isinstance(value, str):
-                value = value.strip() or None
-            sets.append(f"{column}=?")
-            params.append(value)
+        if column not in fields or fields[column] is None:
+            continue
+        value = fields[column]
+        if column in {"only_supported_types", "mirror_deletions"}:
+            value = int(bool(value))
+        elif column == "interval_minutes":
+            value = max(0, int(value))
+        elif isinstance(value, str):
+            value = value.strip()
+            if not value:
+                if column in required:
+                    raise SyncError(f"{column.replace('_', ' ')} cannot be empty")
+                value = None
+        sets.append(f"{column}=?")
+        params.append(value)
     if fields.get("secret"):
         nonce, ciphertext = security.encrypt(
             fields["secret"].strip(), security.AAD_CONNECTION
@@ -264,6 +274,10 @@ class SyncJob:
         self.skipped = 0
         self.deleted = 0
         self.bytes_done = 0
+        # The library's own size, filled by the preflight. Separate from
+        # done/bytes_done, which count only what this run transferred.
+        self.library_files = 0
+        self.library_bytes = 0
         self.mirror: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._error_tail: list[str] = []
@@ -434,6 +448,11 @@ class SyncJob:
                 f"{free / 1e9:.1f} GB is free on the data volume"
             )
         self.total = count
+        # What the library *holds*, as distinct from what this run moves. The row
+        # stores these, so an incremental sync that transfers nothing still shows
+        # the library's real size rather than "0 files".
+        self.library_files = count
+        self.library_bytes = remote_bytes
         broker.log(
             f"{count} file(s), {remote_bytes / 1e9:.2f} GB to mirror "
             f"({free / 1e9:.1f} GB free)."
@@ -509,11 +528,15 @@ class SyncJob:
 
     async def _finish(self, row: dict, status: str, started: float, *, then_ingest: bool) -> None:
         elapsed = time.time() - started
+        # n_files / bytes_total describe the library, not this run: an incremental
+        # sync that transfers nothing would otherwise store zeros and the UI would
+        # report a healthy connection as "0 files".
         db.execute(
             "UPDATE sync_connections SET status=?, error=NULL, last_sync_at=?,"
             " last_sync_seconds=?, n_files=?, n_deleted=?, bytes_total=? WHERE id=?",
             ("ok" if status == "ok" else "failed" if status == "failed" else "ok",
-             time.time(), elapsed, self.done, self.deleted, self.bytes_done, self.conn_id),
+             time.time(), elapsed, self.library_files, self.deleted, self.library_bytes,
+             self.conn_id),
         )
         size = (f"{self.bytes_done / 1e9:.2f} GB" if self.bytes_done >= 1e9
                 else f"{self.bytes_done / 1e6:.1f} MB")
