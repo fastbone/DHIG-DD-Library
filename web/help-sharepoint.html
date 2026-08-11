@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connecting a SharePoint library · DD Library</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Crect x='9' y='8' width='4' height='16' rx='1' fill='white'/%3E%3Crect x='16' y='8' width='4' height='16' rx='1' fill='white' opacity='.65'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+<style>
+  /* Page-scoped only. Every colour comes from the tokens in styles.css, so this
+     guide cannot drift from the app's palette or its three theme states. */
+  .doc { max-width: 1080px; margin: 0 auto; padding: 34px 22px 80px; display: grid; gap: 40px;
+         grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 1000px) {
+    .doc { grid-template-columns: 200px minmax(0, 1fr); gap: 50px; align-items: start; }
+    .doc-rail { position: sticky; top: 34px; }
+  }
+  .doc-head { grid-column: 1 / -1; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+  .doc-head h1 { font-size: clamp(25px, 4vw, 35px); line-height: 1.14; letter-spacing: -.024em;
+                 font-weight: 640; margin: 12px 0 12px; text-wrap: balance; }
+  .doc-head .lede { font-size: 16.5px; color: var(--ink-2); margin: 0; max-width: 62ch; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+             text-transform: uppercase; color: var(--accent); margin: 0; }
+
+  .doc-rail nav { display: flex; flex-direction: column; gap: 2px; }
+  .doc-rail .rail-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em;
+                          text-transform: uppercase; color: var(--ink-3); margin: 0 0 11px;
+                          padding-left: 11px; }
+  .doc-rail a { display: grid; grid-template-columns: 18px 1fr; gap: 9px; align-items: baseline;
+                color: var(--ink-2); text-decoration: none; font-size: 13px; padding: 6px 11px;
+                border-left: 2px solid var(--line); border-radius: 0 6px 6px 0; }
+  .doc-rail a span:first-child { font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+                                 font-variant-numeric: tabular-nums; }
+  .doc-rail a:hover { color: var(--ink); background: var(--panel-2); border-left-color: var(--accent); }
+
+  .doc-main { min-width: 0; max-width: 68ch; }
+  .doc-main h2 { font-size: 12.5px; font-family: var(--mono); letter-spacing: .1em;
+                 text-transform: uppercase; color: var(--ink-3); font-weight: 500;
+                 margin: 50px 0 16px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
+  .doc-main > h2:first-child { margin-top: 4px; }
+  .doc-main h3 { font-size: 16.5px; font-weight: 620; letter-spacing: -.01em; margin: 28px 0 8px; }
+  .doc-main p { margin: 0 0 13px; text-wrap: pretty; }
+  .doc-main ul, .doc-main ol { margin: 0 0 13px; padding-left: 21px; }
+  .doc-main li { margin-bottom: 6px; }
+  .doc-main li::marker { color: var(--ink-3); }
+  .doc-main code { font-family: var(--mono); font-size: .875em; background: var(--panel-2);
+                   border: 1px solid var(--line); border-radius: 5px; padding: .08em .34em;
+                   word-break: break-word; }
+  .doc-main pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; margin: 0 0 15px;
+                  background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+                  padding: 13px 15px; overflow-x: auto; }
+  .doc-main pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+  .pre-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em;
+               text-transform: uppercase; color: var(--ink-3); margin: 0 0 5px; }
+
+  .step { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 15px; margin: 24px 0; }
+  .step-n { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums;
+            width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+            background: var(--accent-soft); color: var(--accent); }
+  .step-body { min-width: 0; }
+  .step-body > :last-child { margin-bottom: 0; }
+  .step h3 { margin-top: 2px; }
+
+  .collect { background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px;
+             padding: 17px 19px; margin: 20px 0; box-shadow: var(--shadow); }
+  .collect h3 { margin-top: 0; }
+  .collect dl { margin: 0; display: grid; gap: 13px; }
+  .collect dt { font-family: var(--mono); font-size: 12px; color: var(--ink);
+                background: var(--accent-soft); display: inline-block; padding: 2px 7px;
+                border-radius: 5px; }
+  .collect dd { margin: 5px 0 0; color: var(--ink-2); font-size: 14px; }
+
+  .note { border-left: 3px solid var(--line-2); background: var(--panel-2); padding: 12px 15px;
+          margin: 17px 0; border-radius: 0 8px 8px 0; font-size: 14px; }
+  .note > :last-child { margin-bottom: 0; }
+  .note .tag { font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
+               text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .note.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+  .note.warn .tag { color: var(--warn); }
+  .note.stop { border-left-color: var(--err); background: var(--err-soft); }
+  .note.stop .tag { color: var(--err); }
+  .note.ok { border-left-color: var(--ok); background: var(--ok-soft); }
+  .note.ok .tag { color: var(--ok); }
+  .note.plain .tag { color: var(--ink-3); }
+
+  .doc-main table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .doc-main tbody td:first-child { white-space: nowrap; }
+  /* The catalogue's rows are clickable; a reference table's are not. Undo the
+     app's row affordances here so nothing invites a click that does nothing. */
+  .doc-main tbody tr { cursor: default; }
+  .doc-main tbody tr:hover { background: none; }
+  .doc-foot { grid-column: 1 / -1; margin-top: 54px; padding-top: 20px;
+              border-top: 1px solid var(--line); color: var(--ink-3); font-size: 13px; }
+  .doc-foot p { margin: 0 0 5px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand"><span class="mark"></span><span>DD&nbsp;Library</span></div>
+  <a class="link" href="/#corpus">&larr; back to the app</a>
+</div>
+
+<div class="doc">
+
+  <header class="doc-head">
+    <p class="eyebrow">Setup · connected libraries</p>
+    <h1>Getting the credentials for a SharePoint&nbsp;Online library</h1>
+    <p class="lede">
+      DD Library signs in to SharePoint as itself, not as you — so it needs its own
+      identity in Microsoft Entra ID. This walks through creating that identity and
+      collecting the values the <em>Connect a library</em> form asks for. Once per
+      tenant, then one grant per library.
+    </p>
+  </header>
+
+  <aside class="doc-rail">
+    <nav aria-label="Contents">
+      <p class="rail-label">Contents</p>
+      <a href="#target"><span>—</span><span>What you need</span></a>
+      <a href="#register"><span>1</span><span>Register the app</span></a>
+      <a href="#permission"><span>2</span><span>Add the permission</span></a>
+      <a href="#site"><span>3</span><span>Grant the library</span></a>
+      <a href="#enter"><span>4</span><span>Enter it here</span></a>
+      <a href="#trouble"><span>—</span><span>If it fails</span></a>
+      <a href="#renew"><span>—</span><span>Before it expires</span></a>
+    </nav>
+  </aside>
+
+  <main class="doc-main">
+
+    <h2 id="target">What you need, and who can do it</h2>
+
+    <p>
+      Four values come out of this, and the form needs all four. Read them first —
+      knowing what you are collecting makes the clicking obvious.
+    </p>
+
+    <div class="collect">
+      <h3>The four values</h3>
+      <dl>
+        <div>
+          <dt>Site URL</dt>
+          <dd>You already have this — the address of the SharePoint site, copied from your browser.</dd>
+        </div>
+        <div>
+          <dt>Directory (tenant) ID</dt>
+          <dd>A GUID identifying your organisation. From the app's Overview page (step&nbsp;2).</dd>
+        </div>
+        <div>
+          <dt>Application (client) ID</dt>
+          <dd>A GUID identifying the app you are about to create. Same page (step&nbsp;2).</dd>
+        </div>
+        <div>
+          <dt>Client secret</dt>
+          <dd>The app's password. Shown exactly once, at the moment you create it (step&nbsp;3).</dd>
+        </div>
+      </dl>
+    </div>
+
+    <p>
+      There is a fifth thing that is not a value but a permission grant — step 6. It is
+      the step people miss, and skipping it produces an <em>access denied</em> that looks
+      like wrong credentials.
+    </p>
+
+    <h3>Who has to do it</h3>
+
+    <ul>
+      <li><strong>Registering the app</strong> (steps 1–4) — any user can, in most tenants. Some restrict it to the <em>Application Developer</em> role.</li>
+      <li><strong>Granting admin consent</strong> (step 5) — a <em>Global Administrator</em>, <em>Privileged Role Administrator</em>, or <em>Cloud Application Administrator</em>. There is no way around this; it is one button, so it is a small ask.</li>
+      <li><strong>Granting access to the library</strong> (step 6) — a SharePoint administrator.</li>
+    </ul>
+
+    <p>
+      If that is not you, parts 1–3 can be handed over whole. Whoever does them needs to
+      send back only the three values.
+    </p>
+
+    <div class="note warn">
+      <span class="tag">Send the secret carefully</span>
+      <p>
+        The client secret is a password to the library's contents. Send it through a
+        password manager or a secret-sharing link, not email or chat. Once it is in
+        DD Library it is encrypted at rest and never shown again.
+      </p>
+    </div>
+
+    <h2 id="register">Part 1 — Register the app</h2>
+
+    <p>
+      Everything here happens in the <strong>Microsoft Entra admin center</strong> at
+      <code>entra.microsoft.com</code>. The same pages exist in the Azure portal under
+      <em>Microsoft Entra ID</em>, if that is where you normally work.
+    </p>
+
+    <div class="step">
+      <div class="step-n">1</div>
+      <div class="step-body">
+        <h3>Create the registration</h3>
+        <p>Go to <strong>Identity &rarr; Applications &rarr; App registrations</strong>, then <strong>New registration</strong>.</p>
+        <ul>
+          <li><strong>Name</strong> — something recognisable in an audit log a year from now. <code>DD Library corpus sync</code> works.</li>
+          <li><strong>Supported account types</strong> — <em>Accounts in this organizational directory only (single tenant)</em>.</li>
+          <li><strong>Redirect URI</strong> — leave it empty. Nobody signs in to this app interactively, so it needs no redirect.</li>
+        </ul>
+        <p>Then <strong>Register</strong>.</p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">2</div>
+      <div class="step-body">
+        <h3>Copy the two IDs</h3>
+        <p>You land on the app's <strong>Overview</strong> page. Two of the four values are right there, under <em>Essentials</em>:</p>
+        <ul>
+          <li><strong>Application (client) ID</strong></li>
+          <li><strong>Directory (tenant) ID</strong></li>
+        </ul>
+        <p>
+          Both are GUIDs and look alike — <code>3fa85f64-5717-4562-b3fc-2c963f66afa6</code>.
+          Label them as you paste them somewhere, because swapping the two produces a login
+          error that names neither.
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">3</div>
+      <div class="step-body">
+        <h3>Create the client secret</h3>
+        <p>
+          Left menu &rarr; <strong>Certificates &amp; secrets</strong> &rarr;
+          <strong>Client secrets</strong> tab &rarr; <strong>New client secret</strong>.
+        </p>
+        <ul>
+          <li><strong>Description</strong> — <code>DD Library</code> plus the month, so the next person knows which is which.</li>
+          <li><strong>Expires</strong> — 12 or 24 months. 24 is the maximum Entra allows; the sync stops working the day it lapses, so see <a href="#renew">Before it expires</a>.</li>
+        </ul>
+        <p>Then <strong>Add</strong>.</p>
+
+        <div class="note stop">
+          <span class="tag">Copy it now</span>
+          <p>
+            The table shows two columns. You want <strong>Value</strong> — the long string,
+            not the shorter <strong>Secret ID</strong> beside it. The Value is displayed only
+            until you navigate away; after that it is masked forever and the only fix is
+            deleting the secret and making another.
+          </p>
+        </div>
+
+        <p>
+          Pasting the Secret ID by mistake is the most common failure here. It is a GUID;
+          a real secret is longer and mixes case and punctuation, something like
+          <code>zXt8Q~kA3v.Lm9_qR2sT7uV1wXyZ4aB6cD8eF0g</code>.
+        </p>
+      </div>
+    </div>
+
+    <h2 id="permission">Part 2 — Give it permission to read SharePoint</h2>
+
+    <div class="step">
+      <div class="step-n">4</div>
+      <div class="step-body">
+        <h3>Add <code>Sites.Selected</code> as an <em>application</em> permission</h3>
+        <p>
+          Left menu &rarr; <strong>API permissions</strong> &rarr;
+          <strong>Add a permission</strong> &rarr; <strong>Microsoft Graph</strong>.
+        </p>
+        <p>
+          Now the fork that matters: choose <strong>Application permissions</strong>, not
+          <em>Delegated permissions</em>. Delegated permissions act on behalf of a signed-in
+          user, and no user ever signs in here — pick that and the sync fails with a
+          permission error no matter what else you do.
+        </p>
+        <p>Search for <code>Sites.Selected</code>, tick it, and <strong>Add permissions</strong>.</p>
+
+        <div class="note plain">
+          <span class="tag">Why this one</span>
+          <p>
+            <code>Sites.Selected</code> grants nothing on its own. Access has to be handed to
+            the app site by site, which is step 6 — so the blast radius of this credential is
+            exactly the libraries you choose. <code>Sites.Read.All</code> would also work and
+            needs no step 6, but it grants read access to <em>every</em> site in the tenant.
+            For a due-diligence tool holding one deal's data room, that is the wrong trade.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-n">5</div>
+      <div class="step-body">
+        <h3>Grant admin consent</h3>
+        <p>
+          Adding the permission only requests it. On the same <strong>API permissions</strong>
+          page, click <strong>Grant admin consent for &lt;your organisation&gt;</strong> and
+          confirm.
+        </p>
+        <p>
+          The <strong>Status</strong> column must end up reading <em>Granted for &lt;your
+          organisation&gt;</em> with a green tick. If it still says <em>Not granted</em>, this
+          step did not happen — that is what to check first when the connection test fails.
+        </p>
+      </div>
+    </div>
+
+    <h2 id="site">Part 3 — Grant the app access to the one library</h2>
+
+    <p>
+      This is the step with no button in the portal. It is one command, run by a SharePoint
+      administrator, and either route below does the same thing. Pick whichever your admin
+      already has to hand.
+    </p>
+
+    <div class="step">
+      <div class="step-n">6</div>
+      <div class="step-body">
+        <h3>Route A — PnP PowerShell</h3>
+        <p>The shorter route if PowerShell is already in use for SharePoint admin.</p>
+        <p class="pre-label">PowerShell</p>
+<pre><code>Install-Module PnP.PowerShell -Scope CurrentUser
+
+Connect-PnPOnline -Url "https://contoso.sharepoint.com/sites/ProjectKestrel" -Interactive
+
+Grant-PnPAzureADAppSitePermission `
+  -AppId       "&lt;Application (client) ID&gt;" `
+  -DisplayName "DD Library corpus sync" `
+  -Permissions Read</code></pre>
+        <p>
+          Replace the URL with your site and the app id with the one from step 2.
+          <code>Read</code> is deliberate — DD Library only ever reads, and a write grant
+          would let a misconfiguration change the data room.
+        </p>
+
+        <div class="note plain">
+          <span class="tag">If the sign-in complains</span>
+          <p>
+            Recent PnP versions ask for your own client id for interactive sign-in rather than
+            using a shared one. If <code>Connect-PnPOnline -Interactive</code> errors about a
+            missing client id, run <code>Register-PnPEntraIDAppForInteractiveLogin</code> once
+            as the message directs, then repeat the connect. That is PnP's own registration and
+            has nothing to do with the app you just made.
+          </p>
+        </div>
+
+        <h3>Route B — Graph Explorer</h3>
+        <p>
+          No installation. Open <code>developer.microsoft.com/graph/graph-explorer</code>, sign
+          in as an administrator, and consent to <code>Sites.FullControl.All</code> when it asks
+          — that is Graph Explorer's own permission for making the grant, not something added
+          to your app.
+        </p>
+
+        <p><strong>First, get the site's ID.</strong> Split your site URL into the hostname and the path after it:</p>
+        <p class="pre-label">GET</p>
+<pre><code>https://graph.microsoft.com/v1.0/sites/contoso.sharepoint.com:/sites/ProjectKestrel</code></pre>
+        <p>
+          Copy the <code>id</code> from the response. It is a compound value with two commas in
+          it — <code>contoso.sharepoint.com,8a7b…,4c2d…</code> — and you need the whole thing.
+        </p>
+
+        <p><strong>Then grant read access</strong>, pasting that id into the URL:</p>
+        <p class="pre-label">POST</p>
+<pre><code>https://graph.microsoft.com/v1.0/sites/&lt;the id you just copied&gt;/permissions</code></pre>
+        <p class="pre-label">Request body</p>
+<pre><code>{
+  "roles": ["read"],
+  "grantedToIdentities": [
+    {
+      "application": {
+        "id": "&lt;Application (client) ID&gt;",
+        "displayName": "DD Library corpus sync"
+      }
+    }
+  ]
+}</code></pre>
+        <p>A <code>201 Created</code> response means the app can now read that site, and only that site.</p>
+      </div>
+    </div>
+
+    <h2 id="enter">Part 4 — Enter it in DD Library</h2>
+
+    <div class="step">
+      <div class="step-n">7</div>
+      <div class="step-body">
+        <h3>Connect the library</h3>
+        <p>
+          Back in the app: <strong>Corpus</strong> tab, then <strong>SharePoint libraries</strong>
+          &rarr; <strong>Connect a library…</strong>
+        </p>
+
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Field</th><th>What goes in it</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>Name</code></td>
+                  <td>Anything you will recognise. It labels the mirror folder on disk.</td></tr>
+              <tr><td><code>Site URL</code></td>
+                  <td>As copied from the browser. A URL pointing at a folder <em>inside</em> the library is fine — the site part is what gets used.</td></tr>
+              <tr><td><code>Library</code></td>
+                  <td>Leave blank unless the site has several document libraries. Blank takes the default one, usually <em>Documents</em>.</td></tr>
+              <tr><td><code>Directory (tenant) ID</code></td><td>From step 2.</td></tr>
+              <tr><td><code>Application (client) ID</code></td><td>From step 2.</td></tr>
+              <tr><td><code>Client secret</code></td><td>The <strong>Value</strong> from step 3.</td></tr>
+              <tr><td><code>Sync automatically</code></td>
+                  <td>Start on <em>manually only</em>. Set an interval once a first sync has worked.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          Saving tests the connection immediately, so a wrong secret or a missing site grant is
+          reported there and then rather than at the first sync. Then use <strong>test</strong>
+          on the row, and only after that <strong>sync now</strong>.
+        </p>
+
+        <div class="note ok">
+          <span class="tag">What a first sync does</span>
+          <p>
+            It checks the library's size against your disk, fetches only the indexable file
+            types, mirrors the folder tree into the data volume, and then indexes it like any
+            local folder. Deletions are mirrored on later runs, capped so a connection pointed
+            at the wrong library cannot empty the mirror in one go.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <h2 id="trouble">If the test fails</h2>
+
+    <p>
+      The test does two things — fetches a token, then reads the library root — so its message
+      tells you which half broke.
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>What it says</th><th>What it means</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>invalid_client</code></td>
+              <td>The secret is wrong, expired, or is actually the <em>Secret ID</em> from step 3 rather than the Value. Create a fresh secret and paste the Value.</td></tr>
+          <tr><td><code>unauthorized_client</code><br><code>AADSTS700016</code></td>
+              <td>The application ID does not exist in this tenant. Usually the two GUIDs from step 2 have been swapped.</td></tr>
+          <tr><td><code>AADSTS900023</code><br>tenant not found</td>
+              <td>The directory (tenant) ID is wrong — the other half of the same swap.</td></tr>
+          <tr><td>access denied · <code>403</code></td>
+              <td>The credentials are fine and the app has no rights to this site. Either admin consent (step 5) was never clicked, or the per-site grant (step 6) was not done — or was done against a different site.</td></tr>
+          <tr><td>site not found · <code>404</code></td>
+              <td>The site URL does not resolve. Paste it again straight from the browser; check for a trailing path from a different site collection.</td></tr>
+          <tr><td>no document library</td>
+              <td>The <code>Library</code> name does not match anything on the site. Clear the field to take the default.</td></tr>
+          <tr><td>timeout · connection refused</td>
+              <td>Not a credentials problem. The server cannot reach <code>login.microsoftonline.com</code>, <code>graph.microsoft.com</code> or <code>*.sharepoint.com</code>. Check egress from the Docker host.</td></tr>
+          <tr><td><code>rclone not installed</code></td>
+              <td>The sync engine is missing from the image. Rebuild it — <code>deploy/update.sh</code> on the host.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Failures also land in the <strong>Indexing</strong> tab's activity log, where
+      <em>errors only</em> plus <em>copy for a bug report</em> gives you the full response
+      rather than the one-line summary.
+    </p>
+
+    <h2 id="renew">Before it expires</h2>
+
+    <p>
+      Entra client secrets have a hard maximum lifetime of 24 months, and syncs begin failing
+      with <code>invalid_client</code> the day one lapses — silently, unless someone is watching
+      the log.
+    </p>
+
+    <p>Two minutes now saves an afternoon later:</p>
+
+    <ul>
+      <li>Put a calendar reminder a month before the expiry date you chose in step 3.</li>
+      <li>When it fires: create a new secret on the same app registration, paste its Value into <strong>edit</strong> on the connection, then delete the old secret.</li>
+    </ul>
+
+    <p>
+      Nothing else needs redoing — the app registration, the consent and the per-site grant all
+      survive a secret rotation. Leaving the secret field blank when editing means <em>keep the
+      current one</em>, so an accidental save cannot wipe it.
+    </p>
+
+    <div class="note warn">
+      <span class="tag">One thing to be clear about internally</span>
+      <p>
+        DD Library authenticates as the app, not as the person asking a question, so
+        SharePoint's own per-user permissions do not carry across. Anything synced is readable
+        by everyone who can sign in to DD Library. Point a connection only at libraries whose
+        whole contents the deal team is meant to see.
+      </p>
+    </div>
+
+  </main>
+
+  <footer class="doc-foot">
+    <p><a class="link" href="/#corpus">&larr; back to the app</a></p>
+    <p>The same material in brief is in the repository README, under <em>Connecting a SharePoint library</em>.</p>
+  </footer>
+
+</div>
+
+<script>
+  // Match whichever theme the operator picked in the app. Without this the guide
+  // opens in the OS theme and reads as a different product.
+  const saved = localStorage.getItem("dd-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+</script>
+</body>
+</html>

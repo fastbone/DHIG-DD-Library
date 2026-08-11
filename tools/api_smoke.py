@@ -688,6 +688,27 @@ def main() -> int:
     code, body, _ = admin.get("/api/status")
     check("the corpus is empty after a reset", body["stats"]["documents"] == 0, str(body["stats"]))
 
+    print("\n— setup guide —")
+    # Served by the app rather than linked out: it is read while setting up a
+    # server that may have no general internet egress.
+    code, body, headers = admin.get("/help/sharepoint")
+    check("the SharePoint setup guide is served", code == 200, f"got {code}")
+    check("the guide is the walkthrough, not a stub",
+          isinstance(body, str) and "Application (client) ID" in body
+          and "Sites.Selected" in body and "Grant admin consent" in body,
+          str(body)[:160])
+    check("the guide styles itself from the app stylesheet, so it cannot drift",
+          isinstance(body, str) and '/styles.css' in body, "no stylesheet link")
+    # Page routes redirect to the login form rather than returning 401 — that is
+    # the middleware's contract for anything outside /api/. urllib follows the
+    # redirect, so the guide is fenced when what comes back is the sign-in page.
+    anon = Client()
+    code, landed, _ = anon.get("/help/sharepoint")
+    check("the guide needs a session like every other page",
+          code == 200 and isinstance(landed, str)
+          and "Sign in" in landed and "Sites.Selected" not in landed,
+          f"got {code}: {str(landed)[:120]}")
+
     print("\n— activity log —")
     # The live SSE feed is a ring buffer, so the point of this table is that a
     # failure is still there — and still exportable — after it scrolled past.

@@ -150,6 +150,12 @@ folder. Files are cached in full rather than as text alone, because two things
 need the original bytes: opening a citation at its source, and `run_python`
 computing over the real workbook instead of eyeballing extracted text.
 
+The click-by-click version of what follows — including the two routes for the
+per-site grant and what each failure message means — is served by the app itself
+at **`/help/sharepoint`**, linked from the *Connect a library* form. It is a page
+rather than a link out because it gets read while setting up a server that may
+have no general internet egress.
+
 **In Entra ID**, once per tenant:
 
 1. Register an application (any name, no redirect URI needed — this is app-only
@@ -634,7 +640,8 @@ app/
   events.py       in-process pub/sub behind the SSE progress stream, and the
                   sink that persists each log line to the `logs` table
   server.py       FastAPI routes and the access-control middleware
-web/              single-page UI plus the login page, no build step
+web/              single-page UI, the login page, and the SharePoint setup
+                  guide served at /help/sharepoint — no build step
 tools/            sample corpus, API / sync / UI smoke tests, container check,
                   fake rclone
 Dockerfile        non-root, read-only /app, /data and /inbox volumes

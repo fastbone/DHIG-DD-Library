@@ -1178,6 +1178,17 @@ async def login_page():
     return FileResponse(WEB_DIR / "login.html")
 
 
+@app.get("/help/sharepoint")
+async def help_sharepoint():
+    """The app-registration walkthrough, linked from the connect form.
+
+    Served by the app rather than linked out: this is read while setting up a
+    server that may have no general internet egress at all, and the one thing an
+    operator should not have to do at that moment is go looking for a document.
+    """
+    return FileResponse(WEB_DIR / "help-sharepoint.html")
+
+
 @app.get("/")
 async def index():
     return FileResponse(WEB_DIR / "index.html")
