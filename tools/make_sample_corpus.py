@@ -3,15 +3,45 @@
 
     python3 tools/make_sample_corpus.py ./sample-dataroom
 
-Produces PDFs, a multi-sheet workbook with formulas, a deck with speaker notes,
-a Word contract, a CSV, and a deliberate near-duplicate pair — everything the
-ingest and dedupe paths need to be worth looking at. All figures are invented.
+Produces PDFs, a multi-sheet workbook with formulas, a legacy Excel 97-2003
+workbook, a deck with speaker notes, a Word contract, a CSV, and a deliberate
+near-duplicate pair — everything the ingest and dedupe paths need to be worth
+looking at. All figures are invented.
 """
 
 from __future__ import annotations
 
+import base64
+import gzip
 import sys
 from pathlib import Path
+
+# A genuine Excel 97-2003 workbook (OLE2 container, BIFF8 records), embedded
+# rather than generated: writing one needs xlwt, and a legacy-format *writer* is
+# not worth a dependency for an app that only ever reads them. Two sheets,
+# "Consolidated P&L" and "Notes", with a date-formatted cell and a boolean so the
+# legacy extractor's rendering is exercised, not just its happy path.
+#
+# Regenerate with:  pip install xlwt  (then xlwt.Workbook(); ...; wb.save(buf);
+# base64.b64encode(gzip.compress(buf.getvalue(), mtime=0)))
+_LEGACY_XLS_GZ_B64 = (
+    "H4sIAAAAAAACA+1YTWgUSRR+1dOdmWh+JmOUjUIoAsZ/ifEigo66+WHBZMeg+MOCO5OpGRsn3UNXjz972NVoji6C"
+    "J5e9CNnDXtyfw+qiol7Eg6DoQVhYSHZv62lBQVDTvnrdLYm2YFCDSr+mXlW9el+9N1WvX9X0ndstE+d+WzwJL9Fm"
+    "SMCUVw9102QMS33YSQOOe55qhnUKixfTR0X1KdzIOgMuNd5Kqj1U+z0JGvyqX0cO8A+Wr6AKg7Yl+BzSNvIhz5QP"
+    "m5iOsafBj1iaoI38yhAfJr6A+C+ke5n4FpKcIr4JdSfYPridHVy5IYjjPVoHjTUhZ3CBMH+RZB0shJsqjr87zXxd"
+    "A7Y6Zr7yAQwwHLisveVU7XoDjAPudb+whKP6zfATzAPYi7RmYGBNT88EtGIcjMMjjwM8DF/4azyWz62cAcofz5Qn"
+    "XyNPvUZej5v7svyMpgMcA+9rpqJ/DD6DnOGn9M9tS9oVs5h3RZHnOrePQSNsUGkdo2fQdoV8Cm2sAbsNfrrv3TXE"
+    "l3V1dWHW6Nvb3dXdHTbWYYANiUPCqolGwGmly+0Sl/mKkAjtd2wpedWxS6abAfiyioHomlaZiyNVYUkhcZrebV/s"
+    "7NmK4O2iWBYOH67YUhRTalrpKv/6AHKOqOYddLVmFVHFPSBwUnHItGuSV3yYPCpdMcILomQ7gjTIv/V8xCwro7a1"
+    "ti90npfMcs0Rkh8QqJsP9DHxSWrka0VTrUt+eNiuWa7kh5VaoWZWXF5y7JG189T5SPk0PSOfNlKWaUBehGZqt1Cu"
+    "SeMSPv35/7sDhVx2P0mO0Rnqn7RL1S6BB8cVAsFNNOKfvwksKwmxivgozbqE2ouJt+KOYd2ZWxg0+k6Qzkka7UQ7"
+    "64nuZZdNay/H9tiDHRfbx/7NrsD2+f7Jb1rP38+egw60XES8ek7Aaraa/XBW0Z/ZsGZBTv6beNsr+TmlpQPfveA6"
+    "0QzPVOJBaiHu99TqsBc9LVgrhWYRaEZngVqPK1gr79ALewHyu6MKqXBaBM4/Q/QAp/m43Q+9DIyWH3k+LhGBSxDO"
+    "CHAJH3cjiXzov7rAnh6B0wlXF+B0wnVsfIL2CuNPAntGBM4gXDLAGT4OtTLw+/daYC9J6zQTlySciqZvNdVjuAvt"
+    "V339VIR+ivRVdBlaCnuMVnOzloE/6MTZMu0eOBdxrr0Y/1jjnEXEeYbqMJZZZCzPV7dvte4Qte4xxRRTTDHF9C6I"
+    "BWetutfodM/3z/Jk8F3nGZap+DPJJ0tDYOPj4j/EXrCwduDorOJnERgsnIu9ISb8XqhoN1p34CAUyI+Ds45fvIux"
+    "6b/njYHpd/cKzdb+1Gz8fM/2nwObFWk/ABYAAA=="
+)
 
 
 def make(root: Path) -> None:
@@ -45,6 +75,11 @@ def make(root: Path) -> None:
     for name, rev in [("Meridian Group", 128900), ("Halstead AG", 51200), ("Others", 232500)]:
         cust.append([name, rev, f"=B{cust.max_row + 1}/412600"])
     wb.save(root / "01_financial" / "Project_Kestrel_Financial_Model_v3.xlsx")
+
+    # --- legacy workbook, the kind that has been sitting in the data room since
+    # before anyone standardised on .xlsx ---
+    (root / "01_financial" / "FinancialStatements_Consolidated_WorkingFile_2022_old.xls") \
+        .write_bytes(gzip.decompress(base64.b64decode(_LEGACY_XLS_GZ_B64)))
 
     # --- PDFs ---
     import pymupdf

@@ -63,8 +63,19 @@ manually, or on an interval. See *Connecting a SharePoint library* below.
 | PDF | text per page, optional OCR for scans | `p14` |
 | PPTX | markdown per slide **including speaker notes** | `slide7` |
 | XLSX / XLSM | one block per sheet: computed values **and** formulas | `Summary!A1:H240` |
+| XLS (Excel 97-2003) | one block per sheet, computed values | `Summary!A1:H240` |
 | DOCX | sectioned text plus tables | `sec3` |
 | CSV / TSV / TXT / MD / JSON | chunked text | `rows501-1000` |
+
+Spreadsheets are routed by what the file **is**, not what it is called. Data-room
+extensions are unreliable in both directions — modern workbooks saved as `.xls`,
+Excel 97-2003 workbooks renamed `.xlsx`, and reporting-system HTML tables handed
+out as `.xls` — so the container is identified from its bytes and each of those
+three is indexed rather than failed. Legacy `.xls` files carry one inherent
+limitation: the format stores computed values only, so there is no formula pass
+for them and the extracted text says so explicitly, rather than leaving the model
+to read the absence as "this workbook has no formulas". `.xlsb` (binary) is not
+supported and is skipped rather than failed.
 
 It also handles the mess a real data room is made of. Byte-identical files
 collapse into one content-addressed document with every path it was filed at
@@ -188,8 +199,9 @@ Admin tab; a locked-out administrator is recovered by setting `DD_ADMIN_USER`,
 `run_python` matters more than it looks. Extracted text loses number formatting,
 merged cells and formulas — so for anything quantitative the system prompt
 requires the model to open the real file with `pandas`/`openpyxl` and show its
-work. A helper module is injected: `dd.path(doc_id)`, `dd.text(doc_id)`,
-`dd.find("revenue model")`.
+work (`pandas.read_excel` covers legacy `.xls` too, via the same `xlrd` the
+extractor uses). A helper module is injected: `dd.path(doc_id)`,
+`dd.text(doc_id)`, `dd.find("revenue model")`.
 
 ---
 

@@ -138,12 +138,60 @@ def _decode(payload: bytes):
         return payload.decode("utf-8", "replace")
 
 
+def _spreadsheet_fixtures() -> dict[str, bytes]:
+    """The four spreadsheet shapes a real data room contains.
+
+    Extensions in a data room lie in both directions, and the app dispatches on
+    the container rather than the name. Each of these went wrong at some point:
+    a legacy workbook reached openpyxl and raised InvalidFileException; a modern
+    workbook named .xls was refused by openpyxl's *extension* check even though
+    its bytes were fine; and a reporting system's HTML table named .xls is not a
+    workbook at all.
+    """
+    import base64
+    import gzip
+
+    from openpyxl import Workbook
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    from make_sample_corpus import _LEGACY_XLS_GZ_B64
+
+    legacy = gzip.decompress(base64.b64decode(_LEGACY_XLS_GZ_B64))
+
+    buf = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Model"
+    ws.append(["Revenue", 412600])
+    ws.append(["EBITDA", 79192])
+    ws.append(["Margin", "=B2/B1"])
+    wb.save(buf)
+    modern = buf.getvalue()
+
+    return {
+        # A genuine Excel 97-2003 workbook, correctly named.
+        "deal/legacy_working_file.xls": legacy,
+        # Modern workbook, wrongly named .xls.
+        "deal/mislabelled_modern.xls": modern,
+        # Legacy workbook, wrongly named .xlsx.
+        "deal/mislabelled_legacy.xlsx": legacy,
+        # An HTML export a reporting system called a spreadsheet.
+        "deal/reporting_export.xls": (
+            "<html><body><table>"
+            "<tr><td>Backlog</td><td>214,000</td></tr>"
+            "</table></body></html>"
+        ).encode(),
+    }
+
+
 def build_zip() -> bytes:
     """A benign archive plus two members that must be refused."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("deal/notes.txt", "Revenue EUR 412.6m in FY2024.\n" * 40)
         zf.writestr("deal/sub/more.md", "# Findings\n\nCustomer concentration 31%.\n" * 20)
+        for name, content in _spreadsheet_fixtures().items():
+            zf.writestr(name, content)
         zf.writestr("../escape.txt", "should never be written outside the target")
         zf.writestr("/abs.txt", "absolute path, also refused")
     return buf.getvalue()
@@ -344,6 +392,64 @@ def main() -> int:
 
     code, body, _ = admin.get("/api/search?q=revenue")
     check("extracted content is searchable", code == 200 and len(body["hits"]) >= 1, str(body)[:160])
+
+    print("\n— spreadsheets are routed by content, not by extension —")
+    # The end-to-end half: a genuine Excel 97-2003 workbook indexed through the
+    # normal ingest path, with a figure only that workbook contains.
+    code, body, _ = admin.get("/api/search?q=%22previous+ledger+system%22")
+    check("a legacy .xls is indexed and searchable",
+          code == 200 and any("legacy_working_file" in h["rel_path"] for h in body["hits"]),
+          str(body)[:200])
+    code, body, _ = admin.get("/api/documents?query=legacy_working_file")
+    legacy_doc = next((d for d in body["documents"] if "legacy_working_file" in d["rel_path"]), None)
+    if legacy_doc:
+        code, card, _ = admin.get(f"/api/documents/{legacy_doc['id']}")
+        anchors = [a["anchor"] for a in card.get("anchors", [])]
+        # Same anchor shape as a modern workbook, so a citation into a legacy file
+        # resolves identically.
+        check("legacy sheets get sheet-range anchors",
+              anchors and all("!" in a and ":" in a for a in anchors), str(anchors))
+        # Identical bytes filed under a second name collapse to one document.
+        check("the same workbook named .xlsx collapses onto the same document",
+              any("mislabelled_legacy.xlsx" in p for p in card.get("identical_copies_at", [])),
+              str(card.get("identical_copies_at")))
+    else:
+        check("legacy sheets get sheet-range anchors", False, "legacy document not indexed")
+        check("the same workbook named .xlsx collapses onto the same document", False, "missing")
+
+    # The routing half, in process: every name/content combination, including the
+    # ones dedupe hides above.
+    from app import extract as _extract
+
+    probe_dir = Path(_TMP) / "spreadsheets"
+    probe_dir.mkdir(exist_ok=True)
+    expectations = {
+        # name                            container  must contain
+        "deal/legacy_working_file.xls": ("ole2", "Consolidated P&L"),
+        "deal/mislabelled_modern.xls": ("ooxml", "## formulas"),
+        "deal/mislabelled_legacy.xlsx": ("ole2", "Consolidated P&L"),
+        "deal/reporting_export.xls": ("other", "214,000"),
+    }
+    for name, content in _spreadsheet_fixtures().items():
+        target = probe_dir / Path(name).name
+        target.write_bytes(content)
+        want_container, want_text = expectations[name]
+        got_container = _extract._container(target)
+        try:
+            text, units = _extract.extract_spreadsheet(target)
+        except Exception as exc:  # noqa: BLE001 — the failure is the finding
+            check(f"{target.name} extracts", False, repr(exc))
+            continue
+        check(
+            f"{target.name} is read as {want_container}",
+            got_container == want_container and want_text in text and bool(units),
+            f"container={got_container} units={len(units)} text_ok={want_text in text}",
+        )
+    # A legacy workbook exposes values but never formulas; the mirror has to say
+    # so, or the model reads the absence as "this workbook has no formulas".
+    text, _ = _extract.extract_spreadsheet(probe_dir / "legacy_working_file.xls")
+    check("the legacy mirror discloses that formulas are unrecoverable",
+          "formulas are not recoverable" in text, text[:160])
 
     payload, ctype = multipart({"auto_extract": "false"}, "notes.txt", b"not an archive")
     code, body, _ = admin.post("/api/archives", payload, raw=True, content_type=ctype)
