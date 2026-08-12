@@ -177,6 +177,21 @@ textarea { width: 100%; resize: vertical; font-family: var(--sans); }
 }
 .fieldset-head .link { font-size: 12px; text-transform: none; letter-spacing: 0; }
 
+/* weekly budgets — a figure plus a bar, because "spent $18 of $25" is a number
+   you read and a bar is a state you notice. */
+.budget-line {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px;
+  margin-top: 5px; font-size: 12px; color: var(--ink-3);
+}
+.budget-line strong { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.budget-track {
+  display: inline-block; width: 64px; height: 5px; border-radius: 999px;
+  background: var(--line); overflow: hidden; vertical-align: middle;
+}
+.budget-fill { display: block; height: 100%; background: var(--accent); }
+.budget-fill.warn { background: var(--warn); }
+.budget-fill.bad { background: var(--err); }
+
 /* progress */
 .progress-wrap { margin-top: 14px; }
 .progress { height: 6px; background: var(--line); border-radius: 999px; overflow: hidden; }

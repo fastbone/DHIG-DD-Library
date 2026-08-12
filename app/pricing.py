@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from typing import Callable
 
 PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
@@ -94,9 +95,59 @@ class Meter:
 lifetime = Meter()
 
 
-def record(model: str, usage, *, meter: Meter | None = None, cache_ttl_1h: bool = False) -> float:
-    """Record usage against the lifetime meter and optionally a scoped one."""
+# --- attribution ---------------------------------------------------------
+#
+# Who is spending, passed explicitly. A context variable would remove the
+# argument from three signatures, but the spending happens inside async
+# generators, and a contextvar set across a `yield` belongs to whichever context
+# resumes the generator rather than to the generator itself. Mis-attributed spend
+# is a silent wrong number in someone's budget, so the boring option wins.
+
+@dataclass(frozen=True)
+class Attribution:
+    username: str | None
+    budget: str            # "ask" | "index"
+    kind: str              # analyst | verifier | carder
+    ref: str | None = None
+
+    def as_kind(self, kind: str) -> "Attribution":
+        """Same payer, different label — the verifier inside an analyst's turn."""
+        return Attribution(self.username, self.budget, kind, self.ref)
+
+
+# Set at startup to append to the ledger. A hook rather than importing db here,
+# so this module stays free of app dependencies and safe to import anywhere.
+sink: Callable[["Attribution", str, float, dict], None] | None = None
+
+
+def _as_dict(usage) -> dict:
+    return {
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+    }
+
+
+def record(
+    model: str,
+    usage,
+    *,
+    meter: Meter | None = None,
+    cache_ttl_1h: bool = False,
+    attribution: "Attribution | None" = None,
+) -> float:
+    """Record usage against the lifetime meter, a scoped one, and the ledger.
+
+    With no attribution the call is still metered but not charged to anyone —
+    which is what should happen to work nobody initiated.
+    """
     cost = lifetime.record(model, usage, cache_ttl_1h=cache_ttl_1h)
     if meter is not None:
         meter.record(model, usage, cache_ttl_1h=cache_ttl_1h)
+    if attribution is not None and sink is not None:
+        try:
+            sink(attribution, model, cost, _as_dict(usage))
+        except Exception:  # noqa: BLE001 — accounting must not fail the request
+            pass
     return cost

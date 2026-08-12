@@ -78,7 +78,12 @@ def span_for(citation: str) -> tuple[str, str]:
     return label, extract.read_mirror(doc_id, start, end)
 
 
-async def _check(client: AsyncAnthropic, claim: dict, meter: pricing.Meter | None) -> dict:
+async def _check(
+    client: AsyncAnthropic,
+    claim: dict,
+    meter: pricing.Meter | None,
+    attribution: pricing.Attribution | None = None,
+) -> dict:
     parts = []
     resolved = 0
     for c in claim["citations"][:4]:
@@ -97,7 +102,8 @@ async def _check(client: AsyncAnthropic, claim: dict, meter: pricing.Meter | Non
         output_config={"format": {"type": "json_schema", "schema": VERDICT_SCHEMA}},
         messages=[{"role": "user", "content": prompt}],
     )
-    pricing.record(settings.verifier_model, resp.usage, meter=meter)
+    pricing.record(settings.verifier_model, resp.usage, meter=meter,
+                   attribution=attribution)
     text = next((b.text for b in resp.content if b.type == "text"), "{}")
     try:
         parsed = json.loads(text)
@@ -107,7 +113,10 @@ async def _check(client: AsyncAnthropic, claim: dict, meter: pricing.Meter | Non
 
 
 async def verify_answer(
-    answer: str, *, meter: pricing.Meter | None = None
+    answer: str,
+    *,
+    meter: pricing.Meter | None = None,
+    attribution: pricing.Attribution | None = None,
 ) -> AsyncIterator[dict]:
     claims = extract_claims(answer)
     if not claims:
@@ -118,7 +127,7 @@ async def verify_answer(
     async def one(claim: dict) -> dict:
         async with sem:
             try:
-                return await _check(client, claim, meter)
+                return await _check(client, claim, meter, attribution)
             except Exception as exc:  # noqa: BLE001
                 return {**claim, "verdict": "unclear", "note": f"{type(exc).__name__}: {exc}"}
 

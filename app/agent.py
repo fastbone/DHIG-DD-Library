@@ -23,7 +23,7 @@ from typing import AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from . import credentials, db, docgen, manifest, pricing, tools, verify
+from . import budget, credentials, db, docgen, manifest, pricing, tools, verify
 from .config import settings
 from .events import broker
 
@@ -129,10 +129,21 @@ async def ask(
     history: list[dict] | None = None,
     do_verify: bool = True,
     effort: str | None = None,
+    actor: str | None = None,
 ) -> AsyncIterator[dict]:
     started = time.time()
     qa_id = uuid.uuid4().hex[:12]
     meter = pricing.Meter()
+
+    # Before the corpus map is even built: a refusal should cost nothing and say
+    # plainly what the position is, rather than surfacing as a failure mid-answer.
+    try:
+        await asyncio.to_thread(budget.require, actor, "ask")
+    except budget.BudgetExceeded as exc:
+        yield {"type": "error", "message": str(exc), "reason": "budget",
+               "budget": await asyncio.to_thread(budget.status, actor)}
+        return
+
     system, m = system_blocks()
 
     yield {
@@ -154,6 +165,9 @@ async def ask(
     messages: list[dict] = list(history or [])
     messages.append({"role": "user", "content": question})
 
+    payer = pricing.Attribution(actor, "ask", "analyst", qa_id)
+    stopped_on_budget = False
+    holding_grace = False
     client = credentials.get_client()
     tool_trace: list[dict] = []
     final_text = ""
@@ -186,7 +200,8 @@ async def ask(
                 response = await stream.get_final_message()
 
             cost = pricing.record(
-                settings.analyst_model, response.usage, meter=meter, cache_ttl_1h=True
+                settings.analyst_model, response.usage, meter=meter, cache_ttl_1h=True,
+                attribution=payer,
             )
             yield {
                 "type": "usage",
@@ -211,6 +226,26 @@ async def ask(
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
+                break
+
+            # Between turns is the only place a running answer can be stopped
+            # without throwing away what it has already paid for. A turn boundary
+            # also means the model has just written text, so the partial answer is
+            # coherent rather than a half-sentence.
+            decision, note = await asyncio.to_thread(
+                budget.turn_decision, actor, holding_grace=holding_grace, ref=qa_id
+            )
+            if decision == budget.GRACE:
+                holding_grace = True
+                yield {"type": "status", "reason": "budget", "message": note}
+            elif decision == budget.STOP:
+                stopped_on_budget = True
+                yield {
+                    "type": "status",
+                    "reason": "budget",
+                    "message": f"{note} The answer below is as far as it got — its "
+                               f"citations are still worth opening.",
+                }
                 break
 
             results: list[dict] = []
@@ -264,9 +299,16 @@ async def ask(
         yield {"type": "citations", "citations": citations}
 
         verdicts: list[dict] = []
-        if do_verify and citations:
+        if do_verify and citations and stopped_on_budget:
+            # Verification is another round of paid calls. Spending past a limit
+            # that has just stopped the answer would make the limit meaningless.
+            yield {"type": "status", "reason": "budget",
+                   "message": "Verification skipped — it costs another API call per claim."}
+        elif do_verify and citations:
             yield {"type": "phase", "phase": "verifying"}
-            async for v in verify.verify_answer(final_text, meter=meter):
+            async for v in verify.verify_answer(
+                final_text, meter=meter, attribution=payer.as_kind("verifier")
+            ):
                 verdicts.append(v)
                 yield {"type": "verdict", **v}
 
@@ -296,6 +338,8 @@ async def ask(
             "usage": usage,
             "duration_s": round(duration, 1),
             "assistant_message": final_text,
+            "stopped_on_budget": stopped_on_budget,
+            "budget": await asyncio.to_thread(budget.status, actor),
         }
     except Exception as exc:  # noqa: BLE001
         broker.log(

@@ -16,7 +16,7 @@ import uuid
 
 from anthropic import AsyncAnthropic
 
-from . import credentials, db, extract, pricing
+from . import budget, credentials, db, extract, pricing
 from .config import WORKSTREAMS, settings
 from .events import broker
 
@@ -81,7 +81,12 @@ def excerpt(doc_id: str, budget: int) -> str:
     )
 
 
-async def card_one(client: AsyncAnthropic, doc: dict, meter: pricing.Meter) -> dict:
+async def card_one(
+    client: AsyncAnthropic,
+    doc: dict,
+    meter: pricing.Meter,
+    attribution: pricing.Attribution | None = None,
+) -> dict:
     body = excerpt(doc["id"], settings.card_excerpt_chars)
     if not body.strip():
         db.execute(
@@ -103,7 +108,7 @@ async def card_one(client: AsyncAnthropic, doc: dict, meter: pricing.Meter) -> d
         output_config={"format": {"type": "json_schema", "schema": CARD_SCHEMA}},
         messages=[{"role": "user", "content": prompt}],
     )
-    pricing.record(settings.carder_model, resp.usage, meter=meter)
+    pricing.record(settings.carder_model, resp.usage, meter=meter, attribution=attribution)
 
     text = next((b.text for b in resp.content if b.type == "text"), "")
     if resp.stop_reason == "refusal":
@@ -133,14 +138,17 @@ async def card_one(client: AsyncAnthropic, doc: dict, meter: pricing.Meter) -> d
 class SweepJob:
     """Cards every extracted-but-unindexed document."""
 
-    def __init__(self, redo: bool = False) -> None:
+    def __init__(self, redo: bool = False, actor: str | None = None) -> None:
         self.id = f"sweep-{uuid.uuid4().hex[:8]}"
         self.redo = redo
+        self.actor = actor
         self.cancel = asyncio.Event()
+        self.budget_stop = False
         self.total = 0
         self.done = 0
         self.failed = 0
         self.meter = pricing.Meter()
+        self.payer = pricing.Attribution(actor, "index", "carder", self.id)
 
     def _publish(self, message: str = "") -> None:
         broker.publish(
@@ -180,14 +188,21 @@ class SweepJob:
         sem = asyncio.Semaphore(settings.card_concurrency)
 
         async def worker(doc: dict) -> None:
-            if self.cancel.is_set():
+            if self.cancel.is_set() or self.budget_stop:
                 return
             async with sem:
-                if self.cancel.is_set():
+                if self.cancel.is_set() or self.budget_stop:
+                    return
+                # Checked per document rather than once up front: a sweep runs for
+                # minutes and the figure it is checked against moves as it goes.
+                # Stopping here is safe — the cards already written are kept, and a
+                # re-run skips them, so nothing is paid for twice.
+                if await asyncio.to_thread(budget.exhausted, self.actor, "index"):
+                    self.budget_stop = True
                     return
                 for attempt in range(3):
                     try:
-                        result = await card_one(client, doc, self.meter)
+                        result = await card_one(client, doc, self.meter, self.payer)
                         if result.get("error"):
                             self.failed += 1
                         break
@@ -214,12 +229,19 @@ class SweepJob:
         finally:
             await client.close()
 
-        status = "cancelled" if self.cancel.is_set() else "done"
+        status = ("cancelled" if self.cancel.is_set()
+                  else "budget_stopped" if self.budget_stop else "done")
         usage = self.meter.snapshot()
         msg = (
             f"Indexed {self.done - self.failed}/{self.total} documents in "
             f"{time.time() - started:.0f}s · ${usage['cost_usd']:.2f} · {self.failed} failed"
         )
+        if self.budget_stop:
+            cap = budget.effective(self.actor, "index")
+            msg += (
+                f" · stopped: weekly indexing budget of ${cap:,.2f} reached. "
+                f"Run the sweep again after it resets to continue where it left off."
+            )
         db.job_upsert(self.id, status=status, done=self.done, failed=self.failed, message=msg,
                       detail=json.dumps(usage), finished_at=time.time())
         broker.log(msg, level="success" if status == "done" else "warn")

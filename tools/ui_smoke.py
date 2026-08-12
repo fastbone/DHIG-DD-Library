@@ -498,6 +498,62 @@ async def main() -> int:
         await page.wait_for_timeout(500)
         await page.screenshot(path="/tmp/sweep-log.png", full_page=True)
 
+        # ── weekly budgets ────────────────────────────────────────────────
+        from app import budget as _budget
+
+        _budget.set_budgets(SMOKE_USER, ask=4.0, index="unlimited", actor="smoke")
+        db.spend_record(SMOKE_USER, "ask", "analyst", "claude-opus-5", 3.40, ref="ui")
+        await page.click('button[data-tab="admin"]')
+        await page.evaluate("() => { refreshStatus(); loadUsers(); }")
+        await page.wait_for_timeout(900)
+
+        pills = await page.inner_text("#headPills")
+        checks["budget: the header shows the signed-in user's own weekly position"] = (
+            "this week" in pills and "$3.40" in pills and "$4.00" in pills
+        )
+        accounts = await page.inner_text("#userList")
+        checks["budget: each account shows both budgets and what it has spent"] = (
+            "questions" in accounts and "indexing" in accounts
+            and "$3.40" in accounts and "unlimited" in accounts
+        )
+        checks["budget: the reset and the instance defaults are stated"] = (
+            "reset" in (await page.inner_text("#budgetNote")).lower()
+            and "overrun" in await page.inner_text("#budgetNote")
+        )
+        # The bar is the at-a-glance half of the pair; 3.40 of 4.00 is 85%, which
+        # should read as a warning rather than as ordinary progress.
+        bar = await page.evaluate(
+            """() => {
+                 const f = document.querySelector('#userList .budget-fill');
+                 return f ? {cls: f.className, width: f.style.width} : null;
+               }"""
+        )
+        checks["budget: a nearly-spent budget reads as a warning"] = (
+            bar is not None and "warn" in bar["cls"]
+            and abs(float(bar["width"].rstrip("%")) - 85) < 0.5
+        )
+        await page.screenshot(path="/tmp/admin-budgets.png", full_page=True)
+
+        # An overspent account must not render a negative remainder or a bar past
+        # the end of its track.
+        db.spend_record(SMOKE_USER, "ask", "analyst", "claude-opus-5", 2.00, ref="ui")
+        await page.evaluate("() => { refreshStatus(); loadUsers(); }")
+        await page.wait_for_timeout(900)
+        over = await page.evaluate(
+            """() => {
+                 const f = document.querySelector('#userList .budget-fill');
+                 return {cls: f.className, width: f.style.width,
+                         text: document.querySelector('#userList').innerText};
+               }"""
+        )
+        # parseFloat, not a string match: the browser normalises "100.0%" to "100%".
+        checks["budget: an overspent account is capped at 100% and flagged"] = (
+            "bad" in over["cls"] and abs(float(over["width"].rstrip("%")) - 100) < 0.05
+            and "question budget spent" in over["text"]
+            # $5.40 of $4.00 — stated plainly, never a negative remainder.
+            and "$5.40 of $4.00" in over["text"] and "-$" not in over["text"]
+        )
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -549,7 +605,7 @@ async def main() -> int:
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
-          "/tmp/help-sharepoint.png")
+          "/tmp/admin-budgets.png /tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

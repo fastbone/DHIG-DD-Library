@@ -119,7 +119,7 @@ badged `supported` / `partial` / `unsupported`.
 analyst generated, plus the question log: every question, its citations, its
 verdicts and its cost.
 
-**Admin tab** (administrators only) — four things:
+**Admin tab** (administrators only) — five things:
 
 - **API keys.** Paste an Anthropic key and it is encrypted with the instance key
   and stored; the browser only ever sees a label and the last four characters.
@@ -135,9 +135,13 @@ verdicts and its cost.
   requires a new sweep), reset the index (drops the text mirror too), purge
   documents whose files are gone, vacuum the database, delete an extracted
   corpus folder.
+- **Weekly spending budgets.** Two caps per account — one for questions, one
+  for indexing — each set to a number, `unlimited`, or left to inherit the
+  instance default. Every account row shows what it has spent this week against
+  each cap. See *Weekly spending budgets* below.
 - **Audit log.** Every sign-in, failed sign-in, account change, key change,
-  upload, extraction, sync, question and storage operation, with actor and
-  timestamp.
+  upload, extraction, sync, question, budget change and storage operation, with
+  actor and timestamp.
 
 Connected libraries are managed from the Corpus tab but are administrator-only
 for the same reason keys are: connecting one makes its contents readable to
@@ -197,6 +201,58 @@ asking, so **SharePoint's own per-user permissions do not carry into DD Library*
 anyone who can sign in can read anything that was synced. And Entra client secrets
 expire; when one does, syncs fail with `invalid_client` until it is replaced under
 *edit*.
+
+## Weekly spending budgets
+
+Every paid API call is attributed to whoever caused it and written to a ledger,
+so "what did this cost and who spent it" is answerable from disk rather than from
+a counter that dies with the process. On top of that ledger sit two weekly caps
+per account:
+
+| Budget | Covers | Typical size |
+|---|---|---|
+| **questions** | Asking in the Ask tab, and the verifier that re-checks each citation | $0.40–1.00 per question |
+| **indexing** | The sweep that writes one catalogue card per document | $10–25 for a whole library, once |
+
+They are separate because the two are nothing alike. A single pooled figure would
+have to be either too small to sweep with or too large to be a limit on
+questions. An analyst who never sweeps can be left at 0 for indexing; the
+administrator who does the sweeping needs a cap that a full library fits inside,
+or `unlimited`.
+
+Each cap is one of three things:
+
+- **a number** — dollars per week. `0` means this account cannot spend at all.
+- **`unlimited`** — no cap. This is what you give the administrator who runs
+  sweeps, or a lead who should never be interrupted.
+- **`default`** — inherit `DD_WEEKLY_BUDGET_ASK_USD` / `DD_WEEKLY_BUDGET_INDEX_USD`.
+  Both default to unlimited, so **adding this feature changes nothing until
+  someone sets a number.**
+
+**The week runs Monday 00:00 to Monday 00:00**, server time. A rolling window
+would be fairer but has no reset anyone can name, and "when do I get my budget
+back" is the first question after being stopped. The Admin tab states the next
+reset in your own timezone.
+
+**What happens at the limit.** A question is refused *before* it starts if the
+week's allowance is already gone — nothing is spent to find that out. A question
+already running is checked between turns, which is the only point where stopping
+does not throw away work already paid for; the partial answer and its citations
+are kept and marked as stopped early, and verification is skipped rather than
+spending further. A sweep is refused before it starts and stops between
+documents, which is safe: the cards already written are kept and a later run
+skips them, so it resumes rather than restarts.
+
+**One overrun a week.** An answer abandoned halfway has spent money and produced
+nothing, so the first time in a week that a question would be cut off, the
+account may exceed its question budget by `DD_BUDGET_GRACE_PCT` (10% by default)
+to finish that one answer. It is claimed at the moment it is needed, logged and
+audited, and stays claimed until Monday — so the next answer that runs out stops
+where it stands. Sweeps get no overrun and need none.
+
+Everyone sees their own position: when a cap applies, the header carries a
+`this week $3.40 / $4.00` pill that turns amber near the limit, so the number is
+not something you first learn by being refused.
 
 ## Accounts and access
 
@@ -316,6 +372,9 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_SYNC_TIMEOUT` | `21600` | Give up on one sync after this many seconds |
 | `DD_RCLONE_BIN` | `rclone` | The sync engine. Point at another binary for a newer version |
 | `DD_LOG_RETENTION` | `20000` | Activity-log lines kept before the oldest are trimmed. `0` keeps everything |
+| `DD_WEEKLY_BUDGET_ASK_USD` | `-1` | Default weekly question budget per account. `-1` unlimited, `0` no spending |
+| `DD_WEEKLY_BUDGET_INDEX_USD` | `-1` | Default weekly indexing (sweep) budget per account |
+| `DD_BUDGET_GRACE_PCT` | `10` | How far over the question budget one answer a week may run to finish |
 
 Effort is worth a sweep of its own on your questions: `low` and `medium` are
 strong on Claude Opus 5 and much cheaper, while `xhigh` suits the hardest
@@ -619,7 +678,7 @@ app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
                   qa_log, users, sessions, api_keys, archives, sync_connections,
-                  audit, logs)
+                  audit, logs, spend, user_budgets)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
@@ -636,7 +695,8 @@ app/
   agent.py        the streaming tool loop, system prompt, citation parsing
   verify.py       re-read each cited span and judge the claim
   docgen.py       docx / xlsx / pptx / md from a block spec
-  pricing.py      token accounting and the cost meter
+  pricing.py      token accounting, the cost meter, and spend attribution
+  budget.py       weekly per-account caps: the week, inheritance, the overrun
   events.py       in-process pub/sub behind the SSE progress stream, and the
                   sink that persists each log line to the `logs` table
   server.py       FastAPI routes and the access-control middleware

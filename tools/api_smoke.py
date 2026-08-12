@@ -688,6 +688,113 @@ def main() -> int:
     code, body, _ = admin.get("/api/status")
     check("the corpus is empty after a reset", body["stats"]["documents"] == 0, str(body["stats"]))
 
+    print("\n— weekly spending budgets —")
+    from app import budget as _budget
+    from app import db as _bdb
+
+    # Its own analyst, because this section runs before the accounts section and
+    # must not depend on an account another check later disables.
+    dana = Client()
+    admin.post("/api/users",
+               {"username": "dana", "password": "budget-pass-3", "role": "analyst"})
+    _, dana_login, _ = dana.post("/api/login",
+                                 {"username": "dana", "password": "budget-pass-3"})
+    dana.csrf = (dana_login.get("user") or {}).get("csrf")
+
+    code, body, _ = admin.get("/api/users")
+    check("accounts report their budgets and the week's spend",
+          code == 200 and "budget" in body["users"][0] and "budget_defaults" in body,
+          str(body.get("budget_defaults")))
+    check("the week starts on a Monday at midnight",
+          time.localtime(body["week_start"]).tm_wday == 0
+          and time.localtime(body["week_start"]).tm_hour == 0,
+          time.strftime("%a %H:%M", time.localtime(body.get("week_start", 0))))
+    check("the reset is exactly a week after the start",
+          round(body["resets_at"] - body["week_start"]) == 7 * 24 * 3600,
+          str(body.get("resets_at", 0) - body.get("week_start", 0)))
+
+    code, body, _ = admin.post("/api/users/dana", {"budget_ask": 5, "budget_index": "unlimited"})
+    b = (body.get("user") or {}).get("budget") or {}
+    check("a cap and an unlimited can be set together",
+          code == 200 and b.get("ask", {}).get("limit_usd") == 5.0
+          and b.get("index", {}).get("unlimited") is True, str(b)[:200])
+    code, body, _ = admin.post("/api/users/dana", {"budget_ask": "default"})
+    b = (body.get("user") or {}).get("budget") or {}
+    check("'default' returns an account to the instance setting",
+          code == 200 and b.get("ask", {}).get("inherited") is True, str(b.get("ask")))
+    check("setting one budget leaves the other alone",
+          b.get("index", {}).get("unlimited") is True, str(b.get("index")))
+    code, body, _ = admin.post("/api/users/dana", {"budget_ask": "twenty quid"})
+    check("an unparseable budget is refused rather than stored as zero",
+          code == 400, f"got {code}: {str(body)[:120]}")
+    code, body, _ = dana.post("/api/users/dana", {"budget_ask": 999})
+    check("an analyst cannot raise their own budget", code == 403, f"got {code}")
+
+    # Spend is attributed and counted against the right budget.
+    _bdb.spend_record("dana", "ask", "analyst", "claude-opus-5", 4.0, ref="probe")
+    _bdb.spend_record("dana", "index", "carder", "claude-haiku-4-5", 99.0, ref="probe")
+    code, body, _ = admin.get("/api/users")
+    dana_row = next(u for u in body["users"] if u["username"] == "dana")
+    check("spend lands against the budget it belongs to",
+          abs(dana_row["spend_this_week"]["ask"] - 4.0) < 1e-6
+          and abs(dana_row["spend_this_week"]["index"] - 99.0) < 1e-6,
+          str(dana_row["spend_this_week"]))
+    check("an unlimited budget never reads as exhausted",
+          dana_row["budget"]["index"]["exhausted"] is False,
+          str(dana_row["budget"]["index"]))
+
+    # Both refusals need a stored key to reach: "no API key configured" is the more
+    # fundamental precondition and is reported ahead of the budget, which is the
+    # right order for whoever has to fix it. The key is never used — a refusal
+    # happens before any request goes out, which is the point of a pre-flight.
+    _, keyed, _ = admin.post("/api/keys",
+                             {"label": "budget-probe", "key": "sk-ant-" + "b" * 40})
+    probe_key = (keyed.get("key") or {}).get("id")
+
+    admin.post("/api/users/dana", {"budget_ask": 1})
+    code, body, _ = dana.post("/api/ask", {"question": "What is the revenue?", "verify": False})
+    stream = str(body)
+    check("a question is refused when the week's budget is gone",
+          code == 200 and '"reason": "budget"' in stream, f"got {code}: {stream[:200]}")
+    check("the refusal names the reset and how to raise it",
+          "resets" in stream and "Accounts" in stream, stream[:240])
+    check("the refusal costs nothing — no model call is made",
+          "text_delta" not in stream and "usage" not in stream, stream[:200])
+
+    # The sweep is a separate budget, refused separately.
+    admin.post("/api/users/alice", {"budget_index": 0})
+    code, body, _ = admin.post("/api/sweep", {"redo": False})
+    check("a sweep is refused when the indexing budget is gone",
+          code == 402 and "indexing" in str(body), f"got {code}: {str(body)[:160]}")
+    admin.post("/api/users/alice", {"budget_index": "unlimited"})
+    if probe_key:
+        admin.delete(f"/api/keys/{probe_key}")
+
+    # The grace is once a week, and pre-flight never grants it.
+    _budget.set_budgets("grace-probe", ask=1.0, actor="smoke")
+    _bdb.spend_record("grace-probe", "ask", "analyst", "claude-opus-5", 1.02)
+    first, note = _budget.turn_decision("grace-probe", holding_grace=False)
+    second, _ = _budget.turn_decision("grace-probe", holding_grace=False)
+    check("the first overrun of the week is granted",
+          first == _budget.GRACE and "one-time" in note, f"{first}: {note[:120]}")
+    check("the second overrun of the week is refused",
+          second == _budget.STOP, second)
+    check("an answer already holding the grace keeps going inside it",
+          _budget.turn_decision("grace-probe", holding_grace=True)[0] == _budget.CONTINUE)
+    _bdb.spend_record("grace-probe", "ask", "analyst", "claude-opus-5", 0.20)   # past 1.10
+    check("even a graced answer stops at the overrun ceiling",
+          _budget.turn_decision("grace-probe", holding_grace=True)[0] == _budget.STOP)
+    try:
+        _budget.require("grace-probe", "ask")
+        check("grace never lets a new question start on an empty budget", False, "allowed")
+    except _budget.BudgetExceeded:
+        check("grace never lets a new question start on an empty budget", True)
+
+    code, body, _ = admin.get("/api/status")
+    check("a user sees their own budget on status",
+          code == 200 and "budget" in body and "ask" in body["budget"],
+          str(body.get("budget"))[:160])
+
     print("\n— setup guide —")
     # Served by the app rather than linked out: it is read while setting up a
     # server that may have no general internet egress.
@@ -839,7 +946,9 @@ def main() -> int:
     carol = Client()
     code, _, _ = admin.post("/api/users",
                             {"username": "carol", "password": "analyst-pass-7", "role": "analyst"})
-    code, _, _ = carol.post("/api/login", {"username": "carol", "password": "analyst-pass-7"})
+    _, carol_login, _ = carol.post("/api/login",
+                                   {"username": "carol", "password": "analyst-pass-7"})
+    carol.csrf = (carol_login.get("user") or {}).get("csrf")
     code, body, _ = carol.get("/api/logs?levels=error")
     check("an analyst can read the log, so they can report a failure",
           code == 200 and "entries" in body, f"got {code}")
