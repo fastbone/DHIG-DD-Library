@@ -275,6 +275,35 @@ CREATE TABLE IF NOT EXISTS spend (
 CREATE INDEX IF NOT EXISTS idx_spend_user ON spend(username, budget, ts);
 CREATE INDEX IF NOT EXISTS idx_spend_ts   ON spend(ts DESC);
 
+-- One row per sync run. The connection row carries only the latest summary, and
+-- the job row is discarded detail — but "what did last night's sync actually
+-- change" is a question about a data room, not about a process, so it is worth
+-- keeping past the process that answered it.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id             TEXT PRIMARY KEY,   -- the job id, so a live event maps to a row
+    conn_id        TEXT NOT NULL,
+    label          TEXT,               -- the connection's label at the time
+    started_at     REAL NOT NULL,
+    finished_at    REAL,
+    status         TEXT NOT NULL,      -- running | ok | failed | cancelled
+    actor          TEXT,               -- who started it, or 'schedule'
+    transferred    INTEGER DEFAULT 0,
+    unchanged      INTEGER DEFAULT 0,
+    deleted        INTEGER DEFAULT 0,
+    errors         INTEGER DEFAULT 0,
+    bytes          INTEGER DEFAULT 0,
+    library_files  INTEGER,
+    library_bytes  INTEGER,
+    indexed_new    INTEGER,            -- from the ingest chained onto the sync
+    indexed_failed INTEGER,
+    purged         INTEGER,            -- documents dropped because their file went
+    message        TEXT,
+    error          TEXT,
+    changes        TEXT,               -- JSON [{op, path}], capped
+    error_lines    TEXT                -- JSON [str], capped
+);
+CREATE INDEX IF NOT EXISTS idx_sync_runs ON sync_runs(conn_id, started_at DESC);
+
 -- Per-account weekly caps. A separate table rather than columns on `users`
 -- because the schema is one pass of CREATE TABLE IF NOT EXISTS with no migration
 -- step, so a new column would never appear on a database that already exists.
@@ -650,6 +679,78 @@ def log_counts() -> dict:
         )
     ]
     return counts
+
+
+# --- sync runs -----------------------------------------------------------
+
+SYNC_RUN_CHANGES_MAX = 500  # paths kept per run
+SYNC_RUN_ERRORS_MAX = 50
+
+
+def sync_run_start(run_id: str, conn_id: str, label: str, actor: str | None) -> None:
+    execute(
+        "INSERT INTO sync_runs(id, conn_id, label, started_at, status, actor)"
+        " VALUES(?,?,?,?, 'running', ?)"
+        " ON CONFLICT(id) DO UPDATE SET status='running', started_at=excluded.started_at",
+        (run_id, conn_id, label, time.time(), actor),
+    )
+    # Trimmed here rather than on a timer: this is the only moment a connection
+    # gains a row, so it is the only moment it can exceed the cap.
+    execute(
+        "DELETE FROM sync_runs WHERE conn_id=? AND id NOT IN ("
+        " SELECT id FROM sync_runs WHERE conn_id=? ORDER BY started_at DESC LIMIT ?)",
+        (conn_id, conn_id, max(1, settings.sync_runs_keep)),
+    )
+
+
+def sync_run_update(run_id: str, **fields: Any) -> None:
+    """Patch a run row. `changes` and `error_lines` are JSON-encoded and capped."""
+    if "changes" in fields and not isinstance(fields["changes"], (str, type(None))):
+        fields["changes"] = json.dumps(list(fields["changes"])[:SYNC_RUN_CHANGES_MAX])
+    if "error_lines" in fields and not isinstance(fields["error_lines"], (str, type(None))):
+        fields["error_lines"] = json.dumps(list(fields["error_lines"])[:SYNC_RUN_ERRORS_MAX])
+    allowed = {
+        "finished_at", "status", "transferred", "unchanged", "deleted", "errors", "bytes",
+        "library_files", "library_bytes", "indexed_new", "indexed_failed", "purged",
+        "message", "error", "changes", "error_lines",
+    }
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    execute(
+        f"UPDATE sync_runs SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?",
+        (*sets.values(), run_id),
+    )
+
+
+def _sync_run_dict(row) -> dict:
+    d = dict(row)
+    for key in ("changes", "error_lines"):
+        raw = d.get(key)
+        try:
+            d[key] = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            d[key] = []
+    return d
+
+
+def sync_runs(conn_id: str, limit: int = 12) -> list[dict]:
+    """Newest first, without the per-file lists — those are per-run detail."""
+    out = []
+    for r in rows(
+        "SELECT id, conn_id, label, started_at, finished_at, status, actor, transferred,"
+        " unchanged, deleted, errors, bytes, library_files, library_bytes, indexed_new,"
+        " indexed_failed, purged, message, error FROM sync_runs"
+        " WHERE conn_id=? ORDER BY started_at DESC LIMIT ?",
+        (conn_id, max(1, min(limit, 100))),
+    ):
+        out.append(dict(r))
+    return out
+
+
+def sync_run(run_id: str) -> dict | None:
+    row = one("SELECT * FROM sync_runs WHERE id=?", (run_id,))
+    return _sync_run_dict(row) if row else None
 
 
 # --- spend ledger --------------------------------------------------------

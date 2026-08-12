@@ -830,6 +830,43 @@ async def edit_connection(
     return {"connection": conn}
 
 
+@app.get("/api/sync/connections/{conn_id}/runs")
+async def sync_run_list(conn_id: str, limit: int = 12, _: dict = Depends(auth.require_admin)):
+    """Recent runs for one connection, newest first, without the per-file lists."""
+    if sync.get(conn_id) is None:
+        raise HTTPException(404, "unknown connection")
+    running = next(
+        (j.id for j in JOBS.values() if getattr(j, "conn_id", None) == conn_id), None
+    )
+    return {"runs": db.sync_runs(conn_id, limit=limit), "running_id": running}
+
+
+@app.get("/api/sync/runs/{run_id}")
+async def sync_run_detail(run_id: str, _: dict = Depends(auth.require_admin)):
+    """One run in full: the counts, the paths it changed, and why it failed."""
+    run = db.sync_run(run_id)
+    if run is None:
+        raise HTTPException(404, "unknown run")
+    job = JOBS.get(run_id)
+    if job is not None:
+        # A running sync's live figures are ahead of the row, which is only written
+        # at the end. Overlay them so the detail view does not read as stalled.
+        run.update({
+            "transferred": job.done, "unchanged": job.skipped, "deleted": job.deleted,
+            "errors": job.failed, "bytes": job.bytes_done,
+            "transferring": job.transferring[:6],
+            "speed_bps": round(job.speed_bps, 1),
+            "eta_s": job.eta_s, "elapsed_s": round(job.elapsed_s, 1),
+            "changes": list(job._changes)[-200:],
+            "error_lines": list(job._error_tail),
+            "live": True,
+        })
+        if job.library_measured:
+            run["library_files"] = job.library_files
+            run["library_bytes"] = job.library_bytes
+    return {"run": run}
+
+
 @app.post("/api/sync/connections/{conn_id}/test")
 async def test_connection(conn_id: str, admin: dict = Depends(auth.require_admin)):
     try:

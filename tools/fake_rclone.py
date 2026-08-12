@@ -15,6 +15,7 @@ environment variables so one binary covers every scenario:
                                during a transfer
 
     FAKE_RCLONE_FILES=3        files to "transfer"
+    FAKE_RCLONE_DELETED_PATH=x  a path to report as deleted, for the change list
     FAKE_RCLONE_DELETES=2      deletions to report in the stats
     FAKE_RCLONE_SIZE=1048576   bytes the remote claims to hold
     FAKE_RCLONE_COUNT=3        files the remote claims to hold
@@ -106,6 +107,10 @@ def do_transfer() -> int:
             path = Path(dest) / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
+        # The real rclone names each object it moves, at -v. This is the line the
+        # change list is built from.
+        rel = SAMPLES[i % len(SAMPLES)][0]
+        emit({"level": "info", "msg": "Copied (new)", "object": rel})
         emit({
             "level": "info",
             "msg": f"transferred {i + 1}",
@@ -117,9 +122,22 @@ def do_transfer() -> int:
                 "bytes": per_file * (i + 1),
                 "deletes": DELETES,
                 "errors": 1 if MODE == "fail" else 0,
+                "speed": 1_250_000.0,
+                "elapsedTime": 0.05 * (i + 1),
+                "eta": max(0, FILES - i - 1) * 0.05,
+                # What is mid-flight this instant, which is what a running sync's
+                # detail view renders.
+                "transferring": [
+                    {"name": SAMPLES[(i + 1) % len(SAMPLES)][0], "size": per_file,
+                     "bytes": per_file // 2, "percentage": 50, "speedAvg": 640_000.0},
+                ],
             },
         })
         time.sleep(0.05)
+
+    deleted_path = os.environ.get("FAKE_RCLONE_DELETED_PATH")
+    if deleted_path:
+        emit({"level": "info", "msg": "Deleted", "object": deleted_path})
 
     # rclone emits stats on its timer regardless of how much moved, so a run that
     # only deleted things still reports those deletions. Without this final line a

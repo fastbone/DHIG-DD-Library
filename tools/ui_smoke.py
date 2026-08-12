@@ -513,6 +513,115 @@ async def main() -> int:
         await page.wait_for_timeout(500)
         await page.screenshot(path="/tmp/sweep-log.png", full_page=True)
 
+        # ── sync detail modal ─────────────────────────────────────────────
+        # Two finished runs and one still going, written straight to the table, so
+        # the view is exercised without a tenant.
+        import time as _t
+
+        conn_rows = db.rows("SELECT id, label FROM sync_connections LIMIT 1")
+        if not conn_rows:
+            db.execute(
+                "INSERT INTO sync_connections(id, label, site_url, tenant, client_id,"
+                " secret_nonce, secret_ciphertext, secret_last4, mirror_dir, created_at)"
+                " VALUES('cx-ui','Project X data room','https://contoso.sharepoint.com/sites/X',"
+                " 't','c', X'00', X'00', 'abcd', ?, ?)",
+                (str(Path(_TMP) / "sync" / "cx-ui"), _t.time()),
+            )
+            conn_rows = db.rows("SELECT id, label FROM sync_connections LIMIT 1")
+        cx_id = conn_rows[0]["id"]
+
+        db.sync_run_start("sync-uidone", cx_id, "Project X data room", "smoke-admin")
+        db.sync_run_update(
+            "sync-uidone", finished_at=_t.time(), status="ok", transferred=3, unchanged=41,
+            deleted=1, errors=0, bytes=2_500_000, library_files=44,
+            library_bytes=91_000_000, indexed_new=2, purged=1,
+            message="Synced Project X data room: 3 transferred (2.5 MB) in 6s",
+            changes=[{"op": "copied", "path": "01_financial/Q3_pack.xlsx"},
+                     {"op": "copied", "path": "02_legal/side_letter.pdf"},
+                     {"op": "deleted", "path": "02_legal/old_draft.pdf"}],
+        )
+        db.sync_run_start("sync-uifail", cx_id, "Project X data room", "schedule")
+        db.sync_run_update(
+            "sync-uifail", finished_at=_t.time(), status="failed", errors=1,
+            message="Sync failed", error="invalid_client: AADSTS7000215",
+            error_lines=["03_hr/locked.xlsx: 403 Forbidden"],
+        )
+
+        await page.click('button[data-tab="corpus"]')
+        await page.evaluate("() => loadConnections()")
+        await page.wait_for_timeout(700)
+        await page.click("#syncList .rowitem .actions button:nth-child(2)")
+        await page.wait_for_timeout(700)
+        cx_label = conn_rows[0]["label"]
+        checks["sync detail: the modal opens on a connection"] = (
+            await page.locator("#runModal.open").count() == 1
+            # The modal title is an h3, which the app uppercases.
+            and cx_label.lower() in (await page.inner_text("#runTitle")).lower()
+        )
+        checks["sync detail: the run history lists both runs"] = (
+            await page.locator("#runList .rowitem").count() == 2
+        )
+        detail = await page.inner_text("#runDetail")
+        # Opens on the newest run, which here is the failure — the thing someone
+        # opening this after a bad night actually wants.
+        checks["sync detail: it opens on the most recent run"] = (
+            "failed" in detail and "AADSTS7000215" in detail
+        )
+        checks["sync detail: a failed run keeps the reason and the failing path"] = (
+            "403 Forbidden" in detail and "locked.xlsx" in detail
+        )
+        # Switch to the successful one.
+        await page.click("#runList .rowitem:nth-child(2)")
+        await page.wait_for_timeout(600)
+        detail = await page.inner_text("#runDetail")
+        low = detail.lower()   # the stat labels are uppercased by the stylesheet
+        checks["sync detail: a finished run reports its counts"] = (
+            "41" in detail and "unchanged" in low and "3" in detail
+            and "2.4 mb" in low and "moved" in low
+        )
+        checks["sync detail: the changed files are listed with what happened"] = (
+            "01_financial/Q3_pack.xlsx" in detail and "02_legal/old_draft.pdf" in detail
+            and "deleted" in low and "copied" in low
+        )
+        checks["sync detail: indexing and purging are reported separately"] = (
+            "indexed" in low and "dropped" in low
+        )
+        await page.screenshot(path="/tmp/sync-detail.png", full_page=True)
+
+        # Now a run that is still going. The row exists from the moment the job
+        # starts, which is what makes a running sync inspectable at all; the event
+        # stream then patches it, because the counts are only written at the end.
+        db.sync_run_start("sync-uilive", cx_id, cx_label, "smoke-admin")
+        await page.evaluate("() => loadRunList()")
+        await page.wait_for_timeout(700)
+        checks["sync detail: a run still going is listed while it runs"] = (
+            "running" in (await page.inner_text("#runList")).lower()
+        )
+        await page.evaluate(
+            """(cx) => onJob({kind: "job", job_id: "sync-uilive", job_kind: "sync",
+                              conn_id: cx, status: "running", total: 10, done: 4, failed: 0,
+                              skipped: 2, deleted: 0, bytes_done: 1048576, elapsed_s: 12.5,
+                              speed_bps: 850000, eta_s: 30, message: "4 transferred",
+                              transferring: [{name: "01_financial/model.xlsx", size: 400000,
+                                              bytes: 200000, percentage: 50,
+                                              speed_bps: 640000}]})""",
+            cx_id,
+        )
+        await page.wait_for_timeout(400)
+        live = (await page.inner_text("#runDetail")).lower()
+        checks["sync detail: a running sync updates from the event stream"] = (
+            "updating live" in live and "in flight" in live and "model.xlsx" in live
+        )
+        checks["sync detail: a running sync shows a rate and an eta"] = (
+            "rate" in live and "eta" in live and "30s" in live
+        )
+        await page.screenshot(path="/tmp/sync-detail-live.png", full_page=True)
+        await page.click("#runClose")
+        await page.wait_for_timeout(200)
+        checks["sync detail: the modal closes"] = (
+            await page.locator("#runModal.open").count() == 0
+        )
+
         # ── weekly budgets ────────────────────────────────────────────────
         from app import budget as _budget
 
@@ -633,7 +742,8 @@ async def main() -> int:
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
-          "/tmp/admin-budgets.png /tmp/help-sharepoint.png")
+          "/tmp/admin-budgets.png /tmp/sync-detail.png /tmp/sync-detail-live.png "
+          "/tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

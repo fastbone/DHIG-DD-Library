@@ -644,6 +644,36 @@ def main() -> int:
         admin, lambda s: any(k.startswith("sync-") for k in s["jobs_running"]), timeout=30
     )
     check("the sync shows up as a running job", running)
+
+    # The detail routes, while the sync is still going: the point of them is that
+    # "watch this run" and "what did the last one do" are the same view.
+    code, body, _ = admin.get(f"/api/sync/connections/{conn_id}/runs")
+    check("a connection lists its runs",
+          code == 200 and body["runs"] and body["runs"][0]["status"] == "running",
+          f"got {code}: {str(body)[:200]}")
+    check("the running job is named, so the view can open on it",
+          body.get("running_id") == sync_job, str(body.get("running_id")))
+    if body.get("runs"):
+        run_id = body["runs"][0]["id"]
+        code, body, _ = admin.get(f"/api/sync/runs/{run_id}")
+        run = body.get("run", {})
+        check("a running run reports live figures the row does not hold yet",
+              code == 200 and run.get("live") is True and "transferring" in run,
+              f"got {code}: {str(run)[:200]}")
+    code, body, _ = admin.get("/api/sync/runs/sync-doesnotexist")
+    check("an unknown run is a 404", code == 404, f"got {code}")
+    code, body, _ = admin.get("/api/sync/connections/nope/runs")
+    check("runs for an unknown connection is a 404", code == 404, f"got {code}")
+    # A sync mirrors a library everyone can then read, but its connection settings
+    # and run history are admin-only like the rest of /api/sync.
+    peeker = Client()
+    admin.post("/api/users",
+               {"username": "erin", "password": "analyst-pass-5", "role": "analyst"})
+    _, peek_login, _ = peeker.post("/api/login",
+                                   {"username": "erin", "password": "analyst-pass-5"})
+    peeker.csrf = (peek_login.get("user") or {}).get("csrf")
+    code, body, _ = peeker.get(f"/api/sync/connections/{conn_id}/runs")
+    check("an analyst cannot read sync runs", code == 403, f"got {code}")
     code, body, _ = admin.post("/api/ingest", {"path": str(root)})
     check("a manual ingest is refused while a sync is running", code == 409,
           f"got {code}: {str(body)[:120]}")
