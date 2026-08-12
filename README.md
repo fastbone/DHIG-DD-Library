@@ -529,17 +529,55 @@ cd /opt/dd-library
 ./deploy/update.sh --status     # what is running now
 ./deploy/update.sh --dry-run    # print the plan, change nothing
 ./deploy/update.sh --rollback   # back to the previous commit
+./deploy/update.sh --no-env-sync  # leave .env alone even if it lacks variables
 ```
 
 What it does, in order: takes a `flock` so two runs can't overlap; refuses to
 start without `.env` and a non-empty `DD_SECRET_KEY`, with a dirty checkout
 (unless `--force`), or if the port belongs to someone else; fast-forwards the
-branch (never merges) and prints the changelog; warns if `.env.example` gained a
-variable; snapshots the index and secrets; builds the new image **while the old
-container still serves**; swaps; then polls `/api/health` for up to three
-minutes. If the new version doesn't come up healthy it restores the previous
-commit, brings the old one back and exits non-zero — a failed update leaves the
-service running.
+branch (never merges) and prints the changelog; reconciles `.env` with the new
+`.env.example` (below); snapshots the index and secrets; builds the new image
+**while the old container still serves**; swaps; then polls `/api/health` for up
+to three minutes. If the new version doesn't come up healthy it restores the
+previous commit, brings the old one back and exits non-zero — a failed update
+leaves the service running.
+
+### Keeping .env in step with .env.example
+
+`.env` is the host's file and is never in git, so an update that documents a new
+variable in `.env.example` cannot add it for you. `deploy/env-sync.sh` closes
+that gap:
+
+```bash
+./deploy/env-sync.sh            # append what is missing to the bottom of .env
+./deploy/env-sync.sh --check    # report only; exit 10 if something is missing
+./deploy/env-sync.sh --dry-run  # print the block it would append
+./deploy/env-sync.sh --edit     # append, then open .env in $EDITOR
+```
+
+It only ever appends, in one timestamped block, with the example's default as the
+value — nothing already in `.env` is rewritten, reordered or removed, so a
+hand-tuned file stays byte-for-byte what you made it. Comments are not synced,
+which has two deliberate consequences: a variable that exists in `.env` only as a
+commented-out line is reported and **left alone** (commenting one out is a
+decision; re-adding it with the example's default would quietly undo it — delete
+the commented line if you want it back), and variables `.env` sets that the
+example no longer mentions are reported but kept, which is also how a typo'd
+name surfaces.
+
+`update.sh` runs it after the fetch and *before* the build, so a variable an
+update introduces is in the container that same run. On a terminal it opens
+`.env` in `$EDITOR` (`$VISUAL`, else nano/vim/vi) — fill the new values in, save,
+and the build and swap continue with the finished file, no second restart. Since
+that editor can change the secret and the published port, `DD_SECRET_KEY` and the
+port conflict are re-checked afterwards and the health check follows the new
+address. If `.env` gained variables when there were no new commits, the container
+is recreated anyway so they take effect.
+
+Unattended (cron, no terminal) there is no editor: the example defaults are
+appended, the run says which variables it added, and the deploy continues. A
+genuinely new *required* value is then empty until you fill it in — the health
+check and the automatic rollback are the backstop.
 
 Nightly, unattended:
 
@@ -740,6 +778,7 @@ Dockerfile        non-root, read-only /app, /data and /inbox volumes
 docker-compose.yml  hardened runtime, localhost-published on 8412
 deploy/
   update.sh       host-side update: pull, build, swap, health-check, roll back
+  env-sync.sh     append variables .env.example gained to the bottom of .env
   nginx/ddlib.dhig.net.conf   the production vhost
 ```
 
