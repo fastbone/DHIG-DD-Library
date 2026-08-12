@@ -770,6 +770,117 @@ async def main() -> int:
             and "$5.40 of $4.00" in over["text"] and "-$" not in over["text"]
         )
 
+        # ── full-text search, in all three mounts ─────────────────────────
+        await page.click('button[data-tab="search"]')
+        await page.fill("#searchFullMount .search-q", "revenue")
+        await page.wait_for_timeout(900)
+        checks["search: the Search tab lists passage hits"] = (
+            await page.locator("#searchFullMount .search-hit").count() >= 1
+        )
+        note = await page.inner_text("#searchFullMount .search-note")
+        checks["search: hits are counted as passages and documents"] = (
+            "passage" in note and "document" in note
+        )
+        checks["search: the matched term is marked in the snippet"] = (
+            await page.locator("#searchFullMount .search-hit mark").count() >= 1
+        )
+        await page.screenshot(path="/tmp/search-tab.png", full_page=True)
+
+        # Clicking a hit must open the reader at that hit's anchor — the whole point
+        # of returning passages rather than documents.
+        anchor_tag = await page.inner_text("#searchFullMount .search-hit:first-child .tag")
+        await page.click("#searchFullMount .search-hit:first-child")
+        await page.wait_for_timeout(900)
+        checks["search: a hit opens the document drawer"] = (
+            await page.locator("#drawer.open").count() == 1
+            and len(await page.inner_text("#drawerText")) > 40
+        )
+        checks["search: the drawer opens at the hit's own anchor"] = (
+            await page.locator(f'#drawerAnchors [data-a="{anchor_tag}"].active').count() == 1
+        )
+        await page.click("#drawerClose")
+        await page.wait_for_timeout(200)
+
+        # Two characters minimum, and "nothing typed" must not read as "no matches".
+        await page.fill("#searchFullMount .search-q", "z")
+        await page.wait_for_timeout(600)
+        checks["search: a too-short query says so rather than reporting no matches"] = (
+            "two characters" in (await page.inner_text("#searchFullMount .search-hits")).lower()
+        )
+        await page.fill("#searchFullMount .search-q", "zzzqqqnothinghere")
+        await page.wait_for_timeout(700)
+        checks["search: no matches is distinct from nothing typed"] = (
+            "no passage matches" in (await page.inner_text("#searchFullMount")).lower()
+        )
+
+        # Responses do not come back in the order the keystrokes went out. A slow
+        # one for an abandoned query must not overwrite the newer results — nor the
+        # cleared box. Stall exactly the abandoned query and let the newer one pass.
+        async def stall_stale(route):
+            if "q=aaaaaa&" in route.request.url or route.request.url.endswith("q=aaaaaa"):
+                await asyncio.sleep(1.5)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"query": "aaaaaa", "hits": [], "n_hits": 7777,
+                                     "n_documents": 7777}),
+                )
+            else:
+                await route.continue_()
+
+        await page.route("**/api/search?**", stall_stale)
+        await page.fill("#searchFullMount .search-q", "aaaaaa")
+        await page.wait_for_timeout(500)          # request in flight, still stalled
+        await page.fill("#searchFullMount .search-q", "revenue")
+        await page.wait_for_timeout(1600)         # newer lands, then the stale one
+        checks["search: a stale response cannot overwrite newer hits"] = (
+            "7,777" not in await page.inner_text("#searchFullMount .search-note")
+            and await page.locator("#searchFullMount .search-hit").count() >= 1
+        )
+        await page.fill("#searchFullMount .search-q", "aaaaaa")
+        await page.wait_for_timeout(500)
+        await page.fill("#searchFullMount .search-q", "")   # cleared while in flight
+        await page.wait_for_timeout(1600)
+        checks["search: a stale response cannot overwrite the cleared box"] = (
+            "two characters"
+            in (await page.inner_text("#searchFullMount .search-hits")).lower()
+        )
+        await page.unroute("**/api/search?**", stall_stale)
+
+        # The filters are populated at mount from the first status call — which can
+        # fail. Then the taxonomy has to arrive with a later poll, exactly as the
+        # Documents filter already does, or the filter is empty for the session.
+        refill = await page.evaluate(
+            """async () => {
+                 const sel = document.querySelector('#searchFullMount .search-ws');
+                 for (const o of [...sel.options].slice(1)) o.remove();
+                 const before = sel.options.length;
+                 await refreshStatus();
+                 return {before, after: sel.options.length};
+               }"""
+        )
+        checks["search: a later status poll refills an empty workstream filter"] = (
+            refill["before"] == 1 and refill["after"] > 1
+        )
+
+        # All three mounts are the same component; a mount that was never wired is
+        # the failure this catches.
+        for mount, tab in (("searchCorpusMount", "corpus"), ("searchAskMount", "ask")):
+            await page.click(f'button[data-tab="{tab}"]')
+            await page.fill(f"#{mount} .search-q", "revenue")
+            await page.wait_for_timeout(900)
+            checks[f"search: the {tab} mount returns hits too"] = (
+                await page.locator(f"#{mount} .search-hit").count() >= 1
+            )
+            # Compact mounts drop the filters; the full one keeps them.
+            checks[f"search: the {tab} mount is the compact form"] = (
+                await page.locator(f"#{mount} .search-ws").count() == 0
+            )
+        checks["search: the full mount keeps its filters"] = (
+            await page.locator("#searchFullMount .search-ws").count() == 1
+        )
+        await page.screenshot(path="/tmp/search-ask-mount.png", full_page=True)
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -822,7 +933,7 @@ async def main() -> int:
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
           "/tmp/admin-budgets.png /tmp/sync-detail.png /tmp/sync-detail-live.png "
-          "/tmp/help-sharepoint.png")
+          "/tmp/search-tab.png /tmp/search-ask-mount.png /tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 
