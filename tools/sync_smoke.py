@@ -235,6 +235,40 @@ async def main() -> int:
           any(e.get("job_kind") == "ingest" for e in jobs),
           sorted({e.get("job_kind") for e in jobs}))
 
+    print("\n— sync run detail —")
+    # A run row is the answer to "what did last night's sync change", which the
+    # connection row cannot hold and the process does not outlive.
+    runs = db.sync_runs(cid)
+    check("the run is recorded", len(runs) == 1, f"{len(runs)} runs")
+    run = db.sync_run(runs[0]["id"]) if runs else {}
+    check("the run keeps its counts", run.get("transferred") == 4 and run.get("status") == "ok",
+          str({k: run.get(k) for k in ("transferred", "unchanged", "status")}))
+    check("the run knows who started it", run.get("actor") == "alice", str(run.get("actor")))
+    check("the run records how long it took",
+          run.get("finished_at") and run.get("finished_at") >= run.get("started_at"),
+          str({k: run.get(k) for k in ("started_at", "finished_at")}))
+    changed = run.get("changes") or []
+    check("the run lists the files it moved", len(changed) == 4,
+          str(changed)[:200])
+    check("each change names an operation and a path",
+          all(c.get("op") == "copied" and c.get("path") for c in changed), str(changed[:2]))
+    check("the run records what the chained ingest indexed",
+          run.get("indexed_new") is not None, str(run.get("indexed_new")))
+    check("the library size is kept, not just what moved",
+          run.get("library_files") == 4, str(run.get("library_files")))
+
+    # The live figures a running sync publishes, which the watch view renders.
+    live = [e for e in jobs if e.get("job_kind") == "sync" and e.get("status") == "running"]
+    check("running events carry the connection they belong to",
+          live and all(e.get("conn_id") == cid for e in live),
+          str([e.get("conn_id") for e in live][:2]))
+    check("running events carry the in-flight transfer list",
+          any(e.get("transferring") for e in live),
+          str([e.get("transferring") for e in live][:1])[:200])
+    check("running events carry a rate and an elapsed time",
+          any(e.get("speed_bps") for e in live) and any(e.get("elapsed_s") for e in live),
+          str([(e.get("speed_bps"), e.get("elapsed_s")) for e in live][:2]))
+
     stats = search.stats()
     check("the mirrored files are indexed", stats["documents"] == 4, stats)
     hits = search.search("revenue")

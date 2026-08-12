@@ -332,12 +332,55 @@ class SyncJob:
         self.mirror: Path | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._error_tail: list[str] = []
+        # What this run moved, in order. "12 files transferred" answers whether the
+        # sync worked; the list answers what changed in the data room, which is the
+        # question someone actually has on a Monday morning.
+        self._changes: list[dict] = []
+        # Live detail from rclone's stats, for the running view. Replaced wholesale
+        # each tick — it describes this instant, not the run.
+        self.transferring: list[dict] = []
+        self.speed_bps = 0.0
+        self.eta_s: float | None = None
+        self.elapsed_s = 0.0
+
+    def live_snapshot(self) -> dict:
+        """The figures a running sync has that its row does not yet.
+
+        The row is only written at the end, so without this a running sync reads as
+        stalled. Only meaningful while the run is actually running — see the caller.
+        """
+        out = {
+            "transferred": self.done, "unchanged": self.skipped, "deleted": self.deleted,
+            "errors": self.failed, "bytes": self.bytes_done,
+            "transferring": self.transferring[:6],
+            "speed_bps": round(self.speed_bps, 1),
+            "eta_s": self.eta_s,
+            "elapsed_s": round(self.elapsed_s, 1),
+            # The tail rather than the head: while a sync is running, the files it
+            # touched most recently are the interesting ones.
+            "changes": list(self._changes)[-200:],
+            "error_lines": list(self._error_tail),
+            "live": True,
+        }
+        if self.library_measured:
+            out["library_files"] = self.library_files
+            out["library_bytes"] = self.library_bytes
+        return out
 
     def _publish(self, status: str = "running", message: str = "") -> None:
         broker.publish(
             "job", job_id=self.id, job_kind="sync", status=status, total=self.total,
             done=self.done, failed=self.failed, skipped=self.skipped,
             deleted=self.deleted, bytes_done=self.bytes_done, message=message,
+            conn_id=self.conn_id,
+            # Enough for the detail view to render a running sync without polling.
+            # Bounded: rclone runs four transfers at a time, and a list that grew
+            # would be a growing event on a 2-second timer.
+            transferring=self.transferring[:6],
+            speed_bps=round(self.speed_bps, 1),
+            eta_s=self.eta_s,
+            elapsed_s=round(self.elapsed_s, 1),
+            library_bytes=self.library_bytes if self.library_measured else None,
         )
 
     # --- rclone plumbing -------------------------------------------------
@@ -459,8 +502,11 @@ class SyncJob:
                         context={"rclone_level": level, "rclone_message": msg,
                                  "object": event.get("object")},
                     )
-                    self._error_tail.append(msg)
-                    del self._error_tail[:-20]
+                    obj = event.get("object")
+                    self._error_tail.append(f"{obj}: {msg}" if obj else msg)
+                    del self._error_tail[:-db.SYNC_RUN_ERRORS_MAX]
+                return True
+            self._note_change(event)
             return True
         self.done = int(stats.get("transfers") or 0)
         checks = int(stats.get("checks") or 0)
@@ -471,8 +517,48 @@ class SyncJob:
         self.bytes_done = int(stats.get("bytes") or 0)
         self.deleted = int(stats.get("deletes") or 0)
         self.failed = int(stats.get("errors") or 0)
+        self.speed_bps = float(stats.get("speed") or 0.0)
+        self.elapsed_s = float(stats.get("elapsedTime") or 0.0)
+        eta = stats.get("eta")
+        self.eta_s = float(eta) if isinstance(eta, (int, float)) else None
+        # What is in flight right now, for the running view. rclone reports each
+        # in-progress object with its own byte count and percentage.
+        live = []
+        for t in (stats.get("transferring") or [])[:6]:
+            if not isinstance(t, dict):
+                continue
+            live.append({
+                "name": str(t.get("name") or "")[:200],
+                "size": int(t.get("size") or 0),
+                "bytes": int(t.get("bytes") or 0),
+                "percentage": int(t.get("percentage") or 0),
+                "speed_bps": float(t.get("speedAvg") or t.get("speed") or 0.0),
+            })
+        self.transferring = live
         self._publish(message=f"{self.done} transferred")
         return True
+
+    # rclone's own wording for what it did to an object. Matched by prefix so a
+    # variant like "Copied (replaced existing)" lands in the same bucket, and an
+    # unrecognised message is simply not a change rather than a crash.
+    _CHANGE_VERBS = (
+        ("Copied", "copied"),
+        ("Updated", "updated"),
+        ("Moved", "moved"),
+        ("Renamed", "moved"),
+        ("Deleted", "deleted"),
+    )
+
+    def _note_change(self, event: dict) -> None:
+        """Record one per-object line as a change, if that is what it is."""
+        obj = event.get("object")
+        if not obj or len(self._changes) >= db.SYNC_RUN_CHANGES_MAX:
+            return
+        msg = str(event.get("msg") or "")
+        for prefix, op in self._CHANGE_VERBS:
+            if msg.startswith(prefix):
+                self._changes.append({"op": op, "path": str(obj)[:400]})
+                return
 
     # --- lifecycle -------------------------------------------------------
 
@@ -563,6 +649,7 @@ class SyncJob:
         db.execute("UPDATE sync_connections SET status='syncing', error=NULL WHERE id=?",
                    (self.conn_id,))
         db.job_upsert(self.id, kind="sync", status="running", message=f"syncing {label}")
+        db.sync_run_start(self.id, self.conn_id, label, self.actor)
         broker.publish("sync_dirty")
 
         mirror = Path(row["mirror_dir"])
@@ -594,6 +681,10 @@ class SyncJob:
             args = [
                 verb, ":onedrive:", str(mirror),
                 "--use-json-log", "--stats", "2s", "--stats-log-level", "NOTICE",
+                # INFO, so each object rclone moves is named. Unchanged files are
+                # not logged at this level, so the volume tracks what changed
+                # rather than the size of the library.
+                "-v",
                 "--max-size", f"{settings.max_file_mb}M",
                 "--transfers", "4", "--checkers", "8",
                 "--low-level-retries", "5", "--retries", "3",
@@ -620,6 +711,12 @@ class SyncJob:
         db.execute("UPDATE sync_connections SET status='failed', error=? WHERE id=?",
                    (msg[:400], self.conn_id))
         db.job_upsert(self.id, status="failed", message=msg, finished_at=time.time())
+        db.sync_run_update(
+            self.id, finished_at=time.time(), status="failed", message=msg, error=msg,
+            transferred=self.done, unchanged=self.skipped, deleted=self.deleted,
+            errors=max(self.failed, 1), bytes=self.bytes_done,
+            changes=self._changes, error_lines=self._error_tail,
+        )
         broker.log(f"Sync of {label!r} failed: {msg}", level="error",
                    source="sync", job_id=self.id,
                    context={"connection_id": self.conn_id, "label": label, "error": msg})
@@ -660,6 +757,14 @@ class SyncJob:
         )
         db.job_upsert(self.id, status="done" if status == "ok" else status, total=self.total,
                       done=self.done, failed=self.failed, message=msg, finished_at=time.time())
+        db.sync_run_update(
+            self.id, finished_at=time.time(), status=status, message=msg,
+            transferred=self.done, unchanged=self.skipped, deleted=self.deleted,
+            errors=self.failed, bytes=self.bytes_done,
+            library_files=self.library_files if self.library_measured else None,
+            library_bytes=self.library_bytes if self.library_measured else None,
+            changes=self._changes, error_lines=self._error_tail,
+        )
         broker.log(msg, level="success" if status == "ok" else "warn")
         self._publish("done" if status == "ok" else status, msg)
         broker.publish("sync_dirty")
@@ -687,11 +792,17 @@ class SyncJob:
         finally:
             JOBS.pop(job.id, None)
             manifest.invalidate_manifest()
+        db.sync_run_update(
+            self.id,
+            indexed_new=max(job.done - job.skipped - job.failed, 0),
+            indexed_failed=job.failed,
+        )
 
         if self.deleted:
             # Ingest never removes anything, so a file the sync deleted would
             # otherwise linger in the catalogue pointing at a path that is gone.
             removed = await asyncio.to_thread(storage.purge_missing)
+            db.sync_run_update(self.id, purged=removed["purged_documents"])
             broker.log(
                 f"{self.deleted} file(s) removed remotely · "
                 f"{removed['purged_documents']} document(s) dropped from the index."
