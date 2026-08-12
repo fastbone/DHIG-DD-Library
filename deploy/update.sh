@@ -10,8 +10,15 @@
 #   ./deploy/update.sh --branch main   # deploy a different branch
 #   ./deploy/update.sh --keep 10       # keep 10 backups instead of 5
 #   ./deploy/update.sh --force         # deploy even with local modifications
+#   ./deploy/update.sh --no-env-sync   # do not touch .env, even if it lacks variables
 #
-# Order matters. The new image is built while the old container is still
+# Order matters. After the fetch and before the build, deploy/env-sync.sh appends
+# any variable the new .env.example documents and .env is missing, and — on a
+# terminal — opens .env so you can fill the values in. That happens *before* the
+# image is built and the container swapped, so a variable added by an update
+# takes effect in this run instead of needing a second restart.
+#
+# The new image is built while the old container is still
 # serving, so the only downtime is the container swap (seconds). If the new
 # container fails its health check the script restores the previous commit,
 # rebuilds and brings the old version back up, then exits non-zero — a failed
@@ -30,6 +37,7 @@ KEEP_BACKUPS=5
 BRANCH=""
 DO_PULL=1
 DO_BACKUP=1
+DO_ENV_SYNC=1
 DO_PRUNE=0
 FORCE=0
 DRY_RUN=0
@@ -67,6 +75,7 @@ while (( $# )); do
     --rollback)   ROLLBACK=1 ;;
     --no-pull)    DO_PULL=0 ;;
     --no-backup)  DO_BACKUP=0 ;;
+    --no-env-sync) DO_ENV_SYNC=0 ;;
     --backup-only) BACKUP_ONLY=1 ;;
     --prune)      DO_PRUNE=1 ;;
     --force)      FORCE=1 ;;
@@ -116,14 +125,19 @@ without it every key in the database becomes undecryptable."
 fi
 
 # Read the published port the way compose does, so the health check probes the
-# same address the reverse proxy talks to.
-HOST_PORT="$(grep -E '^DD_HOST_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
-HOST_PORT="${HOST_PORT:-8412}"
-BIND_ADDR="$(grep -E '^DD_BIND_ADDR=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
-BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-PROBE_HOST="$BIND_ADDR"
-[[ "$PROBE_HOST" == "0.0.0.0" ]] && PROBE_HOST="127.0.0.1"
-HEALTH_URL="http://${PROBE_HOST}:${HOST_PORT}/api/health"
+# same address the reverse proxy talks to. A function, not straight-line code:
+# the .env sync below may open an editor, and whatever comes back out of it is
+# what the container will actually be published on.
+read_env_addressing() {
+  HOST_PORT="$(grep -E '^DD_HOST_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+  HOST_PORT="${HOST_PORT:-8412}"
+  BIND_ADDR="$(grep -E '^DD_BIND_ADDR=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+  BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+  PROBE_HOST="$BIND_ADDR"
+  [[ "$PROBE_HOST" == "0.0.0.0" ]] && PROBE_HOST="127.0.0.1"
+  HEALTH_URL="http://${PROBE_HOST}:${HOST_PORT}/api/health"
+}
+read_env_addressing
 
 STATE_DIR="$REPO_DIR/.deploy"
 mkdir -p "$STATE_DIR"
@@ -260,6 +274,63 @@ if (( BACKUP_ONLY )); then
   exit 0
 fi
 
+# --- .env ----------------------------------------------------------------
+# Run after the fetch (so .env.example is the new one) and before the build, so
+# a variable an update introduces is in place for the container that update
+# starts. Interactively that includes filling the value in: an editor here costs
+# nothing, whereas noticing afterwards costs a second build and swap.
+
+ENV_CHANGED=0
+
+sync_env() {
+  if (( ! DO_ENV_SYNC )); then
+    info "skipping the .env check (--no-env-sync)"
+    return 0
+  fi
+  local script="$REPO_DIR/deploy/env-sync.sh"
+  if [[ ! -x "$script" ]]; then
+    warn "deploy/env-sync.sh missing or not executable — skipping the .env check"
+    return 0
+  fi
+
+  local -a args=()
+  if (( DRY_RUN )); then
+    args+=(--dry-run)
+  elif [[ -t 0 && -t 1 ]]; then
+    args+=(--edit)
+  fi
+  # Unattended (cron), the appended defaults stand: they are the same values the
+  # example documents, and env-sync.sh says on stdout what it added.
+
+  local rc=0
+  "$script" ${args[@]+"${args[@]}"} || rc=$?
+  case "$rc" in
+    0)  ;;
+    10) if (( DRY_RUN )); then
+          info "would append those and open .env before building"
+        else
+          ENV_CHANGED=1
+        fi ;;
+    *)  die "the .env check failed (exit $rc) — fix .env or pass --no-env-sync" ;;
+  esac
+  (( ENV_CHANGED )) || return 0
+
+  # The editor is a free hand on the file the deploy depends on, so re-check the
+  # two things preflight checked before it was opened.
+  grep -Eq '^DD_SECRET_KEY=.+' .env \
+    || die "DD_SECRET_KEY is empty in .env — refusing to deploy without it."
+  local before="${BIND_ADDR}:${HOST_PORT}"
+  read_env_addressing
+  if [[ "${BIND_ADDR}:${HOST_PORT}" != "$before" ]]; then
+    info "published address is now ${BIND_ADDR}:${HOST_PORT} — the reverse proxy needs to agree"
+    if port_conflict; then
+      die "${HOST_PORT} is already in use by something other than $SERVICE. \
+Pick another port with DD_HOST_PORT in .env and update the reverse proxy."
+    fi
+  fi
+  return 0
+}
+
 # --- health --------------------------------------------------------------
 
 wait_healthy() {
@@ -364,22 +435,32 @@ nothing you need."
 fi
 
 NEW_SHA="$(git rev-parse HEAD)"
+UP_TO_DATE=0
 if [[ "$NEW_SHA" == "$OLD_SHA" ]]; then
-  if [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
-    ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
-    exit 0
-  fi
-  warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
+  UP_TO_DATE=1
 else
   step "Changes to deploy"
   git --no-pager log --oneline --no-decorate "$OLD_SHA..$NEW_SHA" | sed 's/^/    /'
+  # New variables are added to .env by sync_env below; a *changed default* for a
+  # variable .env already sets is not, because .env wins and its value is yours.
+  # The diff is the only place that shows up.
+  if git diff --name-only "$OLD_SHA" "$NEW_SHA" | grep -q '^\.env\.example$'; then
+    warn ".env.example changed in this update — review it for changed defaults:"
+    git --no-pager diff "$OLD_SHA" "$NEW_SHA" -- .env.example | sed 's/^/    /' >&2 || true
+  fi
 fi
 
-# .env.example gaining a variable is the usual cause of a working directory
-# that starts but misbehaves, so say so rather than letting it surprise later.
-if git diff --name-only "$OLD_SHA" "$NEW_SHA" | grep -q '^\.env\.example$'; then
-  warn ".env.example changed in this update — check .env for new variables:"
-  git --no-pager diff "$OLD_SHA" "$NEW_SHA" -- .env.example | sed 's/^/    /' >&2 || true
+sync_env
+
+if (( UP_TO_DATE )); then
+  if (( ENV_CHANGED )); then
+    info "no new commits, but .env gained variables — recreating the container so they take effect"
+  elif [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+    ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
+    exit 0
+  else
+    warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
+  fi
 fi
 
 (( DO_BACKUP )) && backup
