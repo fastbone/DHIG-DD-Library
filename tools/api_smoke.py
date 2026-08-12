@@ -473,6 +473,40 @@ def main() -> int:
     code, body, _ = admin.post("/api/archives", payload, raw=True, content_type=ctype)
     check("a non-archive upload is refused", code == 400, str(body)[:120])
 
+    print("\n— full-text search —")
+    # The index has always existed; only the agent could reach it. These are the
+    # filters search() already applied, now reachable over HTTP.
+    code, body, _ = admin.get("/api/search?q=revenue")
+    hits = body.get("hits", []) if code == 200 else []
+    check("passage search returns citable hits",
+          code == 200 and hits and all(h.get("doc_id") and h.get("anchor") for h in hits),
+          f"got {code}: {str(body)[:200]}")
+    check("hits carry a snippet with the match marked",
+          any("\u00ab" in (h.get("snippet") or "") for h in hits),
+          str([h.get("snippet") for h in hits][:1])[:200])
+    check("passages and documents are counted separately",
+          body.get("n_hits") == len(hits)
+          and body.get("n_documents") == len({h["doc_id"] for h in hits}),
+          str({k: body.get(k) for k in ("n_hits", "n_documents")}))
+
+    code, body, _ = admin.get("/api/search?q=revenue&family=text")
+    check("the family filter narrows to one file type",
+          code == 200 and all(h.get("family") == "text" for h in body["hits"]),
+          str({h.get("family") for h in body.get("hits", [])}))
+    code, body, _ = admin.get("/api/search?q=revenue&limit=2")
+    check("the limit is honoured", code == 200 and len(body["hits"]) <= 2,
+          str(len(body.get("hits", []))))
+    code, body, _ = admin.get("/api/search?q=zzzzqqqxnotinthecorpus")
+    check("a query that matches nothing is an empty list, not an error",
+          code == 200 and body["hits"] == [] and body["n_hits"] == 0, str(body)[:160])
+    # FTS5 MATCH syntax is hostile; db.fts_query sanitises it, and the route must
+    # not turn a stray operator into a 500.
+    code, body, _ = admin.get("/api/search?q=%22unbalanced%20AND%20OR%20*")
+    check("punctuation in a query does not 500", code == 200, f"got {code}: {str(body)[:160]}")
+    anon2 = Client()
+    code, _, _ = anon2.get("/api/search?q=revenue")
+    check("search needs a session", code == 401, f"got {code}")
+
     print("\n— folder browsing is fenced —")
     code, body, _ = admin.get("/api/browse?path=/etc")
     check("browsing outside the permitted roots is refused", code == 403, f"got {code}")
@@ -644,6 +678,70 @@ def main() -> int:
         admin, lambda s: any(k.startswith("sync-") for k in s["jobs_running"]), timeout=30
     )
     check("the sync shows up as a running job", running)
+
+    # The detail routes, while the sync is still going: the point of them is that
+    # "watch this run" and "what did the last one do" are the same view.
+    code, body, _ = admin.get(f"/api/sync/connections/{conn_id}/runs")
+    check("a connection lists its runs",
+          code == 200 and body["runs"] and body["runs"][0]["status"] == "running",
+          f"got {code}: {str(body)[:200]}")
+    check("the running job is named, so the view can open on it",
+          body.get("running_id") == sync_job, str(body.get("running_id")))
+    if body.get("runs"):
+        run_id = body["runs"][0]["id"]
+        code, body, _ = admin.get(f"/api/sync/runs/{run_id}")
+        run = body.get("run", {})
+        check("a running run reports live figures the row does not hold yet",
+              code == 200 and run.get("live") is True and "transferring" in run,
+              f"got {code}: {str(run)[:200]}")
+    # A finished run whose job is still registered must not read as live. The job
+    # stays in JOBS through the ingest chained onto the sync, minutes after a
+    # terminal status was stored, and overlaying then would relabel the run and
+    # replace its final change list with an in-memory tail.
+    from app.server import JOBS as _JOBS
+
+    _db.sync_run_start("sync-terminal", conn_id, "probe", "alice")
+    _db.sync_run_update("sync-terminal", finished_at=time.time(), status="ok",
+                        transferred=7, changes=[{"op": "copied", "path": "a/final.xlsx"}])
+
+    class _StillRegistered:
+        conn_id = "x"
+        done = skipped = deleted = failed = bytes_done = 0
+        transferring: list = []
+        speed_bps = elapsed_s = 0.0
+        eta_s = None
+        library_measured = False
+
+        def live_snapshot(self):
+            return {"live": True, "transferred": 999, "changes": [], "transferring": [{}]}
+
+    _JOBS["sync-terminal"] = _StillRegistered()
+    try:
+        code, body, _ = admin.get("/api/sync/runs/sync-terminal")
+        run = body.get("run", {})
+        check("a finished run is not relabelled live while its job lingers",
+              code == 200 and not run.get("live") and run.get("transferred") == 7,
+              str({k: run.get(k) for k in ("live", "transferred")}))
+        check("a finished run keeps its stored change list",
+              [c.get("path") for c in run.get("changes") or []] == ["a/final.xlsx"],
+              str(run.get("changes")))
+    finally:
+        _JOBS.pop("sync-terminal", None)
+
+    code, body, _ = admin.get("/api/sync/runs/sync-doesnotexist")
+    check("an unknown run is a 404", code == 404, f"got {code}")
+    code, body, _ = admin.get("/api/sync/connections/nope/runs")
+    check("runs for an unknown connection is a 404", code == 404, f"got {code}")
+    # A sync mirrors a library everyone can then read, but its connection settings
+    # and run history are admin-only like the rest of /api/sync.
+    peeker = Client()
+    admin.post("/api/users",
+               {"username": "erin", "password": "analyst-pass-5", "role": "analyst"})
+    _, peek_login, _ = peeker.post("/api/login",
+                                   {"username": "erin", "password": "analyst-pass-5"})
+    peeker.csrf = (peek_login.get("user") or {}).get("csrf")
+    code, body, _ = peeker.get(f"/api/sync/connections/{conn_id}/runs")
+    check("an analyst cannot read sync runs", code == 403, f"got {code}")
     code, body, _ = admin.post("/api/ingest", {"path": str(root)})
     check("a manual ingest is refused while a sync is running", code == 409,
           f"got {code}: {str(body)[:120]}")

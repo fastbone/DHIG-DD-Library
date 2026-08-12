@@ -116,6 +116,22 @@ failure can report it. Clearing it is destructive and therefore admin-only; a
 clear honours the level filter, so *errors only* → *clear* drops the failures you
 have just reported and leaves the rest of the history intact.
 
+**Search tab** — the corpus's own full-text index, for people. BM25 over every
+extracted page, slide and sheet, returning **passages** rather than documents: one
+hit per page/slide/sheet with the matched terms highlighted, and a click opens the
+same reader a citation does, at that same anchor. Filter by workstream or file type.
+
+This index is not new — it is what the analyst's `search_corpus` tool has always
+run. What was missing is that only the model could reach it, so "which documents
+mention indemnity" cost a question: thirty seconds and ~$0.40 for a lookup that is
+instant and free. The same box is mounted in three places, because that is where
+the question gets asked: its own tab, above the Documents table on the Corpus tab,
+and beside the question box on the Ask tab as the cheap alternative to asking.
+
+Search complements the catalogue filter rather than replacing it: the Documents
+filter matches names, titles, parties and summaries — the *card* — while this
+matches the text inside the files.
+
 **Ask tab** — ask in whatever words you have; the question is scoped before it
 is answered. See *Scoping a question* below. Then streaming answers with the
 reasoning summary, the tool trace (every search, read and computation), and a
@@ -276,6 +292,20 @@ site URL (as copied from the browser — a URL pointing at a folder inside the
 library is fine), the directory and application IDs, and the secret. The
 connection is tested immediately, so a wrong secret or a missing site permission
 is reported there and then.
+
+**Every run is kept.** Each connection has a *detail* button (*watch* while a sync
+is running) opening the run history: what transferred, what was left unchanged,
+what was deleted, how long it took, how much moved — and **the list of files that
+actually changed**, which is the question someone has on a Monday morning and
+which the summary line cannot answer. Indexing is reported separately from
+transferring, because "3 files copied" and "2 new documents indexed" are different
+facts and both get asked about.
+
+A run that is still going shows the same view live, driven by the event stream
+rather than polling: the files in flight with their progress, the transfer rate and
+an ETA. A failed run keeps its reason and the paths that failed, so a bad night is
+diagnosable the next morning rather than being a red tag with no detail. The last
+`DD_SYNC_RUNS_KEEP` runs per connection are retained.
 
 Then *sync now*, or set an interval. What happens on each sync:
 
@@ -476,6 +506,7 @@ choice is persisted to `data/settings.json` and takes effect without a restart.
 | `DD_MAX_SYNC_GB` | `50` | Refuse to mirror a library larger than this |
 | `DD_MAX_SYNC_DELETE` | `500` | Abort a sync that would delete more than this many mirrored files |
 | `DD_SYNC_TIMEOUT` | `21600` | Give up on one sync after this many seconds |
+| `DD_SYNC_RUNS_KEEP` | `50` | Sync runs kept per connection for the detail view |
 | `DD_RCLONE_BIN` | `rclone` | The sync engine. Point at another binary for a newer version |
 | `DD_LOG_RETENTION` | `20000` | Activity-log lines kept before the oldest are trimmed. `0` keeps everything |
 | `DD_WEEKLY_BUDGET_ASK_USD` | `-1` | Default weekly question budget per account. `-1` unlimited, `0` no spending |
@@ -795,7 +826,7 @@ app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
                   qa_log, scope_rounds, users, sessions, api_keys, archives,
-                  sync_connections, audit, logs, spend, user_budgets)
+                  sync_connections, sync_runs, audit, logs, spend, user_budgets)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
@@ -804,7 +835,8 @@ app/
   ingest.py       walk → hash → extract → index → duplicate detection
   uploads.py      archive upload and hardened extraction
   graph.py        the app-only Microsoft Graph calls rclone cannot make
-  sync.py         connected libraries: credentials, the mirror job, scheduling
+  sync.py         connected libraries: credentials, the mirror job, per-run
+                  history, scheduling
   storage.py      disk usage and the reclaim operations
   manifest.py     the sweep (one card per document) and the corpus map
   search.py       BM25 search, catalogue browsing, corpus statistics

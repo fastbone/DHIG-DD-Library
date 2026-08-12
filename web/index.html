@@ -26,6 +26,7 @@
 <nav class="tabs" id="tabs">
   <button data-tab="corpus" class="active">Corpus</button>
   <button data-tab="sweep">Indexing</button>
+  <button data-tab="search">Search</button>
   <button data-tab="ask">Ask</button>
   <button data-tab="deliverables">Deliverables</button>
   <button data-tab="admin" id="adminTabBtn" class="hidden">Admin</button>
@@ -106,6 +107,14 @@
         <h3>By file type</h3>
         <div id="familyBars" class="bars"></div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Search the text</h2>
+        <span class="muted small">every page, slide and sheet · free, no model call</span>
+      </div>
+      <div id="searchCorpusMount"></div>
     </div>
 
     <div class="card">
@@ -215,6 +224,20 @@
     </div>
   </section>
 
+  <!-- ─────────────── SEARCH ─────────────── -->
+  <section id="tab-search" class="tab">
+    <div class="card">
+      <div class="card-head">
+        <h2>Search the corpus text</h2>
+        <span class="muted small">
+          BM25 over every extracted page, slide and sheet. Costs nothing and answers
+          instantly — use it when you want to find a word, not ask a question.
+        </span>
+      </div>
+      <div id="searchFullMount"></div>
+    </div>
+  </section>
+
   <!-- ─────────────── ASK ─────────────── -->
   <section id="tab-ask" class="tab">
     <div class="ask-layout">
@@ -244,6 +267,13 @@
       </div>
 
       <aside class="ask-side">
+        <div class="side-card">
+          <h3>Look it up first</h3>
+          <p class="muted small">
+            A keyword lookup is free and instant. Worth trying before spending a question.
+          </p>
+          <div id="searchAskMount"></div>
+        </div>
         <div class="side-card">
           <h3>Run</h3>
           <div id="runMeta" class="muted small">idle</div>
@@ -431,6 +461,22 @@
     <div class="row between">
       <button class="ghost" id="pickerUp">↑ parent</button>
       <button class="primary" id="pickerUse">Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<div id="runModal" class="modal">
+  <div class="modal-body wide">
+    <div class="row between">
+      <h3 id="runTitle">Sync detail</h3>
+      <button class="ghost" id="runClose">close</button>
+    </div>
+    <div class="run-layout">
+      <div class="run-history">
+        <div class="fieldset-head"><span>Runs</span></div>
+        <div id="runList" class="rowlist"></div>
+      </div>
+      <div class="run-detail" id="runDetail"></div>
     </div>
   </div>
 </div>

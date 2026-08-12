@@ -113,6 +113,9 @@ class Settings:
     # could empty the mirror. rclone aborts past this many deletions in one run.
     max_sync_delete: int = _env_int("DD_MAX_SYNC_DELETE", 500)
     sync_timeout_s: int = _env_int("DD_SYNC_TIMEOUT", 6 * 3600)
+    # Run history per connection. "What changed last night" is asked about
+    # recent syncs, so this is a window rather than an archive.
+    sync_runs_keep: int = _env_int("DD_SYNC_RUNS_KEEP", 50)
 
     # --- activity log ----------------------------------------------------
     # How many log lines to keep. A sweep over a large data room writes one line
