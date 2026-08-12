@@ -37,13 +37,22 @@ from . import (
     ingest,
     manifest,
     pricing,
+    refine,
     search,
     security,
     storage,
     sync,
     uploads,
 )
-from .config import CONFIG_WARNINGS, SUPPORTED_EXTS, WORKSTREAMS, settings
+from .config import (
+    COMPLEXITY_MODELS,
+    CONFIG_WARNINGS,
+    EFFORTS,
+    MODEL_ROLES,
+    SUPPORTED_EXTS,
+    WORKSTREAMS,
+    settings,
+)
 from .events import broker, sse
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -408,6 +417,85 @@ async def delete_key(key_id: str, admin: dict = Depends(auth.require_admin)):
     return {"deleted": key_id, "source": credentials.source()}
 
 
+# --- models --------------------------------------------------------------
+
+
+def _checked_model(value: str | None, field: str) -> str | None:
+    """Reject anything we have no price for.
+
+    An unpriced model is not merely unbudgeted — spend would be recorded against
+    a fallback rate, so a limit would silently stop meaning what it says.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value not in pricing.PRICES:
+        raise HTTPException(
+            400, f"unknown {field} {value!r} — pick one of {', '.join(sorted(pricing.PRICES))}"
+        )
+    return value
+
+
+class ModelsBody(BaseModel):
+    models: dict[str, str] | None = None            # role -> model id ("" = inherit)
+    analyst_effort: str | None = None
+    refiner_effort: str | None = None
+    refine_max_rounds: int | None = None
+    complexity_models: dict[str, str] | None = None
+
+
+@app.patch("/api/settings/models")
+async def patch_models(body: ModelsBody, admin: dict = Depends(auth.require_admin)):
+    for role, value in (body.models or {}).items():
+        if role not in MODEL_ROLES:
+            raise HTTPException(400, f"unknown model role {role!r}")
+        # An empty refiner means "inherit the analyst", which is the default and
+        # the cheap choice; the other roles need a real id.
+        if not (value or "").strip() and role != "refiner":
+            raise HTTPException(400, f"{role} model cannot be blank")
+        _checked_model(value, f"{role} model")
+    for level, value in (body.complexity_models or {}).items():
+        if level not in COMPLEXITY_MODELS:
+            raise HTTPException(400, f"unknown complexity level {level!r}")
+        _checked_model(value, f"{level} model")
+    for field in ("analyst_effort", "refiner_effort"):
+        value = getattr(body, field)
+        if value is not None and value not in EFFORTS:
+            raise HTTPException(400, f"unknown {field} {value!r}")
+    if body.refine_max_rounds is not None and not 1 <= body.refine_max_rounds <= 4:
+        raise HTTPException(400, "refine_max_rounds must be between 1 and 4")
+
+    await asyncio.to_thread(
+        settings.set_models,
+        models=body.models, analyst_effort=body.analyst_effort,
+        refiner_effort=body.refiner_effort, refine_max_rounds=body.refine_max_rounds,
+        complexity_models=body.complexity_models,
+    )
+    db.audit("models.update", actor=admin["username"], detail=json.dumps(body.model_dump(
+        exclude_none=True))[:300])
+    manifest.invalidate_manifest()
+    return _models_payload()
+
+
+def _models_payload() -> dict:
+    return {
+        "analyst": settings.analyst_model,
+        "refiner": settings.refiner_model,
+        "refiner_configured": settings.configured_model("refiner"),
+        "carder": settings.carder_model,
+        "verifier": settings.verifier_model,
+        "effort": settings.analyst_effort,
+        "refiner_effort": settings.refiner_effort,
+        "refine_max_rounds": settings.refine_max_rounds,
+        "complexity_models": settings.complexity_models,
+        "env_pinned": settings.model_overrides,
+        "available": [
+            {"id": model, "input_usd": price[0], "output_usd": price[1]}
+            for model, price in sorted(pricing.PRICES.items(), key=lambda kv: kv[1][0])
+        ],
+    }
+
+
 # --- status / config -----------------------------------------------------
 
 
@@ -420,12 +508,7 @@ async def status(request: Request):
         "corpus_root": str(settings.corpus_root) if settings.corpus_root else None,
         "credentials": credentials.source(),
         "has_api_key": credentials.available(),
-        "models": {
-            "analyst": settings.analyst_model,
-            "carder": settings.carder_model,
-            "verifier": settings.verifier_model,
-            "effort": settings.analyst_effort,
-        },
+        "models": _models_payload(),
         "python_tool": settings.enable_python_tool,
         "ocr": settings.ocr_enabled,
         "supported_extensions": sorted(SUPPORTED_EXTS),
@@ -1268,7 +1351,9 @@ class AskBody(BaseModel):
     history: list[dict] = []
     verify: bool = True
     effort: str | None = None
+    model: str | None = None
     scope: list[str] = []
+    refine_id: str | None = None
 
 
 @app.post("/api/ask")
@@ -1280,17 +1365,33 @@ async def ask(body: AskBody, request: Request):
     scope = validated_scope(body.scope)
     if not credentials.available():
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
-    db.audit(
-        "ask", actor=actor(request),
-        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
-    )
 
     who = actor(request)
+    refine_id = body.refine_id
+    if refine_id:
+        # The brief was written against the folders the refinement session was
+        # started with: coverage was measured against them and the evidence plan
+        # names documents inside them. The chip can have moved since — a reload,
+        # or a click between the brief appearing and Run — so the session's
+        # folders win over whatever the client sent. An id that is not this
+        # account's is ignored outright rather than trusted for either field.
+        known_session, locked = await asyncio.to_thread(refine.session_scope, refine_id, who)
+        if not known_session:
+            refine_id = None
+        else:
+            scope = validated_scope(locked)
+
+    db.audit(
+        "ask", actor=who,
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
+    model = _checked_model(body.model, "model")
+    effort = body.effort if body.effort in EFFORTS else None
 
     async def gen():
         async for event in agent.ask(
-            body.question, history=body.history, do_verify=body.verify, effort=body.effort,
-            actor=who, scope=scope,
+            body.question, history=body.history, do_verify=body.verify, effort=effort,
+            model=model, actor=who, scope=scope, refine_id=refine_id,
         ):
             yield sse(event)
 
@@ -1299,6 +1400,57 @@ async def ask(body: AskBody, request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- question refinement -------------------------------------------------
+
+
+class RefineBody(BaseModel):
+    question: str = Field(min_length=2)
+    refine_id: str | None = None
+    answers: list[dict] = []
+    scope: list[str] = []
+
+
+@app.post("/api/refine")
+async def api_refine(body: RefineBody, request: Request):
+    """Sharpen a question before the analyst is paid to answer it.
+
+    The refinement transcript is deliberately not on the wire: it holds tool
+    results derived from document text and is replayed into a model whose output
+    becomes the analyst's instructions, so a client-supplied one would be an
+    injection path straight into the brief. The client carries only the id.
+    """
+    scope = validated_scope(body.scope)
+    if not credentials.available():
+        raise HTTPException(400, "no API key configured — add one under Admin → API keys")
+    db.audit(
+        "refine", actor=actor(request),
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
+
+    who = actor(request)
+
+    async def gen():
+        async for event in refine.run(
+            body.question, refine_id=body.refine_id, answers=body.answers, actor=who,
+            scope=scope,
+        ):
+            yield sse(event)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/refine/{refine_id}")
+async def api_refine_session(refine_id: str, request: Request):
+    found = await asyncio.to_thread(refine.load, refine_id, actor(request))
+    if not found:
+        raise HTTPException(404, "no such refinement session")
+    return found
 
 
 @app.get("/api/qa-log")

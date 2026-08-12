@@ -804,9 +804,9 @@ def main() -> int:
     # Choosing what a question may see is part of asking one, so this is not admin.
     scoper = Client()
     admin.post("/api/users",
-               {"username": "scoper", "password": "scope-pass-7", "role": "analyst"})
+               {"username": "refiner", "password": "scope-pass-7", "role": "analyst"})
     _, scoper_login, _ = scoper.post("/api/login",
-                                     {"username": "scoper", "password": "scope-pass-7"})
+                                     {"username": "refiner", "password": "scope-pass-7"})
     scoper.csrf = (scoper_login.get("user") or {}).get("csrf")
     code, body, _ = scoper.get("/api/corpus/folders")
     check("an analyst can read the folder tree", code == 200 and body.get("folders"),
@@ -1109,6 +1109,260 @@ def main() -> int:
     check("a user sees their own budget on status",
           code == 200 and "budget" in body and "ask" in body["budget"],
           str(body.get("budget"))[:160])
+
+    print("\n— question refinement —")
+    from app import agent as _agent
+    from app import refine as _refine
+    from app import tools as _apptools
+
+    # The whole cost argument for refinement is that it reuses the analyst's cached
+    # prefix instead of forking it. That is a property of the request bytes, not
+    # of any behaviour, so it is asserted directly — a well-meant "let's give the
+    # refiner its own tools" would otherwise pass every other test in this file
+    # while quietly making each round cost more than the answer it prefaces.
+    check("the refiner reuses the analyst's cached system prefix",
+          _refine.system_for_refine() == _agent.system_blocks()[0])
+    check("the refiner passes the tool array through unchanged",
+          _refine.tools_for_refine() is _apptools.TOOLS)
+    _tool_names = {t["name"] for t in _apptools.TOOLS}
+    check("the refiner's tools are a subset of the analyst's",
+          _refine.REFINE_TOOLS <= _tool_names, str(_refine.REFINE_TOOLS - _tool_names))
+    check("the refiner cannot read documents, run code or write files",
+          not (_refine.REFINE_TOOLS
+               & {"read_document", "run_python", "create_deliverable"}))
+
+    # Preconditions match /api/ask exactly, and the route is fenced by the
+    # middleware's default rather than by remembering to fence it.
+    code, body, _ = anon.post("/api/refine", {"question": "What are the risks?"})
+    check("refining needs a session", code == 401, f"got {code}")
+    no_csrf = Client()
+    no_csrf.cookie = admin.cookie          # a real session, no CSRF header
+    code, body, _ = no_csrf.post("/api/refine", {"question": "What are the risks?"})
+    check("refining needs the CSRF header", code == 403, f"got {code}")
+
+    # Coverage: the model proposes, the probe caps. These are the guards that
+    # keep the percentage honest, so they are checked without a server at all.
+    empty_probe = {"score": 0, "hits": 0, "docs": 0, "workstreams": [], "top": [], "basis": ""}
+    raw_round = {
+        "ready": False, "assessment": "x",
+        "coverage": {"score": 95, "reasons": [], "missing": [], "answer_shape": ""},
+        "questions": [{"id": "q1", "question": "Which period?", "why": "w", "kind": "single",
+                       "default": "", "options": [
+                           {"label": f"o{i}", "detail": "d", "evidence": ["deadbeefdeadbeef"]}
+                           for i in range(12)]}] * 9,
+        "brief": {"question": "refined", "covers": [], "excludes": [],
+                  "evidence_plan": [{"doc_id": "deadbeefdeadbeef", "rel_path": "x", "why": "y"}],
+                  "deliverable": "prose", "assumptions": ["a"] * 20},
+        "complexity": {"level": "nonsense", "drivers": [], "docs_to_read": 999,
+                       "needs_computation": False, "recommended_effort": "turbo"},
+        "gaps": [],
+    }
+    zero = _refine._coerce(raw_round, empty_probe)
+    check("a confident score is capped when nothing retrieved",
+          zero["coverage"]["score"] <= 15, str(zero["coverage"]["score"]))
+    thin_probe = {"score": 24, "hits": 4, "docs": 2, "workstreams": ["financial"], "top": [],
+                  "basis": ""}
+    thin = _refine._coerce(raw_round, thin_probe)
+    check("a two-document evidence base caps coverage well short of confident",
+          thin["coverage"]["score"] <= 55, str(thin["coverage"]["score"]))
+    check("the model may not run far ahead of what actually retrieved",
+          thin["coverage"]["score"] <= thin_probe["score"] + 25)
+    check("coverage is displayed, never a gate — a thin round still asks",
+          zero["ready"] is False and len(zero["questions"]) == 4)
+    check("questions and options are clamped to what a reader can hold",
+          len(zero["questions"]) == 4
+          and all(len(q["options"]) <= 5 for q in zero["questions"]))
+    check("evidence that does not resolve to a document is dropped",
+          zero["brief"]["evidence_plan"] == []
+          and all(not o["evidence"] for q in zero["questions"] for o in q["options"]))
+    check("a skipped question always has a default to fall back on",
+          all(q["default"] for q in zero["questions"]))
+    check("an unknown enum falls back rather than reaching the model",
+          zero["complexity"]["level"] == "moderate"
+          and zero["complexity"]["recommended_effort"] == "high")
+    for bad in (900, -3):
+        r = json.loads(json.dumps(raw_round))
+        r["coverage"]["score"] = bad
+        got = _refine._coerce(r, {**empty_probe, "score": 80, "docs": 20})["coverage"]["score"]
+        check(f"a score of {bad} is clamped into 0-100", 0 <= got <= 100, str(got))
+
+    # The brief is instructions, not a claim: it must not turn up in the
+    # citation panel of the answer it produced.
+    brief_text = _refine.render_brief(zero["brief"])
+    check("the brief is tagged as scope for the analyst",
+          brief_text.startswith("<research_brief>") and brief_text.endswith("</research_brief>"))
+    check("the brief does not pollute the citation panel",
+          _agent.parse_citations(brief_text) == [])
+
+    # A thin corpus should not be answered with the most expensive model.
+    deep_covered = _refine.propose_model({"score": 88}, {"level": "deep",
+                                                       "recommended_effort": "max"})
+    deep_thin = _refine.propose_model({"score": 22}, {"level": "deep",
+                                                    "recommended_effort": "max"})
+    check("a thin question is proposed a cheaper run than a well-covered one",
+          deep_thin["model"] != deep_covered["model"],
+          f"{deep_thin['model']} vs {deep_covered['model']}")
+
+    # Model settings: admin-only, and never a model the ledger has no price for.
+    code, body, _ = admin.get("/api/status")
+    check("status lists the models that may be selected",
+          code == 200 and len(body["models"]["available"]) >= 4
+          and "refine_max_rounds" in body["models"], str(body.get("models"))[:160])
+    code, body, _ = dana.request("PATCH", "/api/settings/models",
+                                 {"models": {"analyst": "claude-sonnet-5"}})
+    check("an analyst cannot change the models", code == 403, f"got {code}")
+    code, body, _ = admin.request("PATCH", "/api/settings/models",
+                                  {"models": {"analyst": "gpt-nonexistent"}})
+    check("an unpriced model is refused rather than silently mis-billed",
+          code == 400 and "unknown" in str(body).lower(), f"got {code}: {str(body)[:160]}")
+    code, body, _ = admin.request("PATCH", "/api/settings/models", {"refine_max_rounds": 9})
+    check("the number of question rounds is bounded", code == 400, f"got {code}")
+    code, body, _ = admin.request(
+        "PATCH", "/api/settings/models",
+        {"models": {"analyst": "claude-sonnet-5", "refiner": ""}, "refiner_effort": "medium",
+         "refine_max_rounds": 3, "complexity_models": {"deep": "claude-opus-5"}})
+    check("an admin can change the models", code == 200, f"got {code}: {str(body)[:160]}")
+    check("an unset refiner inherits the analyst, which is the cheap default",
+          body["refiner"] == "claude-sonnet-5" and body["refiner_configured"] == "",
+          str(body)[:200])
+    check("the choice is visible to everyone who has to live with it",
+          admin.get("/api/status")[1]["models"]["refine_max_rounds"] == 3)
+    admin.request("PATCH", "/api/settings/models",
+                  {"models": {"analyst": "claude-opus-5"}, "refine_max_rounds": 2})
+
+    # Round two resumes from the stored transcript, and a round can end three
+    # ways: the model stopped, it used its last tool turn, or the budget stopped
+    # it holding a tool_use nobody answered. All three have to come back as a
+    # conversation the API will accept — a failure here only shows up on the
+    # second round of a real question, which is the worst place to find it.
+    _endings = {
+        "the model stopped on its own": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [{"type": "text", "text": "found enough"}]},
+        ],
+        "the last tool turn was used up": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant",
+             "content": [{"type": "tool_use", "id": "t1", "name": "search_corpus", "input": {}}]},
+            {"role": "user",
+             "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "{}"}]},
+        ],
+        "the budget stopped it mid-turn": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant",
+             "content": [{"type": "tool_use", "id": "t1", "name": "search_corpus", "input": {}}]},
+        ],
+    }
+    for _ending, _messages in _endings.items():
+        _resumed = _refine._sealed(list(_messages))
+        _refine._resume(_resumed, "the user answered: FY2024")
+        _roles = [m["role"] for m in _resumed]
+        check(f"a round resumes cleanly when {_ending}",
+              _roles[-1] == "user"
+              and all(_roles[i] != _roles[i + 1] for i in range(len(_roles) - 1))
+              and "FY2024" in str(_resumed[-1]["content"]),
+              str(_roles))
+
+    # Stage B never sees the corpus map, so a document the refiner opened reaches
+    # it only through this digest. document_card spreads the `documents` row, so
+    # its identifier is `id` — reading `doc_id` printed [None] and lost the one
+    # document the refiner had bothered to open.
+    # Its own row rather than whatever ingest left behind: the storage section
+    # above resets the index, and relying on a leftover document made this pass
+    # vacuously against an empty id.
+    _known_doc_id = "5c09ed0ca11d0001"
+    _bdb.execute(
+        "INSERT OR REPLACE INTO documents(id, sha256, rel_path, abs_path, filename, ext,"
+        " family, size_bytes, status, n_units, title, doc_type, workstream, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (_known_doc_id, "0" * 64, "financial/audited.pdf", "/tmp/audited.pdf", "audited.pdf",
+         ".pdf", "pdf", 1024, "carded", 1, "Audited accounts", "audited_accounts",
+         "financial", time.time()),
+    )
+    _bdb.execute(
+        "INSERT INTO units(doc_id, ordinal, anchor, kind, char_start, char_end)"
+        " VALUES(?,?,?,?,?,?)",
+        (_known_doc_id, 0, "p1", "page", 0, 100),
+    )
+    _card = _apptools.dispatch("document_card", {"doc_id": _known_doc_id})
+    _digest = _refine._findings_digest(
+        [{"tool": "document_card", "input": {"doc_id": _known_doc_id}, "result": _card}],
+        {"score": 0, "hits": 0, "docs": 0, "workstreams": [], "top": [], "basis": ""},
+    )
+    check("the card the refiner opened is real before the digest is judged",
+          not _card.get("error") and bool(_card.get("anchors")), str(_card)[:160])
+    check("a document the refiner opened reaches the propose call by id",
+          _known_doc_id in _digest and "None" not in _digest, _digest[:200])
+    _bdb.execute("DELETE FROM units WHERE doc_id=?", (_known_doc_id,))
+    _bdb.execute("DELETE FROM documents WHERE id=?", (_known_doc_id,))
+
+    # An option that named documents and lost all of them is ungrounded: the
+    # model asserted evidence that does not exist. An option that never claimed
+    # any is a different thing — "an answer in chat" has no document behind it
+    # and is not supposed to — so only the first kind is dropped.
+    _mixed = json.loads(json.dumps(raw_round))
+    _mixed["questions"] = [{
+        "id": "q1", "question": "What should the output be?", "why": "w",
+        "kind": "single", "default": "an answer in chat",
+        "options": [
+            {"label": "an answer in chat", "detail": "fastest", "evidence": []},
+            {"label": "from the FY24 pack", "detail": "d", "evidence": ["deadbeefdeadbeef"]},
+        ],
+    }]
+    _labels = [o["label"] for o in _refine._coerce(_mixed, empty_probe)["questions"][0]["options"]]
+    check("an option whose every document was dropped does not reach the reader",
+          "from the FY24 pack" not in _labels, str(_labels))
+    check("an option that never claimed a document is kept",
+          "an answer in chat" in _labels, str(_labels))
+
+    # Dropping an ungrounded option and leaving the default naming it would make
+    # "skip" assume the very choice that was removed — and the answer would carry
+    # it as a recorded assumption.
+    _dropped_default = json.loads(json.dumps(raw_round))
+    _dropped_default["questions"] = [{
+        "id": "q1", "question": "Which period?", "why": "w", "kind": "single",
+        "default": "from the FY24 pack",          # the option that will be dropped
+        "options": [
+            {"label": "from the FY24 pack", "detail": "d", "evidence": ["deadbeefdeadbeef"]},
+            {"label": "whatever is audited", "detail": "d", "evidence": []},
+        ],
+    }]
+    _q = _refine._coerce(_dropped_default, empty_probe)["questions"][0]
+    check("a default naming a dropped option falls back to one still offered",
+          _q["default"] in {o["label"] for o in _q["options"]},
+          f"default {_q['default']!r} vs {[o['label'] for o in _q['options']]}")
+
+    # A question with no options at all keeps the model's wording: there is
+    # nothing for it to match, and "your best judgement" is not an improvement.
+    _free = json.loads(json.dumps(raw_round))
+    _free["questions"] = [{"id": "q1", "question": "Anything else?", "why": "w",
+                           "kind": "free", "default": "assume FY2024 only", "options": []}]
+    check("a free question keeps the default the model wrote",
+          _refine._coerce(_free, empty_probe)["questions"][0]["default"] == "assume FY2024 only")
+
+    # The brief was written against the folders the session started with, so
+    # those folders decide the run — not whatever the client posts alongside the
+    # id. A chip moved between the brief appearing and Run would otherwise
+    # answer it against a different corpus than its coverage was measured on.
+    _refine_id = "smokerefine99"
+    _bdb.execute(
+        "INSERT OR REPLACE INTO refine_rounds(id, refine_id, round, question, scope, answers,"
+        " payload, transcript, ready, coverage, usage, model, effort, actor, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("smokerr99", _refine_id, 1, "q", json.dumps(["/locked/folder"]), "[]", "{}", "[]",
+         1, 80, "{}", "claude-opus-5", "low", "alice", time.time()),
+    )
+    check("a session's folders are readable by the account that owns it",
+          _refine.session_scope(_refine_id, "alice") == (True, ["/locked/folder"]))
+    check("another account's session is not found rather than trusted",
+          _refine.session_scope(_refine_id, "dana") == (False, []))
+    check("an unknown session is not found rather than trusted",
+          _refine.session_scope("nosuchsession", "alice") == (False, []))
+    _bdb.execute("DELETE FROM refine_rounds WHERE refine_id=?", (_refine_id,))
+
+    # A missing session is a 404, not someone else's brief.
+    code, _, _ = admin.get("/api/refine/deadbeefdead")
+    check("an unknown refinement session is not found", code == 404, f"got {code}")
 
     print("\n— setup guide —")
     # Served by the app rather than linked out: it is read while setting up a

@@ -39,6 +39,13 @@ rates that is about **$0.12 per turn** instead of $1.25, and a question that
 reads 50K tokens of actual pages lands around **$0.40–1.00**. Indexing the whole
 library once, on Claude Haiku 4.5, costs roughly **$10–25**.
 
+Which is also why no question goes straight to the analyst. A vague question
+costs a full run to discover it was the wrong one, so it is **refined first**: the
+corpus is read, a few grounded clarifying questions come back, and you approve an
+editable brief — along with an honest figure for how much of what the question
+needs the data room actually holds. A refinement round costs cents. See *Refining a
+question*.
+
 ---
 
 ## What it does
@@ -125,21 +132,29 @@ Search complements the catalogue filter rather than replacing it: the Documents
 filter matches names, titles, parties and summaries — the *card* — while this
 matches the text inside the files.
 
-**Ask tab** — streaming answers with the reasoning summary, the tool trace
-(every search, read and computation), and a citations panel. Clicking any
-citation opens the source document at that exact page. With verification on,
-each cited claim is re-checked against its cited span by a second model and
-badged `supported` / `partial` / `unsupported`.
+**Ask tab** — ask in whatever words you have; the question is refined before it
+is answered. See *Refining a question* below. Then streaming answers with the
+reasoning summary, the tool trace (every search, read and computation), and a
+citations panel. Clicking any citation opens the source document at that exact
+page. With verification on, each cited claim is re-checked against its cited
+span by a second model and badged `supported` / `partial` / `unsupported`.
 
-The **scope** chip beside *effort* limits one question to part of the library —
+The **scope** chip in the composer limits one question to part of the library —
 any number of folders, at any depth. See *Scoping a question to folders* below.
+The model and effort a run uses are chosen on the brief, where the refiner has
+just proposed them, rather than in the composer.
 
 **Deliverables tab** — Word, Excel, PowerPoint and Markdown documents the
 analyst generated, plus the question log: every question, its citations, its
 verdicts and its cost.
 
-**Admin tab** (administrators only) — five things:
+**Admin tab** (administrators only) — six things:
 
+- **Models.** Which model fills each of the four roles — analyst, refiner, carder,
+  verifier — the default effort, how many rounds of clarifying questions a
+  question gets, and which model the refiner proposes for a simple, moderate or
+  deep question. Only models the cost ledger has a price for can be selected; a
+  role pinned by an environment variable is shown but not editable.
 - **API keys.** Paste an Anthropic key and it is encrypted with the instance key
   and stored; the browser only ever sees a label and the last four characters.
   One key is active at a time, each can be liveness-tested (a model lookup, so
@@ -157,7 +172,8 @@ verdicts and its cost.
 - **Weekly spending budgets.** Two caps per account — one for questions, one
   for indexing — each set to a number, `unlimited`, or left to inherit the
   instance default. Every account row shows what it has spent this week against
-  each cap. See *Weekly spending budgets* below.
+  each cap. Scoping is charged to the question budget. See *Weekly spending
+  budgets* below.
 - **Audit log.** Every sign-in, failed sign-in, account change, key change,
   upload, extraction, sync, question, budget change and storage operation, with
   actor and timestamp.
@@ -165,6 +181,103 @@ verdicts and its cost.
 Connected libraries are managed from the Corpus tab but are administrator-only
 for the same reason keys are: connecting one makes its contents readable to
 everyone who can sign in.
+
+## Refining a question
+
+The expensive part of due diligence is not answering a question, it is answering
+the wrong one. So nothing goes straight to the analyst. A question you type is
+first read against the corpus by the **refiner**, which comes back with a few
+clarifying questions and then a research brief you can edit.
+
+```
+you type            →  "How risky is this deal?"
+probe (free)        →  BM25 over the raw question, a provisional coverage figure
+refine round        →  the corpus is searched, then: coverage, questions, a draft brief
+you answer          →  clickable options, "something else", or skip any of them
+refine round 2      →  only if it is still unsure; hard cap, then the brief is forced
+the brief           →  editable, with the model and effort it proposes for the run
+you approve         →  the analyst runs, on the brief, at the model you chose
+```
+
+**The questions are grounded, not generic.** The refiner searches before it asks,
+and every option has to name something it actually found — a workstream, a
+period, a document — and carry its `doc_id`. Options whose documents do not
+resolve are dropped server-side before they reach the browser, because a
+plausible-looking option for a document that does not exist is worse than no
+option at all. The citations inside a question are clickable: you can open the
+source before deciding.
+
+**Every question has a default,** always one of the choices actually on offer,
+so *skip* is a well-defined action rather than a hole, and *Skip all — use your judgement* still produces a runnable
+brief. Whatever was assumed instead of asked is recorded in the brief's
+assumptions, and the analyst states them as caveats.
+
+**Coverage — can this be answered at all?** Every round reports a percentage:
+*the share of what this question needs that the data room appears to contain.*
+It is deliberately not called a success rate: it is a claim about evidence, which
+is what the app can actually measure, and what a DD reader needs to know.
+
+It is computed in two layers, and the second one caps the first:
+
+- a **free probe** — BM25 over the raw question, no API call — counts how many
+  distinct documents and workstreams the question's own words reach;
+- the **refiner's reading**, which rides on the round it was going to emit anyway,
+  so it costs nothing extra, and can tell "twelve documents mention the customer"
+  from "twelve documents contain the contract terms this needs".
+
+A model scoring itself drifts upward, so the ceiling is mechanical and not
+promptable: nothing retrieved caps the score at 15, a two-document evidence base
+at 55, and the model may never run more than 25 points ahead of the probe. Below
+70 the brief lists what is missing; below 40 it says so plainly and the run
+button reads **Run anyway**.
+
+Coverage never blocks a run and never ends the loop — a gate would only teach the
+model to score whatever gets it through. And on a thin question the missing list
+is the point: *"audited FY2025 accounts — would settle whether the FY25 figures
+are management's or audited — searched: `audit report 2025`, `FY25 auditor`"* is
+a document request you can send to the seller.
+
+**Which model runs it.** The refiner also judges how hard the brief is — how many
+documents it implies, whether figures have to be computed — and proposes a model
+and an effort accordingly, preselected on the brief with an estimated cost. Thin
+coverage drops the proposal a tier, because spending the strongest model on a
+question the corpus cannot answer is exactly the waste this feature exists to
+prevent. Change either dropdown before approving; the defaults and the
+complexity→model mapping are set in Admin → Models.
+
+**What it costs.** Roughly $0.15–0.25 per round, against a thirty-turn analyst
+run at high effort. That number depends on one implementation detail: the refiner
+sends the analyst's *exact* cached prefix — same tool array, same system blocks —
+so it reads the corpus map at 0.1× instead of writing its own copy at 2×, and
+leaves the cache warm for the run that follows. Its read-only tool subset is
+enforced at dispatch rather than by handing it a different tool array, and its
+directive rides in the first user turn, after the cache breakpoint. Changing
+either would fork the cache and make a refinement round cost more than the answer it
+prefaces; `tools/api_smoke.py` asserts the prefix directly for that reason.
+
+**Folders come first.** If the question is scoped to folders (see *Scoping a
+question to folders*), the refiner is given the same ones: it searches inside
+them, its coverage figure is measured against them, and the run the brief
+produces inherits them — read back from the session server-side rather than
+taken from the request, because the chip can move between the brief appearing
+and Run being clicked. The answer's provenance line is written from what the run
+actually saw, for the same reason. Coverage judged against the whole library would be a
+different question's answer, and a brief that named documents outside the chosen
+folders would cite files the run is not allowed to open. The folders are fixed
+when the session starts, so a later round cannot widen them underneath a brief
+that has already been written.
+
+**What is kept.** Each round is stored in `refine_rounds` — the questions, the
+answers, the brief, the coverage score, and the transcript the next round
+rehydrates from. Once the brief is run, every row of the session is stamped with
+the answer's `qa_id`, so the audit trail runs both ways: from an answer back to
+how its question was framed, and from a refinement session forward to what it
+produced. The transcript stays on the server and never crosses the wire — it
+contains document text and is replayed into a model whose output becomes the
+analyst's instructions, so a client-supplied one would be an injection path
+straight into the brief. The browser holds only the session id, in
+`sessionStorage`, which is enough to restore a half-answered round after a
+reload.
 
 ## Connecting a SharePoint library
 
@@ -466,7 +579,14 @@ Everything is env-overridable; defaults in `app/config.py`.
 | `DD_ANALYST_MODEL` | `claude-opus-5` | The reasoning loop |
 | `DD_CARDER_MODEL` | `claude-haiku-4-5` | The bulk indexing sweep |
 | `DD_VERIFIER_MODEL` | `claude-haiku-4-5` | Citation checking |
-| `DD_ANALYST_EFFORT` | `high` | Also selectable per question in the UI |
+| `DD_REFINER_MODEL` | *(the analyst's)* | Question refinement. Unset is the cheap default — see below |
+| `DD_ANALYST_EFFORT` | `high` | Proposed per question on the brief, and changeable there |
+| `DD_REFINER_EFFORT` | `low` | Refining is narrow and the user is waiting on it |
+| `DD_REFINE_MAX_ROUNDS` | `2` | Rounds of clarifying questions before the brief is forced (1–4) |
+
+Any model variable that is set **pins** that role: it cannot then be changed from
+Admin → Models. Leave it unset to make the role settable in the UI, where the
+choice is persisted to `data/settings.json` and takes effect without a restart.
 | `DD_EXTRACT_WORKERS` | cores − 1 | Extraction threads |
 | `DD_CARD_CONCURRENCY` | `8` | Concurrent indexing calls |
 | `DD_MANIFEST_CHAR_BUDGET` | `1_000_000` | Above this the map degrades to compact, then to a rollup |
@@ -801,9 +921,9 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 190 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
-python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 109 checks: the browser front end, end to end
+python3 tools/api_smoke.py            # 229 checks: auth, CSRF, keys, uploads, access, sync, storage, scope, refinement
+python3 tools/sync_smoke.py           # 84 checks: connected libraries, end to end
+python3 tools/ui_smoke.py             # 141 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 
@@ -827,6 +947,13 @@ scanned like any other, the app's own text mirror never re-enters the corpus as
 source material, and an unreadable folder is reported rather than skipped in
 silence.
 
+Its refinement section pins the two properties nothing else would catch: that the
+refiner's system prefix and tool array are byte-identical to the analyst's — the
+whole cost argument — and that coverage is capped by the probe rather than by
+whatever the model claims, clamped into 0–100, and never allowed to end the loop.
+It also checks that unresolvable doc_ids are dropped, that a rendered brief
+contributes no citations, and that an unpriced model cannot be selected.
+
 `sync_smoke.py` covers connected libraries against a stub Graph and a fake
 rclone (`tools/fake_rclone.py`), so it needs no tenant and no network while still
 spawning the real subprocess and running the real ingest: a connection round-trips
@@ -838,7 +965,11 @@ anything is fetched, and the client secret reaches rclone through its environmen
 rather than its command line.
 
 `ui_smoke.py` ingests the sample corpus, stamps synthetic cards, replaces the
-agent with a scripted event stream, and drives a real browser: sign-in,
+agent and the refiner with scripted event streams, and drives a real browser:
+sign-in, a round of clarifying questions answered by number key, multi-select and
+free text, the coverage meter, a brief edited before approval — asserting that
+what actually ran was the edited text and that the refinement dialogue never entered
+the analyst's history — the thin-coverage warning and its *Run anyway* path,
 streaming answer, reasoning panel, tool trace, citation chips that open the
 source at the cited page, verdict badges, artifact download, the admin surfaces,
 a drag-and-drop archive upload through to extraction, and the connected-library
@@ -863,8 +994,9 @@ unprivileged account.
 app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
-                  qa_log, qa_scopes, users, sessions, api_keys, archives,
-                  sync_connections, audit, logs, spend, user_budgets, sync_runs)
+                  qa_log, qa_scopes, refine_rounds, users, sessions, api_keys,
+                  archives, sync_connections, sync_runs, audit, logs, spend,
+                  user_budgets)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
@@ -881,6 +1013,8 @@ app/
                   scope filter, corpus statistics
   tools.py        the analyst's tool definitions and handlers
   agent.py        the streaming tool loop, system prompt, citation parsing
+  scope.py        question refinement: the free coverage probe, the grounded
+                  clarifying rounds, the research brief and the model proposal
   verify.py       re-read each cited span and judge the claim
   docgen.py       docx / xlsx / pptx / md from a block spec
   pricing.py      token accounting, the cost meter, and spend attribution
@@ -906,6 +1040,28 @@ deploy/
 map, with the cache breakpoint on the map. Tool definitions are kept in a fixed
 sorted order and the map is rebuilt only after a sweep, because any byte change
 in that prefix throws away the cache that makes the whole approach affordable.
+
+**The refiner rides that same prefix, byte for byte.** It sends `tools.TOOLS` and
+`agent.system_blocks(scope)` unchanged, restricts itself to read-only tools *at
+dispatch*, and carries its directive in the first user turn — after the
+breakpoint. That is what makes a refinement round a cache read at 0.1× rather
+than a fresh write at 2×, and it is why `refiner_model` defaults to the analyst's
+model: caches are per-model, so a cheaper refiner has its own copy of a
+250k-token map to pay for. `tools/api_smoke.py` asserts the prefix identity
+directly, because nothing else in the suite would notice it breaking.
+
+**A model must never be the only thing bounding a number it reports.** The
+coverage percentage is capped by a mechanical BM25 probe before it is shown, and
+doc_ids in questions and briefs are dropped unless they resolve in `documents`.
+The schema cannot express either rule, so both live in `refine._coerce`. Keep new
+model-authored fields on that side of the line.
+
+**"Scope" means folders, and only folders.** `state.scope`, `agent.ask(scope=)`,
+`tools.dispatch(…, scope)` and `manifest.build(scope)` are all the same thing:
+which folders a question may see. The dialogue that sharpens the question itself
+is *refinement* throughout — `app/refine.py`, `/api/refine`, `refine_rounds`,
+`refine_*` events. The two features arrived within a day of each other and the
+collision is easy to reintroduce; keep the words apart.
 
 **A question's scope is enforced, not announced.** `tools.dispatch` takes the
 scope and applies it to every tool that can reach a document; `manifest.build`

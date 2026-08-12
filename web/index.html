@@ -246,24 +246,18 @@
           <div class="empty">
             <h2>Ask the data room</h2>
             <p class="muted">
-              Questions are answered from the indexed corpus only, with a
-              <code>[[doc&nbsp;·&nbsp;page]]</code> citation on every claim. Ask for a document and it
-              gets built.
+              Ask in whatever words you have. The corpus is read first and you get a few
+              questions back, then a brief you can edit — so a vague question costs cents to
+              sharpen instead of a full run to discover it was the wrong one. Every claim in
+              the answer carries a <code>[[doc&nbsp;·&nbsp;page]]</code> citation.
             </p>
             <div class="suggestions" id="suggestions"></div>
           </div>
         </div>
         <form class="composer" id="askForm">
-          <textarea id="question" rows="3" placeholder="e.g. Summarise revenue by segment for FY22–FY24 from the audited accounts, and flag any inconsistency with the management deck."></textarea>
+          <textarea id="question" rows="3" placeholder="e.g. How risky is this deal? — a rough question is fine, it gets sharpened before anything expensive runs."></textarea>
           <div class="composer-bar">
             <div class="row gap wrap">
-              <select id="effort" title="Reasoning effort">
-                <option value="low">effort: low</option>
-                <option value="medium">effort: medium</option>
-                <option value="high" selected>effort: high</option>
-                <option value="xhigh">effort: xhigh</option>
-                <option value="max">effort: max</option>
-              </select>
               <label class="check"><input type="checkbox" id="verifyToggle" checked> verify citations</label>
               <button type="button" class="ghost" id="scopeChip" title="Limit this question to part of the library">scope: whole corpus</button>
               <button type="button" class="ghost" id="newThread">new thread</button>
@@ -327,6 +321,40 @@
           <button class="primary" id="addKeyBtn">Add</button>
         </div>
         <div id="keyList" class="rowlist" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Models</h2><span class="muted small" id="modelsNote"></span></div>
+        <p class="muted small">
+          The analyst reasons; the refiner sharpens a question before the analyst is paid to
+          answer it; the carder indexes; the verifier re-reads cited spans. A role pinned by an
+          environment variable cannot be changed here.
+        </p>
+        <div class="grid-2" id="modelRoles"></div>
+        <div class="row wrap gap" style="margin-top:12px">
+          <label class="field" style="margin:0">
+            <span>default effort</span>
+            <select id="analystEffort"></select>
+          </label>
+          <label class="field" style="margin:0">
+            <span>refiner effort</span>
+            <select id="refinerEffort"></select>
+          </label>
+          <label class="field" style="margin:0">
+            <span>question rounds</span>
+            <select id="refineRounds"></select>
+          </label>
+        </div>
+        <div class="fieldset-head"><span>proposed model by complexity</span></div>
+        <p class="muted small">
+          What the refiner preselects on the brief once it has judged how hard the question is.
+          The user can always change it before approving.
+        </p>
+        <div class="grid-2" id="complexityModels"></div>
+        <div class="row between wrap gap" style="margin-top:12px">
+          <span class="muted small" id="modelsSaved"></span>
+          <button class="primary" id="saveModelsBtn">Save models</button>
+        </div>
       </div>
 
       <div class="card">

@@ -343,6 +343,44 @@ tbody tr:last-child td { border-bottom: 0; }
   border: 0; border-radius: 4px; padding: 1px 5px; cursor: pointer; white-space: nowrap;
 }
 .cite:hover { filter: brightness(.95); text-decoration: underline; }
+
+/* question refinement — a proposed answer is the same object as a suggested question, so it
+   wears the same clothes; only the container geometry changes. Everything is
+   scoped under .options / .msg.refine / .msg.brief so the empty state's four
+   canned suggestions do not reflow. */
+.msg.refine > .body, .msg.brief > .body {
+  border-left: 2px solid var(--line-2); padding-left: 11px; white-space: normal;
+}
+.qgroup { border: 0; margin: 0 0 16px; padding: 0; min-width: 0; }
+.qgroup > legend { padding: 0; font-weight: 560; }
+.qgroup.skipped { opacity: .55; }
+.qwhy { margin: 3px 0 8px; }
+.assessment { margin-bottom: 12px; }
+.suggestions.options { max-width: none; margin: 0 0 6px; }
+.options .suggestion { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; padding: 6px 10px; }
+.options .suggestion.on { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
+/* The label leads; the grounding detail and its citations trail on the same
+   line and only wrap when they have to, so four options stay one glance. */
+.options .suggestion .optlabel { font-weight: 540; }
+.options .suggestion .optnote { display: inline-flex; align-items: baseline; gap: 5px; }
+.options .suggestion .othertext { flex: 1 1 160px; padding: 3px 8px; font-size: 12px; }
+.tag.key { font-family: var(--mono); min-width: 18px; text-align: center; padding: 1px 4px; }
+.skip { font-size: 12px; }
+.refinefoot { margin-top: 12px; }
+/* Coverage: a number, a band and a bar — never colour alone. */
+.coverage {
+  display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-left: 10px; text-transform: none; letter-spacing: 0; font-size: 11px;
+}
+.coverage.provisional { opacity: .5; }
+.coverage b { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.missing { margin: 6px 0 12px 18px; padding: 0; font-size: 12.5px; }
+.missing li { margin-bottom: 4px; }
+.brieflists { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0 18px; }
+.brieflists ul { margin: 4px 0 0 18px; padding: 0; font-size: 13px; }
+.runopts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+.msg.brief textarea { width: 100%; }
+
 .composer {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 12px; box-shadow: var(--shadow);

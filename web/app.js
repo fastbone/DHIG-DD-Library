@@ -1246,8 +1246,11 @@ function inline(s) {
   out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  // type="button" is load-bearing: citation chips are rendered inside the
+  // scoping and brief forms, and a bare <button> in a form submits it — so
+  // opening a source would silently run the question.
   out = out.replace(CITE, (_m, id, anchor) =>
-    `<button class="cite" data-doc="${id}" data-anchor="${esc(anchor)}">${esc(anchor)}</button>`);
+    `<button type="button" class="cite" data-doc="${id}" data-anchor="${esc(anchor)}">${esc(anchor)}</button>`);
   return out;
 }
 
@@ -1308,6 +1311,7 @@ for (const s of $("suggestions").children) {
 
 $("newThread").onclick = () => {
   state.history = [];
+  resetRefine();
   $("thread").innerHTML = `<div class="empty"><h2>New thread</h2><p class="muted">Previous turns cleared.</p></div>`;
   $("trace").innerHTML = ""; $("citations").innerHTML = ""; $("runMeta").textContent = "idle";
 };
@@ -1530,25 +1534,712 @@ $("scopeApply").onclick = () => {
 };
 renderScopeChip();
 
-$("askForm").addEventListener("submit", async (e) => {
+$("askForm").addEventListener("submit", (e) => {
   e.preventDefault();
+  startRefining();
+});
+
+/* Events every stream emits the same way. Shared so the scope stream and the
+   answer stream cannot drift apart on the two things that matter most: what a
+   budget stop looks like, and what the trace rail shows. */
+function handleCommonEvent(ev, ctx) {
+  switch (ev.type) {
+    case "status":
+      if (ev.reason === "budget") {
+        // A spending stop is a decision the reader has to see, not a line in
+        // the meta strip that the next status message overwrites.
+        ctx.notices.insertAdjacentHTML("beforeend",
+          `<div class="notice warn">${esc(ev.message)}</div>`);
+        refreshStatus();
+      } else {
+        $("runMeta").dataset.base = esc(ev.message || "");
+      }
+      return true;
+    case "thinking_delta":
+      ctx.think.classList.remove("hidden");
+      ctx.thinkBody.textContent += ev.text;
+      ctx.think.scrollTop = ctx.think.scrollHeight;
+      return true;
+    case "tool_use":
+      addTrace(ev.id, ev.name, ev.label, "running");
+      return true;
+    case "tool_result":
+      updateTrace(ev.id, ev.summary, ev.ok ? "ok" : "err");
+      return true;
+    case "usage": {
+      const u = ev.cumulative || {};
+      $("runMeta").dataset.base =
+        `· ${money(u.cost_usd)} · ${nfmt(ev.cache_read)} cached / ${nfmt(ev.input)} fresh in, ${nfmt(ev.output)} out`;
+      return true;
+    }
+    case "error":
+      // A budget refusal is a policy outcome, not a fault — say so in the
+      // thread and leave it there, rather than flashing a red failure tag.
+      if (ev.reason === "budget") {
+        ctx.notices.insertAdjacentHTML("beforeend",
+          `<div class="notice warn">${esc(ev.message)}</div>`);
+        refreshStatus();
+      } else {
+        toast(ev.message, true);
+        if (ctx.body) ctx.body.innerHTML += `<div class="tag bad">${esc(ev.message)}</div>`;
+        else ctx.notices.insertAdjacentHTML("beforeend",
+          `<div class="notice err">${esc(ev.message)}</div>`);
+      }
+      return true;
+  }
+  return false;
+}
+
+/* ── scoping ─────────────────────────────────────────────────────────── */
+/* Every question is refined before it is answered: the model reads the corpus,
+   asks a few questions whose options name documents that actually exist, and
+   hands back a brief the user can edit. Note the two senses of "scope" in this
+   file are different things: `state.scope` is the folders a question may see,
+   and this is the refinement dialogue that sharpens the question itself.
+
+   Its own object rather than a field on `state`, because its lifecycle is not
+   the thread's — but `state.running` stays the single lock, so a refinement
+   stream and an answer stream can never both be writing the trace rail. */
+const refine = {
+  phase: "idle",          // idle | refining | awaiting | brief | running
+  id: "", round: 0, final: false, original: "",
+  questions: [], brief: null, proposal: null, coverage: null,
+  card: null, briefCard: null,
+};
+
+function resetRefine() {
+  Object.assign(refine, {
+    phase: "idle", id: "", round: 0, final: false, original: "",
+    questions: [], brief: null, proposal: null, coverage: null,
+    card: null, briefCard: null,
+  });
+  try { sessionStorage.removeItem("dd-refine-id"); } catch { /* private mode */ }
+}
+
+function setRefinePhase(next) {
+  refine.phase = next;
+  const busy = next === "refining" || next === "running";
+  $("askBtn").disabled = busy;
+  $("askBtn").textContent =
+    next === "refining" ? "Refining…" : next === "running" ? "Working…" : "Ask";
+}
+
+/* Coverage is a claim about evidence, not a promise about the answer — so it is
+   labelled, banded and never colour-only. */
+function coverageEl(cov, provisional) {
+  const score = Math.max(0, Math.min(100, Number(cov.score) || 0));
+  const fill = score >= 70 ? "" : score >= 40 ? "warn" : "bad";
+  const wrap = el("div", "coverage" + (provisional ? " provisional" : ""));
+  wrap.title = "Coverage: the share of what this question needs that the data room appears "
+    + "to contain." + (provisional ? " Provisional — still searching." : "");
+  wrap.innerHTML =
+    `<span>coverage</span><b>${score}%</b>`
+    + `<span class="budget-track"><span class="budget-fill ${fill}" style="width:${score}%"></span></span>`
+    + `<span class="muted">${esc(cov.band || "")}</span>`
+    + (cov.basis || cov.probe?.basis
+      ? `<span class="muted small">· ${esc(cov.basis || cov.probe.basis)}</span>` : "");
+  return wrap;
+}
+
+function missingList(missing) {
+  const ul = el("ul", "missing");
+  for (const m of missing || []) {
+    const li = el("li");
+    li.innerHTML = `<strong>${esc(m.what)}</strong> — ${esc(m.why)}`
+      + (m.searched ? ` <span class="muted small">searched: ${esc(m.searched)}</span>` : "");
+    ul.append(li);
+  }
+  return ul;
+}
+
+function citeChip(ref) {
+  const [doc, anchor] = String(ref).split(":");
+  return `<button type="button" class="cite" data-doc="${esc(doc)}" `
+    + `data-anchor="${esc(anchor || "")}">${esc(anchor || doc.slice(0, 8))}</button>`;
+}
+
+function questionFieldset(q, index) {
+  const fs = document.createElement("fieldset");
+  fs.className = "qgroup";
+  fs.dataset.qid = q.id;
+  fs.dataset.multi = q.kind === "multi" ? "1" : "0";
+  fs.dataset.skipped = "0";
+
+  const legend = document.createElement("legend");
+  legend.textContent = `${index + 1}. ${q.question}`;
+  fs.append(legend);
+
+  if (q.why) {
+    const why = el("div", "qwhy muted small");
+    // Prose only — rendered so the model's [[doc:anchor]] citations become the
+    // same clickable chips as everywhere else. Labels below stay textContent.
+    why.innerHTML = renderMarkdown(q.why);
+    fs.append(why);
+  }
+
+  const opts = el("div", "suggestions options");
+  const type = q.kind === "multi" ? "checkbox" : "radio";
+  (q.options || []).forEach((o, i) => {
+    const label = el("label", "suggestion");
+    const input = document.createElement("input");
+    input.type = type;
+    input.name = `${q.id}-${refine.round}`;
+    input.value = o.label;
+    const key = el("span", "tag key", String(i + 1));
+    key.setAttribute("aria-hidden", "true");
+    label.append(input, key, el("span", "optlabel", o.label));
+    if (o.detail) label.append(el("span", "muted small optnote", o.detail));
+    if ((o.evidence || []).length) {
+      const ev = el("span", "muted small optnote");
+      ev.innerHTML = o.evidence.map(citeChip).join(" ");
+      label.append(ev);
+    }
+    opts.append(label);
+  });
+
+  // Always offered: four options that do not fit is a trap, not a choice.
+  const other = el("label", "suggestion other");
+  const otherInput = document.createElement("input");
+  otherInput.type = type;
+  otherInput.name = `${q.id}-${refine.round}`;
+  otherInput.dataset.other = "1";
+  const otherKey = el("span", "tag key", String((q.options || []).length + 1));
+  otherKey.setAttribute("aria-hidden", "true");
+  const otherText = document.createElement("input");
+  otherText.type = "text";
+  otherText.className = "othertext";
+  otherText.placeholder = "in your own words…";
+  otherText.setAttribute("aria-label", `Other answer for: ${q.question}`);
+  otherText.addEventListener("input", () => {
+    if (otherText.value.trim()) { otherInput.checked = true; syncOptions(fs); }
+  });
+  other.append(otherInput, otherKey, el("span", "optlabel", "something else"), otherText);
+  opts.append(other);
+  fs.append(opts);
+
+  const skip = el("button", "link skip", `skip — assume “${q.default}”`);
+  skip.type = "button";
+  skip.onclick = () => {
+    for (const i of fs.querySelectorAll("input")) { i.checked = false; i.value = i.dataset.other ? "" : i.value; }
+    qs(".othertext", fs).value = "";
+    fs.dataset.skipped = "1";
+    syncOptions(fs);
+  };
+  fs.append(skip);
+
+  opts.addEventListener("change", () => { fs.dataset.skipped = "0"; syncOptions(fs); });
+  return fs;
+}
+
+function syncOptions(fs) {
+  for (const l of fs.querySelectorAll(".suggestion")) {
+    l.classList.toggle("on", qs("input", l).checked);
+  }
+  fs.classList.toggle("skipped", fs.dataset.skipped === "1");
+  updateRefineMeta();
+}
+
+function updateRefineMeta() {
+  if (!refine.card) return;
+  const groups = [...refine.card.querySelectorAll(".qgroup")];
+  const done = groups.filter((fs) =>
+    fs.dataset.skipped === "1" || qs("input:checked", fs)).length;
+  const meta = qs(".refinemeta", refine.card);
+  if (meta) meta.textContent = `${done} of ${groups.length} answered · ⌘⏎ to continue`;
+}
+
+function collectAnswers() {
+  const out = [];
+  for (const fs of refine.card.querySelectorAll(".qgroup")) {
+    if (fs.dataset.skipped === "1") { out.push({ id: fs.dataset.qid, value: "", skipped: true }); continue; }
+    const picked = [...fs.querySelectorAll("input:checked")]
+      .map((i) => (i.dataset.other === "1" ? (qs(".othertext", fs).value || "").trim() : i.value))
+      .filter(Boolean);
+    out.push({ id: fs.dataset.qid, value: picked, skipped: picked.length === 0 });
+  }
+  return out;
+}
+
+/* Number keys pick an option in the group you are in (or the first unanswered
+   one), Enter moves on, ⌘⏎ submits — the same binding as the composer. Typing
+   in "something else" is left alone. */
+function onRefineKeydown(e) {
+  const t = e.target;
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    e.preventDefault();
+    return refine.card.requestSubmit();
+  }
+  if (t.tagName === "TEXTAREA" || (t.tagName === "INPUT" && t.type === "text")) return;
+  if (e.key === "Enter" && t.type !== "submit") {
+    e.preventDefault();
+    const next = [...refine.card.querySelectorAll(".qgroup")]
+      .find((fs) => fs.dataset.skipped !== "1" && !qs("input:checked", fs));
+    if (next) qs("input", next).focus(); else refine.card.requestSubmit();
+    return;
+  }
+  if (!/^[1-9]$/.test(e.key) || e.metaKey || e.ctrlKey || e.altKey) return;
+  const group = t.closest?.(".qgroup")
+    || [...refine.card.querySelectorAll(".qgroup")]
+      .find((fs) => fs.dataset.skipped !== "1" && !qs("input:checked", fs));
+  if (!group) return;
+  const inputs = [...group.querySelectorAll(".suggestion input:not(.othertext)")];
+  const pick = inputs[Number(e.key) - 1];
+  if (!pick) return;
+  e.preventDefault();
+  pick.checked = group.dataset.multi === "1" ? !pick.checked : true;
+  group.dataset.skipped = "0";
+  syncOptions(group);
+}
+
+async function startRefining() {
   if (state.running) return;
   const question = $("question").value.trim();
   if (!question) return;
   if (!state.status?.stats?.by_status?.carded) {
     return toast("Nothing is indexed yet — run Ingest then Indexing first.", true);
   }
-
-  state.running = true;
-  $("askBtn").disabled = true;
-  $("askBtn").textContent = "Working…";
+  resetRefine();
+  refine.original = question;
   $("question").value = "";
   const thread = $("thread");
   if (qs(".empty", thread)) thread.innerHTML = "";
   $("trace").innerHTML = "";
   $("citations").innerHTML = "";
-
   thread.append(msgBlock("you", esc(question).replace(/\n/g, "<br>"), "user"));
+  await refineStream({ question });
+}
+
+async function submitRefineRound() {
+  if (state.running || !refine.card) return;
+  const answers = collectAnswers();
+  for (const i of refine.card.querySelectorAll("input, button")) i.disabled = true;
+  await refineStream({ question: refine.original, refine_id: refine.id, answers });
+}
+
+/* A refused request, turned into the sentence the reader gets.
+
+   The corpus can be re-pointed or an extracted folder deleted between choosing
+   a scope and asking, and both the refinement round and the answer post those
+   prefixes — refinement first, since it now goes ahead of every question. So
+   the recovery lives in one place rather than in whichever request happened to
+   run first.
+
+   The re-check is awaited, and the message says what actually happened:
+   reporting a re-check that is still in flight, or that failed, would send the
+   reader back into the same refusal believing it was fixed. Awaiting also
+   closes the retry window — `state.running` is still set, so nothing can post
+   the stale prefixes while it resolves. */
+async function askError(res) {
+  const detail = (await res.text()) || res.statusText;
+  if (res.status === 400 && detail.includes("outside every known corpus root")) {
+    return `${detail} — ${await recheckScope()}`;
+  }
+  return detail;
+}
+
+async function refineStream(body) {
+  state.running = true;
+  setRefinePhase("refining");
+  refine.round += 1;
+  refine.questions = [];
+
+  const thread = $("thread");
+  const card = document.createElement("form");
+  card.className = "msg refine";
+  const head = el("div", "who", `refining · round ${refine.round}`);
+  const think = el("div", "think hidden");
+  think.append(el("div", "who", "reasoning"));
+  const thinkBody = el("div", "b");
+  think.append(thinkBody);
+  const qbox = el("div", "body");
+  qbox.setAttribute("aria-live", "polite");
+  qbox.setAttribute("aria-busy", "true");
+  const notices = el("div", "notices");
+  card.append(head, think, qbox, notices);
+  card.addEventListener("submit", (e) => { e.preventDefault(); submitRefineRound(); });
+  card.addEventListener("keydown", onRefineKeydown);
+  // Only the live round answers to these ids; earlier rounds stay in the thread
+  // as the record of how the question got here, but must stop answering to them.
+  // Their controls too: a disabled button from round one still holding
+  // #refineSubmit is what $() would hand back.
+  for (const stale of thread.querySelectorAll(
+    "#refineCard, #refineSubmit, #refineSkipAll, #refineDraft"
+  )) stale.removeAttribute("id");
+  card.id = "refineCard";
+  // A new round supersedes the brief that came with the last one. Leaving that
+  // card on screen leaves a live Run button whose textarea belongs to the old
+  // brief while `refine.brief` has already moved on — one click and the analyst
+  // gets the old question wrapped in the new round's scope and assumptions.
+  refine.briefCard?.remove();
+  refine.briefCard = null;
+  thread.append(card);
+  thread.scrollTop = thread.scrollHeight;
+  refine.card = card;
+
+  const ctx = { notices, think, thinkBody };
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    if (!state.running) return clearInterval(tick);
+    const cur = $("runMeta").dataset.base || "";
+    $("runMeta").innerHTML = `<span class="spin">◐</span> ${((Date.now() - t0) / 1000).toFixed(0)}s refining ${cur}`;
+  }, 500);
+
+  let failed = false;
+  try {
+    const res = await fetch("/api/refine", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...body, scope: state.scope }),
+    });
+    if (!res.ok) throw new Error(await askError(res));
+
+    for await (const ev of sseStream(res)) {
+      if (ev.type === "error") failed = true;
+      if (handleCommonEvent(ev, ctx)) continue;
+      switch (ev.type) {
+        case "refine_probe":
+          refine.id = ev.refine_id;
+          try { sessionStorage.setItem("dd-refine-id", ev.refine_id); } catch { /* private mode */ }
+          head.append(coverageEl(ev, true));
+          break;
+        case "refine_coverage": {
+          refine.coverage = ev;
+          qs(".coverage", head)?.replaceWith(coverageEl(ev, false));
+          if (ev.score < 70 && (ev.missing || []).length) {
+            qbox.append(el("div", "muted small", "What the data room does not appear to have:"));
+            qbox.append(missingList(ev.missing));
+          }
+          if (ev.score < 40) {
+            notices.insertAdjacentHTML("beforeend",
+              `<div class="notice warn">${esc(ev.band)}${ev.answer_shape
+                ? " — " + esc(ev.answer_shape) : ""}. You can still run it; the gaps above are `
+              + `what to ask the seller for.</div>`);
+          }
+          break;
+        }
+        case "refine_round":
+          refine.final = !!ev.final;
+          if (ev.assessment) {
+            const a = el("div", "assessment");
+            a.innerHTML = renderMarkdown(ev.assessment);
+            qbox.prepend(a);
+          }
+          break;
+        case "refine_question":
+          refine.questions.push(ev);
+          qbox.append(questionFieldset(ev, refine.questions.length - 1));
+          break;
+        case "refine_brief":
+          refine.brief = ev.brief;
+          refine.proposal = ev.proposal;
+          refine.complexity = ev.complexity;
+          break;
+        case "refine_done":
+          qbox.setAttribute("aria-busy", "false");
+          if (ev.needs_answers) {
+            card.append(refineFooter());
+            updateRefineMeta();
+            qs(".qgroup input", card)?.focus();
+          } else {
+            head.textContent = `refining · round ${refine.round} · ready`;
+            if (refine.coverage) head.append(coverageEl(refine.coverage, false));
+            renderBrief();
+          }
+          refreshStatus();
+          $("runMeta").innerHTML = `refined in ${ev.duration_s}s · ${money(ev.usage.cost_usd)}`;
+          $("runMeta").dataset.base = "";
+          break;
+      }
+    }
+  } catch (err) {
+    failed = true;
+    toast(err.message, true);
+    notices.insertAdjacentHTML("beforeend", `<div class="notice err">${esc(err.message)}</div>`);
+  } finally {
+    clearInterval(tick);
+    state.running = false;
+    qbox.setAttribute("aria-busy", "false");
+    setRefinePhase(failed ? "idle" : refine.questions.length ? "awaiting" : "brief");
+    if (failed) resetRefine();
+  }
+}
+
+function refineFooter() {
+  const foot = el("div", "row between wrap gap refinefoot");
+  foot.append(el("span", "muted small refinemeta", ""));
+  const right = el("div", "row gap");
+  const skipAll = el("button", "ghost", "Skip all — use your judgement");
+  skipAll.type = "button";
+  skipAll.id = "refineSkipAll";
+  skipAll.onclick = () => {
+    for (const fs of refine.card.querySelectorAll(".qgroup")) {
+      for (const i of fs.querySelectorAll("input")) i.checked = false;
+      qs(".othertext", fs).value = "";
+      fs.dataset.skipped = "1";
+      syncOptions(fs);
+    }
+    refine.card.requestSubmit();
+  };
+  const draft = el("button", "ghost", "Run the draft as it stands");
+  draft.type = "button";
+  draft.id = "refineDraft";
+  draft.onclick = () => renderBrief();
+  const go = el("button", "primary", "Continue");
+  go.type = "submit";
+  go.id = "refineSubmit";
+  right.append(skipAll, draft, go);
+  foot.append(right);
+  return foot;
+}
+
+/* The brief is the plan: shown before anything expensive runs, and editable,
+   because the user knows things about the deal the corpus does not. */
+function renderBrief() {
+  if (!refine.brief) return;
+  refine.briefCard?.remove();
+  // The pointer is not enough: a finished run clears it while leaving the card
+  // in the thread as part of the record, so an earlier brief can still be
+  // holding these ids. Ids belong to the live brief, the transcript keeps the
+  // rest.
+  for (const stale of $("thread").querySelectorAll(
+    "#briefCard, #briefText, #briefRun, #briefOriginal, #briefMore, #briefModel,"
+    + " #briefEffort, #briefEditedNote, #briefCovers, #briefExcludes, #briefAssumed,"
+    + " #briefFocus"
+  )) stale.removeAttribute("id");
+  const card = document.createElement("form");
+  card.className = "msg brief";
+  card.id = "briefCard";
+  const thin = (refine.coverage?.score ?? 100) < 40;
+
+  const head = el("div", "who", "research brief · you can edit this");
+  const body = el("div", "body");
+
+  const field = el("div", "field");
+  field.append(el("label", null, "The question that will be run"));
+  const ta = document.createElement("textarea");
+  ta.id = "briefText";
+  ta.rows = 5;
+  ta.value = refine.brief.question || refine.original;
+  const edited = el("div", "muted small hidden", "edited — it will run exactly as written");
+  edited.id = "briefEditedNote";
+  ta.addEventListener("input", () => edited.classList.remove("hidden"));
+  ta.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); card.requestSubmit(); }
+  });
+  field.append(ta, edited);
+  body.append(field);
+
+  // Three separate lists, because they are three separate promises to the
+  // reader: what the run will cover, what it will leave out, and what was taken
+  // on faith. render_brief sends them under IN SCOPE / OUT OF SCOPE /
+  // ASSUMPTIONS, and folding scope into "Assumed" told the reader the run had
+  // guessed at something it had actually been told.
+  const lists = el("div", "brieflists");
+  for (const [title, items, id] of [
+    ["Covers", refine.brief.covers || [], "briefCovers"],
+    ["Excludes", refine.brief.excludes || [], "briefExcludes"],
+    ["Assumed", refine.brief.assumptions || [], "briefAssumed"],
+  ]) {
+    const col = el("div");
+    col.append(el("h4", null, title));
+    const ul = el("ul");
+    ul.id = id;
+    for (const item of items) {
+      const li = document.createElement("li");
+      li.innerHTML = renderMarkdown(item);   // citations stay clickable
+      ul.append(li);
+    }
+    if (!items.length) ul.append(el("li", "muted", "—"));
+    col.append(ul);
+    lists.append(col);
+  }
+  body.append(lists);
+
+  if ((refine.brief.evidence_plan || []).length) {
+    body.append(el("h4", null, "Starts from"));
+    const focus = el("div", "drawer-anchors");
+    focus.id = "briefFocus";
+    focus.innerHTML = refine.brief.evidence_plan
+      .map((e) => `${citeChip(e.doc_id)} <span class="muted small">${esc(e.rel_path)}</span>`)
+      .join(" ");
+    body.append(focus);
+  }
+
+  if ((refine.coverage?.missing || []).length && !thin) {
+    body.append(el("h4", null, "Not in the data room"));
+    body.append(missingList(refine.coverage.missing));
+  }
+
+  const opts = el("div", "runopts");
+  const modelSel = document.createElement("select");
+  modelSel.id = "briefModel";
+  modelSel.title = "Which model answers this";
+  for (const m of state.status?.models?.available || []) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = `${m.id} · $${m.input_usd}/$${m.output_usd} per Mtok`;
+    modelSel.append(o);
+  }
+  modelSel.value = refine.proposal?.model || state.status?.models?.analyst || "";
+  const effortSel = document.createElement("select");
+  effortSel.id = "briefEffort";
+  effortSel.title = "Reasoning effort";
+  for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+    const o = document.createElement("option");
+    o.value = level;
+    o.textContent = `effort: ${level}`;
+    effortSel.append(o);
+  }
+  effortSel.value = refine.proposal?.effort || state.status?.models?.effort || "high";
+  opts.append(modelSel, effortSel);
+  opts.append(el("span", "muted small",
+    `proposed: ${refine.proposal?.note || "—"} · about ${money(refine.proposal?.estimated_cost_usd)}`));
+  body.append(opts);
+
+  const notices = el("div", "notices");
+  if (thin) {
+    notices.insertAdjacentHTML("beforeend",
+      `<div class="notice warn">Coverage is ${refine.coverage.score}% — `
+      + `${esc(refine.coverage.band)}. Running this is unlikely to produce a cited answer.</div>`);
+  }
+
+  const foot = el("div", "row between wrap gap");
+  foot.append(el("span", "muted small",
+    refine.complexity ? `${refine.complexity.level} · ~${refine.complexity.docs_to_read} documents to read` : ""));
+  const right = el("div", "row gap");
+  const original = el("button", "ghost", "Run original instead");
+  original.type = "button";
+  original.id = "briefOriginal";
+  original.onclick = () => runFromBrief(refine.original);
+  if (!refine.final) {
+    const more = el("button", "ghost", "Refine further");
+    more.type = "button";
+    more.id = "briefMore";
+    more.onclick = () => refineStream({ question: refine.original, refine_id: refine.id, answers: [] });
+    right.append(more);
+  }
+  const go = el("button", "primary", thin ? "Run anyway" : "Run with this");
+  go.type = "submit";
+  go.id = "briefRun";
+  right.append(original, go);
+  foot.append(right);
+
+  card.append(head, body, notices, foot);
+  card.addEventListener("submit", (e) => { e.preventDefault(); runFromBrief(); });
+  $("thread").append(card);
+  $("thread").scrollTop = $("thread").scrollHeight;
+  refine.briefCard = card;
+  setRefinePhase("brief");
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+function runFromBrief(originalOnly) {
+  const edited = ($("briefText")?.value || "").trim();
+  const question = originalOnly || edited || refine.original;
+  // The tagged envelope tells the analyst this is scope, not a claim to cite.
+  // Running the original skips it entirely — there is no brief to send.
+  const sent = originalOnly
+    ? question
+    : renderBriefText({ ...refine.brief, question });
+  for (const c of [refine.card, refine.briefCard]) {
+    for (const i of c?.querySelectorAll("input, button, select, textarea") || []) i.disabled = true;
+  }
+  runAsk(sent, {
+    echo: question,
+    model: $("briefModel")?.value || null,
+    effort: $("briefEffort")?.value || null,
+    refineId: refine.id,
+  });
+}
+
+/* Mirrors app/scope.py:render_brief — the analyst is asked the same shape
+   whether the brief came back untouched or the user rewrote the question. */
+function renderBriefText(brief) {
+  const lines = ["<research_brief>", `QUESTION: ${brief.question || ""}`];
+  const block = (title, items, fmt) => {
+    if (!(items || []).length) return;
+    lines.push(title);
+    for (const i of items) lines.push("  - " + fmt(i));
+  };
+  block("IN SCOPE:", brief.covers, (s) => s);
+  block("OUT OF SCOPE:", brief.excludes, (s) => s);
+  block("START FROM:", brief.evidence_plan, (e) => `${e.doc_id} ${e.rel_path} — ${e.why}`);
+  if (brief.deliverable) lines.push(`DELIVERABLE: ${brief.deliverable}`);
+  block("ASSUMPTIONS (recorded during scoping, unverified):", brief.assumptions, (a) => a);
+  lines.push("</research_brief>");
+  return lines.join("\n");
+}
+
+function storedRefineId() {
+  try { return sessionStorage.getItem("dd-refine-id"); } catch { return null; }
+}
+
+async function restoreRefine() {
+  const id = storedRefineId();
+  if (!id || refine.id || state.running) return;
+  let s = null;
+  try { s = await api(`/api/refine/${encodeURIComponent(id)}`); } catch { /* gone */ }
+  // Fetching the session is a round trip, and the user can start asking during
+  // it. Landing a restored round on top of a live one would replace it with a
+  // stale session, so anything that started while we were away wins — including
+  // the failure path, which must not clear an id that is no longer the one we
+  // went to fetch.
+  if (refine.id || state.running || storedRefineId() !== id) return;
+  if (!s) return resetRefine();
+  refine.id = s.refine_id;
+  refine.original = s.question;
+  refine.round = s.round;
+  refine.final = !!s.final;
+  refine.brief = s.brief;
+  refine.proposal = s.proposal;
+  refine.complexity = s.complexity;
+  refine.coverage = s.coverage;
+  refine.questions = s.questions || [];
+  // The chip has to match what will actually run. The folders were fixed when
+  // the session started and the server enforces them on the answer regardless,
+  // so showing yesterday's chip over a restored brief would state the wrong
+  // thing about a run already decided.
+  if (JSON.stringify(s.scope || []) !== JSON.stringify(state.scope)) {
+    setScope(s.scope || []);
+  }
+
+  const thread = $("thread");
+  if (qs(".empty", thread)) thread.innerHTML = "";
+  thread.append(msgBlock("you", esc(s.question).replace(/\n/g, "<br>"), "user"));
+
+  const card = document.createElement("form");
+  card.className = "msg refine";
+  card.id = "refineCard";
+  const head = el("div", "who", `refining · round ${s.round} · restored`);
+  if (s.coverage) head.append(coverageEl(s.coverage, false));
+  const qbox = el("div", "body");
+  card.append(head, qbox, el("div", "notices"));
+  card.addEventListener("submit", (e) => { e.preventDefault(); submitRefineRound(); });
+  card.addEventListener("keydown", onRefineKeydown);
+  thread.append(card);
+  refine.card = card;
+  refine.questions.forEach((q, i) => qbox.append(questionFieldset(q, i)));
+
+  if (refine.questions.length) {
+    card.append(refineFooter());
+    updateRefineMeta();
+    setRefinePhase("awaiting");
+  } else {
+    renderBrief();
+  }
+}
+
+async function runAsk(question, opts = {}) {
+  if (state.running) return;
+  state.running = true;
+  setRefinePhase("running");
+  const thread = $("thread");
+  if (qs(".empty", thread)) thread.innerHTML = "";
+  $("trace").innerHTML = "";
+  $("citations").innerHTML = "";
+
+  thread.append(msgBlock("you", esc(opts.echo || question).replace(/\n/g, "<br>"), "user"));
 
   const assistant = msgBlock("analyst", "", "assistant");
   const think = el("div", "think hidden");
@@ -1564,14 +2255,18 @@ $("askForm").addEventListener("submit", async (e) => {
   assistant.append(notices);
   // Stated on the answer itself, not only on the chip: scrolled back to weeks
   // later, "not in the data room" has to carry what the room was at the time.
-  if (state.scope.length) {
-    const names = state.scope.map((p) => p.replace(/\/$/, "").split("/").pop());
+  // Written from the run's own status event rather than from the chip, because
+  // the two can differ: a brief runs against the folders its refinement session
+  // was started with, whatever the chip says by the time Run is clicked.
+  const markScope = (scope) => {
+    if (!Array.isArray(scope) || !scope.length || qs(".scope-note", assistant)) return;
+    const names = scope.map((p) => p.replace(/\/$/, "").split("/").pop());
     assistant.insertBefore(
       el("div", "scope-note muted small",
          `Scoped to ${names.join(", ")} — documents elsewhere were not readable.`),
       think,
     );
-  }
+  };
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -1589,61 +2284,25 @@ $("askForm").addEventListener("submit", async (e) => {
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         question, history: state.history,
-        verify: $("verifyToggle").checked, effort: $("effort").value,
+        verify: $("verifyToggle").checked,
+        effort: opts.effort || null,
+        model: opts.model || null,
         scope: state.scope,
+        refine_id: opts.refineId || null,
       }),
     });
-    if (!res.ok) {
-      const detail = (await res.text()) || res.statusText;
-      // The corpus can be re-pointed or an extracted folder deleted between
-      // choosing a scope and asking. Recover here rather than leaving every
-      // question failing on a chip nobody suspects.
-      if (res.status === 400 && detail.includes("outside every known corpus root")) {
-        // Awaited, and the message says what actually happened. Reporting a
-        // re-check that is still in flight — or that failed — would send the
-        // reader straight back into the same refusal believing it was fixed.
-        // Awaiting also closes the retry window: `state.running` is still set,
-        // so nothing can post the stale prefixes while this resolves.
-        throw new Error(`${detail} — ${await recheckScope()}`);
-      }
-      throw new Error(detail);
-    }
+    if (!res.ok) throw new Error(await askError(res));
 
+    const ctx = { notices, think, thinkBody, body };
     for await (const ev of sseStream(res)) {
+      if (ev.type === "status") markScope(ev.scope);
+      if (handleCommonEvent(ev, ctx)) continue;
       switch (ev.type) {
-        case "status":
-          if (ev.reason === "budget") {
-            // A spending stop is a decision the reader has to see, not a line in
-            // the meta strip that the next status message overwrites.
-            notices.insertAdjacentHTML("beforeend",
-              `<div class="notice warn">${esc(ev.message)}</div>`);
-            refreshStatus();
-          } else {
-            $("runMeta").dataset.base = esc(ev.message || "");
-          }
-          break;
-        case "thinking_delta":
-          think.classList.remove("hidden");
-          thinkBody.textContent += ev.text;
-          think.scrollTop = think.scrollHeight;
-          break;
         case "text_delta":
           answer += ev.text;
           body.innerHTML = renderMarkdown(answer);
           thread.scrollTop = thread.scrollHeight;
           break;
-        case "tool_use":
-          addTrace(ev.id, ev.name, ev.label, "running");
-          break;
-        case "tool_result":
-          updateTrace(ev.id, ev.summary, ev.ok ? "ok" : "err");
-          break;
-        case "usage": {
-          const u = ev.cumulative || {};
-          $("runMeta").dataset.base =
-            `· ${money(u.cost_usd)} · ${nfmt(ev.cache_read)} cached / ${nfmt(ev.input)} fresh in, ${nfmt(ev.output)} out`;
-          break;
-        }
         case "citations":
           renderCitations(ev.citations, []);
           break;
@@ -1654,24 +2313,14 @@ $("askForm").addEventListener("submit", async (e) => {
           body.appendChild(artifactRow(ev));
           loadArtifacts();
           break;
-        case "error":
-          // A budget refusal is a policy outcome, not a fault — say so in the
-          // thread and leave it there, rather than flashing a red failure tag.
-          if (ev.reason === "budget") {
-            notices.insertAdjacentHTML("beforeend",
-              `<div class="notice warn">${esc(ev.message)}</div>`);
-            refreshStatus();
-          } else {
-            toast(ev.message, true);
-            body.innerHTML += `<div class="tag bad">${esc(ev.message)}</div>`;
-          }
-          break;
         case "done":
           answer = ev.answer || answer;
           body.innerHTML = renderMarkdown(answer);
           if (ev.stopped_on_budget) assistant.classList.add("stopped-early");
           for (const a of ev.artifacts || []) body.appendChild(artifactRow(a));
           renderCitations(ev.citations, ev.verdicts);
+          // The history carries what the analyst was actually asked, so a
+          // follow-up inherits the sharpened framing rather than the vague one.
           state.history.push({ role: "user", content: question });
           state.history.push({ role: "assistant", content: answer });
           refreshStatus();
@@ -1689,11 +2338,12 @@ $("askForm").addEventListener("submit", async (e) => {
   } finally {
     clearInterval(tick);
     state.running = false;
-    $("askBtn").disabled = false;
-    $("askBtn").textContent = "Ask";
+    // One question, one scoping session: the next Ask starts a fresh one.
+    resetRefine();
+    setRefinePhase("idle");
     refreshStatus();
   }
-});
+}
 
 function msgBlock(who, html, cls) {
   const m = el("div", "msg " + cls);
@@ -1842,7 +2492,102 @@ const AREA_COLOURS = ["#0f766e", "#2dd4bf", "#a5610a", "#7b848e", "#196b3c"];
 
 async function loadAdmin() {
   await Promise.all([loadKeys(), loadUsers(), loadStorage(), loadAudit()]);
+  renderModels();
 }
+
+/* ── models ──────────────────────────────────────────────────────────── */
+const MODEL_ROLE_NOTES = {
+  analyst: "answers the question",
+  refiner: "sharpens the question first — leave on the analyst's model unless you have a "
+    + "reason: it reuses the analyst's cached corpus map, and a different model has its "
+    + "own cache to pay for",
+  carder: "summarises every document during indexing",
+  verifier: "re-reads each cited span",
+};
+
+function modelSelect(id, chosen, { blankLabel } = {}) {
+  const sel = document.createElement("select");
+  sel.id = id;
+  if (blankLabel) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = blankLabel;
+    sel.append(o);
+  }
+  for (const m of state.status?.models?.available || []) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = `${m.id} · $${m.input_usd}/$${m.output_usd} per Mtok`;
+    sel.append(o);
+  }
+  sel.value = chosen || "";
+  return sel;
+}
+
+function renderModels() {
+  const m = state.status?.models;
+  if (!m || !$("modelRoles")) return;
+  const map = state.status?.manifest || {};
+  $("modelsNote").textContent =
+    `corpus map ~${compact(map.approx_tokens || 0)} tokens · ${m.available.length} priced models`;
+
+  $("modelRoles").innerHTML = "";
+  for (const role of ["analyst", "refiner", "carder", "verifier"]) {
+    const pinned = m.env_pinned?.[role];
+    const wrap = el("div", "field");
+    wrap.append(el("label", null, role));
+    const sel = modelSelect(
+      `model-${role}`,
+      role === "refiner" ? m.refiner_configured : m[role],
+      role === "refiner" ? { blankLabel: `same as the analyst (${m.analyst})` } : {},
+    );
+    sel.disabled = !!pinned;
+    wrap.append(sel);
+    wrap.append(el("div", "muted small",
+      pinned ? "pinned by the environment" : MODEL_ROLE_NOTES[role]));
+    $("modelRoles").append(wrap);
+  }
+
+  for (const [id, value] of [["analystEffort", m.effort], ["refinerEffort", m.refiner_effort]]) {
+    $(id).innerHTML = ["low", "medium", "high", "xhigh", "max"]
+      .map((e) => `<option value="${e}"${e === value ? " selected" : ""}>${e}</option>`).join("");
+  }
+  $("refineRounds").innerHTML = [1, 2, 3, 4]
+    .map((n) => `<option value="${n}"${n === m.refine_max_rounds ? " selected" : ""}>${n}</option>`)
+    .join("");
+
+  $("complexityModels").innerHTML = "";
+  for (const level of ["simple", "moderate", "deep"]) {
+    const wrap = el("div", "field");
+    wrap.append(el("label", null, level));
+    wrap.append(modelSelect(`cx-${level}`, m.complexity_models?.[level]));
+    $("complexityModels").append(wrap);
+  }
+}
+
+$("saveModelsBtn").onclick = async () => {
+  const models = {};
+  for (const role of ["analyst", "refiner", "carder", "verifier"]) {
+    const sel = $(`model-${role}`);
+    if (sel && !sel.disabled) models[role] = sel.value;
+  }
+  const complexity_models = {};
+  for (const level of ["simple", "moderate", "deep"]) complexity_models[level] = $(`cx-${level}`).value;
+  try {
+    await api("/api/settings/models", {
+      method: "PATCH",
+      body: {
+        models, complexity_models,
+        analyst_effort: $("analystEffort").value,
+        refiner_effort: $("refinerEffort").value,
+        refine_max_rounds: Number($("refineRounds").value),
+      },
+    });
+    $("modelsSaved").textContent = `saved at ${new Date().toLocaleTimeString()}`;
+    await refreshStatus();
+    renderModels();
+  } catch (e) { toast(e.message, true); }
+};
 
 /* ── corpus access ───────────────────────────────────────────────────── */
 function renderAccess(r) {
@@ -2366,12 +3111,16 @@ function searchHit(h, compact) {
 const searchMounts = {};
 
 /* ── boot ────────────────────────────────────────────────────────────── */
-// Mounted after the first status load, because the workstream filter is populated
-// from the taxonomy that call returns.
+// Both wait on the first status load: the search panels populate their
+// workstream filter from the taxonomy it returns, and restoring a scoping
+// session needs the model list the brief card offers. The scoping session
+// itself lives on the server — the tab holds only its id, because the
+// questions and the brief quote a confidential data room.
 refreshStatus().then(() => {
   searchMounts.full = searchPanel("searchFullMount");
   searchMounts.corpus = searchPanel("searchCorpusMount", { compact: true });
   searchMounts.ask = searchPanel("searchAskMount", { compact: true });
+  return restoreRefine();
 });
 // A scope restored from the session has paths but no counts; the chip needs the
 // counts to say how much of the library the next question can actually see.
