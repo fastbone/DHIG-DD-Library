@@ -343,6 +343,30 @@ class SyncJob:
         self.eta_s: float | None = None
         self.elapsed_s = 0.0
 
+    def live_snapshot(self) -> dict:
+        """The figures a running sync has that its row does not yet.
+
+        The row is only written at the end, so without this a running sync reads as
+        stalled. Only meaningful while the run is actually running — see the caller.
+        """
+        out = {
+            "transferred": self.done, "unchanged": self.skipped, "deleted": self.deleted,
+            "errors": self.failed, "bytes": self.bytes_done,
+            "transferring": self.transferring[:6],
+            "speed_bps": round(self.speed_bps, 1),
+            "eta_s": self.eta_s,
+            "elapsed_s": round(self.elapsed_s, 1),
+            # The tail rather than the head: while a sync is running, the files it
+            # touched most recently are the interesting ones.
+            "changes": list(self._changes)[-200:],
+            "error_lines": list(self._error_tail),
+            "live": True,
+        }
+        if self.library_measured:
+            out["library_files"] = self.library_files
+            out["library_bytes"] = self.library_bytes
+        return out
+
     def _publish(self, status: str = "running", message: str = "") -> None:
         broker.publish(
             "job", job_id=self.id, job_kind="sync", status=status, total=self.total,

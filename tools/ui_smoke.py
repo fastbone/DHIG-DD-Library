@@ -570,6 +570,11 @@ async def main() -> int:
         checks["sync detail: a failed run keeps the reason and the failing path"] = (
             "403 Forbidden" in detail and "locked.xlsx" in detail
         )
+        # Rendered as lines. Joining with an escaped "\\n" put a visible backslash-n
+        # between paths, which is worst exactly when a run failed on several files.
+        checks["sync detail: error lines are lines, not one run-on string"] = (
+            "\\n" not in await page.inner_text("#runDetail pre")
+        )
         # Switch to the successful one.
         await page.click("#runList .rowitem:nth-child(2)")
         await page.wait_for_timeout(600)
@@ -616,6 +621,58 @@ async def main() -> int:
             "rate" in live and "eta" in live and "30s" in live
         )
         await page.screenshot(path="/tmp/sync-detail-live.png", full_page=True)
+
+        # The run finishes while it is being watched. This is the whole point of
+        # watching, and it used to fail: the pane kept its last live frame — still
+        # labelled running, with no change list — because refreshing the history
+        # preserved the existing selection instead of re-reading the run.
+        db.sync_run_update(
+            "sync-uilive", finished_at=_t.time(), status="ok", transferred=4,
+            unchanged=2, deleted=0, errors=0, bytes=1_048_576,
+            message="Synced Project X data room: 4 transferred (1.0 MB) in 13s",
+            changes=[{"op": "copied", "path": "01_financial/model.xlsx"},
+                     {"op": "copied", "path": "04_hr/headcount.csv"}],
+        )
+        await page.evaluate(
+            """(cx) => onJob({kind: "job", job_id: "sync-uilive", job_kind: "sync",
+                              conn_id: cx, status: "done", total: 4, done: 4, failed: 0,
+                              skipped: 2, deleted: 0, bytes_done: 1048576,
+                              message: "Synced"})""",
+            cx_id,
+        )
+        await page.wait_for_timeout(1200)
+        done = (await page.inner_text("#runDetail")).lower()
+        checks["sync detail: a watched run shows its result when it finishes"] = (
+            "updating live" not in done and "in flight" not in done
+            and "01_financial/model.xlsx" in done and "04_hr/headcount.csv" in done
+        )
+
+        # A live event must never inherit fields from a different run. Asserted on
+        # the merge itself rather than through timing: the window it used to go
+        # wrong in is a few hundred milliseconds wide, and a test that races it
+        # would collide with the pane legitimately settling on the newest run.
+        rendered = await page.evaluate(
+            """(cx) => {
+                 runState.connId = cx;
+                 runState.runId = null;
+                 runState.current = {id: "sync-old", status: "ok", library_files: 44,
+                                     changes: [{op: "copied", path: "OLD/stale.xlsx"}],
+                                     error_lines: ["OLD/stale.xlsx: 403"]};
+                 onSyncJobDetail({job_kind: "sync", conn_id: cx, job_id: "sync-new",
+                                  status: "running", done: 1, skipped: 0, deleted: 0,
+                                  failed: 0, bytes_done: 1024, elapsed_s: 2,
+                                  speed_bps: 1000, eta_s: 8, transferring: []});
+                 return {changes: (runState.current.changes || []).length,
+                         errors: (runState.current.error_lines || []).length,
+                         id: runState.current.id};
+               }""",
+            cx_id,
+        )
+        checks["sync detail: a new run does not inherit the last one's files"] = (
+            rendered["changes"] == 0 and rendered["errors"] == 0
+            and rendered["id"] == "sync-new"
+        )
+
         await page.click("#runClose")
         await page.wait_for_timeout(200)
         checks["sync detail: the modal closes"] = (

@@ -522,6 +522,12 @@ function onJob(ev) {
   const cancelBtn = $(which + "Cancel");
   if (cancelBtn) cancelBtn.dataset.job = ev.job_id;
   if (ev.job_kind === "sync") onSyncJobDetail(ev);
+  // The ingest chained onto a sync writes the indexed and dropped counts onto the
+  // run row after the sync's own terminal event, so an open detail view needs a
+  // second look once that finishes.
+  if (ev.job_kind === "ingest" && ev.status !== "running" && runState.connId) {
+    setTimeout(() => loadRunList({ select: runState.runId }), 400);
+  }
   if (ev.status !== "running") {
     hideProgress(which);
     setTimeout(() => { refreshStatus(); loadDocs(); loadArchives(); loadConnections(); }, 300);
@@ -540,10 +546,14 @@ function onSyncJobDetail(ev) {
       // something else and should keep it.
       if (runState.current && runState.current.status === "running") return;
       runState.current = null;
-      loadRunList();
+      loadRunList({ listOnly: true });
     }
     runState.runId = ev.job_id;
-    const cur = runState.current || {};
+    // Only carry forward what belongs to *this* run. Merging whatever was last
+    // rendered would paint a previous run's changed-file list and start time onto
+    // a new live one, and it would stick.
+    const cur = runState.current && runState.current.id === ev.job_id
+      ? runState.current : {};
     renderRunDetail({
       ...cur,
       id: ev.job_id, status: "running", live: true,
@@ -555,9 +565,11 @@ function onSyncJobDetail(ev) {
       message: ev.message,
     });
   } else {
-    // Finished: re-read once, because the changed-file list and the ingest counts
-    // are only written to the row at the end.
-    setTimeout(() => { loadRunList(); }, 400);
+    // Finished: re-read *this* run explicitly. loadRunList keeps whatever is
+    // already selected, so without the forced selection the pane would sit on its
+    // last live frame — still labelled running, with no change list — which is
+    // exactly the answer someone watched the sync to get.
+    setTimeout(() => { loadRunList({ select: ev.job_id }); }, 400);
   }
 }
 function hideProgress(which) {
@@ -907,7 +919,7 @@ function renderRunDetail(run) {
         </div>`).join("")}</div>` : ""}
     ${errs.length ? `
       <h3>Errors (${errs.length})</h3>
-      <pre class="pre-scroll">${esc(errs.join("\\n"))}</pre>` : ""}
+      <pre class="pre-scroll">${esc(errs.join("\n"))}</pre>` : ""}
     <h3>Changed files ${changes.length ? `(${changes.length}${
       changes.length >= 500 ? "+, capped" : ""})` : ""}</h3>
     ${changes.length ? `
@@ -933,7 +945,7 @@ async function loadRun(runId) {
   }
 }
 
-async function loadRunList() {
+async function loadRunList({ select = null, listOnly = false } = {}) {
   if (!runState.connId) return;
   try {
     const r = await api(`/api/sync/connections/${runState.connId}/runs`);
@@ -951,9 +963,17 @@ async function loadRunList() {
       node.dataset.run = run.id;
       box.append(node);
     }
-    // Default to whatever is running, else the most recent — which is what the
-    // person opening this is asking about in both cases.
-    if (!runState.runId || !r.runs.some((x) => x.id === runState.runId)) {
+    // A caller may name the run to show — a run that has just finished, whose
+    // stored detail now differs from what is on screen. Otherwise default to
+    // whatever is running, else the most recent, which is what the person opening
+    // this is asking about in both cases.
+    // listOnly refreshes the navigation and leaves the pane alone — used when a
+    // live event is already driving it. Without that, this would helpfully load
+    // "the newest run" over the top of the running one the event is painting.
+    if (listOnly) return;
+    if (select) {
+      await loadRun(select);
+    } else if (!runState.runId || !r.runs.some((x) => x.id === runState.runId)) {
       await loadRun(r.running_id || r.runs[0].id);
     }
   } catch (e) {
@@ -964,6 +984,7 @@ async function loadRunList() {
 function openRunModal(conn) {
   runState.connId = conn.id;
   runState.runId = null;
+  runState.current = null;
   runState.label = conn.label;
   $("runTitle").textContent = `${conn.label} — sync detail`;
   $("runList").innerHTML = "";
@@ -976,6 +997,7 @@ function closeRunModal() {
   $("runModal").classList.remove("open");
   runState.connId = null;
   runState.runId = null;
+  runState.current = null;
 }
 
 $("runClose").onclick = closeRunModal;

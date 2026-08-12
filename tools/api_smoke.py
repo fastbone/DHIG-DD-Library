@@ -660,6 +660,40 @@ def main() -> int:
         check("a running run reports live figures the row does not hold yet",
               code == 200 and run.get("live") is True and "transferring" in run,
               f"got {code}: {str(run)[:200]}")
+    # A finished run whose job is still registered must not read as live. The job
+    # stays in JOBS through the ingest chained onto the sync, minutes after a
+    # terminal status was stored, and overlaying then would relabel the run and
+    # replace its final change list with an in-memory tail.
+    from app.server import JOBS as _JOBS
+
+    _db.sync_run_start("sync-terminal", conn_id, "probe", "alice")
+    _db.sync_run_update("sync-terminal", finished_at=time.time(), status="ok",
+                        transferred=7, changes=[{"op": "copied", "path": "a/final.xlsx"}])
+
+    class _StillRegistered:
+        conn_id = "x"
+        done = skipped = deleted = failed = bytes_done = 0
+        transferring: list = []
+        speed_bps = elapsed_s = 0.0
+        eta_s = None
+        library_measured = False
+
+        def live_snapshot(self):
+            return {"live": True, "transferred": 999, "changes": [], "transferring": [{}]}
+
+    _JOBS["sync-terminal"] = _StillRegistered()
+    try:
+        code, body, _ = admin.get("/api/sync/runs/sync-terminal")
+        run = body.get("run", {})
+        check("a finished run is not relabelled live while its job lingers",
+              code == 200 and not run.get("live") and run.get("transferred") == 7,
+              str({k: run.get(k) for k in ("live", "transferred")}))
+        check("a finished run keeps its stored change list",
+              [c.get("path") for c in run.get("changes") or []] == ["a/final.xlsx"],
+              str(run.get("changes")))
+    finally:
+        _JOBS.pop("sync-terminal", None)
+
     code, body, _ = admin.get("/api/sync/runs/sync-doesnotexist")
     check("an unknown run is a 404", code == 404, f"got {code}")
     code, body, _ = admin.get("/api/sync/connections/nope/runs")

@@ -848,22 +848,12 @@ async def sync_run_detail(run_id: str, _: dict = Depends(auth.require_admin)):
     if run is None:
         raise HTTPException(404, "unknown run")
     job = JOBS.get(run_id)
-    if job is not None:
-        # A running sync's live figures are ahead of the row, which is only written
-        # at the end. Overlay them so the detail view does not read as stalled.
-        run.update({
-            "transferred": job.done, "unchanged": job.skipped, "deleted": job.deleted,
-            "errors": job.failed, "bytes": job.bytes_done,
-            "transferring": job.transferring[:6],
-            "speed_bps": round(job.speed_bps, 1),
-            "eta_s": job.eta_s, "elapsed_s": round(job.elapsed_s, 1),
-            "changes": list(job._changes)[-200:],
-            "error_lines": list(job._error_tail),
-            "live": True,
-        })
-        if job.library_measured:
-            run["library_files"] = job.library_files
-            run["library_bytes"] = job.library_bytes
+    # Only while the row itself still says running. The job stays registered through
+    # the ingest chained onto the sync — minutes after _finish wrote a terminal
+    # status — and overlaying then would relabel a finished run as live, replace its
+    # final change list with the in-memory tail, and leave stale transfers in flight.
+    if job is not None and run.get("status") == "running":
+        run.update(job.live_snapshot())
     return {"run": run}
 
 
