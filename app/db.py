@@ -6,7 +6,8 @@ Three things live here:
 * ``units`` + ``units_fts`` — the searchable atoms (a PDF page, a slide, a
   spreadsheet sheet), each with a citation anchor and a char range into the
   document's text mirror on disk.
-* ``jobs`` / ``qa_log`` / ``artifacts`` — operational and audit state.
+* ``jobs`` / ``qa_log`` / ``scope_rounds`` / ``artifacts`` — operational and
+  audit state.
 """
 
 from __future__ import annotations
@@ -130,6 +131,36 @@ CREATE TABLE IF NOT EXISTS artifacts (
     qa_id       TEXT,
     created_at  REAL NOT NULL
 );
+
+-- Question refinement. One row per round of grounded clarifying questions that
+-- turns a general question into a research brief before the analyst is paid to
+-- run. A separate table rather than columns on qa_log for the same reason
+-- user_budgets is one: the schema is a single pass of CREATE TABLE IF NOT
+-- EXISTS with no migration step, so a new column would never appear on a
+-- database that already exists. The link runs the same direction as
+-- artifacts.qa_id — written across every round of the session once the
+-- accepted brief is finally asked.
+CREATE TABLE IF NOT EXISTS scope_rounds (
+    id          TEXT PRIMARY KEY,
+    scope_id    TEXT NOT NULL,
+    round       INTEGER NOT NULL,
+    question    TEXT NOT NULL,   -- the user's original question, unchanged
+    answers     TEXT,            -- JSON: the answers that produced this round
+    payload     TEXT NOT NULL,   -- JSON: the coerced round object
+    transcript  TEXT,            -- JSON: messages[] to rehydrate the next round
+    ready       INTEGER NOT NULL DEFAULT 0,
+    -- The combined coverage score, duplicated out of `payload` so "which
+    -- questions did we run thin?" is a query rather than a JSON unpack.
+    coverage    INTEGER,
+    usage       TEXT,
+    model       TEXT,
+    effort      TEXT,
+    actor       TEXT,
+    qa_id       TEXT,            -- the answer this brief produced, once run
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scope_session ON scope_rounds(scope_id, round);
+CREATE INDEX IF NOT EXISTS idx_scope_qa      ON scope_rounds(qa_id);
 
 -- --- accounts and access ------------------------------------------------
 
@@ -263,7 +294,7 @@ CREATE TABLE IF NOT EXISTS spend (
     ts       REAL NOT NULL,
     username TEXT,                    -- NULL when nothing initiated it (never blocked)
     budget   TEXT NOT NULL,           -- ask | index
-    kind     TEXT NOT NULL,           -- analyst | verifier | carder
+    kind     TEXT NOT NULL,           -- analyst | scoper | verifier | carder
     model    TEXT,
     cost_usd REAL NOT NULL,
     input_tokens       INTEGER DEFAULT 0,

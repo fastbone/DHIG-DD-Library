@@ -36,7 +36,7 @@ os.environ.setdefault("DD_SECRET_KEY", "ui-smoke-secret-not-for-production")
 os.environ["DD_ADMIN_USER"] = SMOKE_USER = "smoke-admin"
 os.environ["DD_ADMIN_PASSWORD"] = SMOKE_PASSWORD = "ui-smoke-password"
 
-from app import agent, auth, db, docgen, ingest, manifest, search  # noqa: E402
+from app import agent, auth, db, docgen, ingest, manifest, scope, search  # noqa: E402
 
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8099"))
 
@@ -107,6 +107,140 @@ def pick_citations() -> list[str]:
         if h.get("citation") and h["citation"] not in seen:
             seen.append(h["citation"])
     return seen[:2] or ["deadbeefdeadbeef:p1", "deadbeefdeadbeef:p2"]
+
+
+def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None, **_kw):
+    """A scripted scoping session: one round of questions, then a brief.
+
+    Mirrors app/scope.py's event order exactly — coverage lands before the
+    questions, because a user looking at a thin corpus should be able to walk
+    away before answering four of them.
+    """
+    a, b = (cits + cits)[:2]
+    doc_a, doc_b = a.split(":")[0], b.split(":")[0]
+    # A question the sample corpus cannot answer, for the thin-coverage path.
+    thin = "pension" in question.lower()
+
+    async def gen():
+        sid = scope_id or "smokescope01"
+        yield {"type": "scope_probe", "scope_id": sid, "round": 1 if not scope_id else 2,
+               "score": 18 if thin else 41, "band": "thin — the data room probably cannot answer this"
+               if thin else "partial — expect gaps", "basis": "9 keyword hits across 3 documents",
+               "provisional": True}
+        yield {"type": "status", "message": "corpus map: 8 documents, ~224 tokens (full mode)",
+               "scope_id": sid}
+        for chunk in ["Looking for what the data room actually holds on this. ",
+                      "Two narrow searches should be enough to ask good questions."]:
+            yield {"type": "thinking_delta", "text": chunk}
+            await asyncio.sleep(0.05)
+        yield {"type": "tool_use", "id": "s1", "name": "search_corpus",
+               "input": {"query": "revenue segment"}, "label": "revenue segment"}
+        await asyncio.sleep(0.1)
+        yield {"type": "tool_result", "id": "s1", "name": "search_corpus", "ok": True,
+               "summary": "9 hits", "payload": {"n_hits": 9}}
+        yield {"type": "usage", "cost_usd": 0.006, "cumulative": {"cost_usd": 0.006},
+               "cache_read": 224, "cache_write": 0, "input": 900, "output": 210}
+
+        if scope_id:  # the answered round: converge
+            # A thin corpus stays thin however well the question is scoped —
+            # sharpening the wording cannot conjure documents that are not there.
+            yield {"type": "scope_coverage", "scope_id": sid, "round": 2, "provisional": False,
+                   "score": 15 if thin else 84,
+                   "band": "thin — the data room probably cannot answer this" if thin
+                   else "well covered",
+                   "reasons": [] if thin else [f"Audited accounts cover it [[{a}]]."],
+                   "missing": [{"what": "any pension scheme document",
+                                "why": "nothing in the room describes one",
+                                "searched": "pension, funding ratio, scheme"}] if thin else [],
+                   "answer_shape": "not answerable from this data room" if thin
+                   else "a cited figure",
+                   "probe": {"basis": "22 keyword hits across 6 documents"}}
+            yield {"type": "scope_round", "scope_id": sid, "round": 2, "final": True, "ready": True,
+                   "assessment": f"The audited accounts carry the figures [[{a}]]. Nothing is open.",
+                   "gaps": [], "n_questions": 0}
+            yield {"type": "scope_brief", "scope_id": sid, "round": 2,
+                   "brief": SCOPE_BRIEF(a, doc_a),
+                   "brief_text": "<research_brief>…</research_brief>",
+                   "complexity": {"level": "moderate", "drivers": ["two sources to reconcile"],
+                                  "docs_to_read": 5, "needs_computation": True,
+                                  "recommended_effort": "high"},
+                   "proposal": {"model": "claude-sonnet-5", "effort": "high",
+                                "note": "moderate question", "estimated_cost_usd": 0.14}}
+            yield {"type": "scope_done", "scope_id": sid, "round": 2, "ready": True,
+                   "needs_answers": False, "usage": {"cost_usd": 0.011}, "duration_s": 3.1,
+                   "budget": {}}
+            return
+
+        yield {"type": "scope_coverage", "scope_id": sid, "round": 1, "provisional": False,
+               "score": 15 if thin else 46,
+               "band": "thin — the data room probably cannot answer this" if thin
+               else "partial — expect gaps",
+               "reasons": [f"The audited accounts are here [[{a}]]."],
+               "missing": [{"what": "audited FY2025 accounts",
+                            "why": "would settle whether the FY25 figures are management's",
+                            "searched": "audit report 2025, FY25 auditor"}],
+               "answer_shape": "a directional read, not a number",
+               "probe": {"basis": "9 keyword hits across 3 documents"}}
+        yield {"type": "scope_round", "scope_id": sid, "round": 1, "final": False, "ready": False,
+               "assessment": f"The data room has audited accounts through FY2024 [[{a}]] and a "
+                             f"management deck that restates EBITDA [[{b}]].",
+               "gaps": ["No FY2025 audit"], "n_questions": 3}
+        yield {"type": "scope_question", "scope_id": sid, "id": "q1",
+               "question": "Which period should this cover?",
+               "why": f"The audited accounts stop at FY2024 [[{a}]]; the deck carries a forecast [[{b}]].",
+               "kind": "single", "default": "FY2022–FY2024, audited only",
+               "options": [
+                   {"label": "FY2022–FY2024, audited only", "detail": "3 documents · financial",
+                    "evidence": [a]},
+                   {"label": "Include the FY2025–27 forecast", "detail": "adds the board deck",
+                    "evidence": [b]},
+               ]}
+        yield {"type": "scope_question", "scope_id": sid, "id": "q2",
+               "question": "Which workstreams matter here?",
+               "why": "Answering across all of them costs more and says less.",
+               "kind": "multi", "default": "financial",
+               "options": [
+                   {"label": "financial", "detail": "4 documents", "evidence": [a]},
+                   {"label": "commercial", "detail": "2 documents", "evidence": [b]},
+                   {"label": "legal", "detail": "1 document", "evidence": []},
+               ]}
+        yield {"type": "scope_question", "scope_id": sid, "id": "q3",
+               "question": "What should the output be?",
+               "why": "A memo and a chat answer are different amounts of work.",
+               "kind": "single", "default": "an answer in chat",
+               "options": [
+                   {"label": "an answer in chat", "detail": "fastest", "evidence": []},
+                   {"label": "a Word memo", "detail": "built with create_deliverable",
+                    "evidence": []},
+               ]}
+        yield {"type": "scope_brief", "scope_id": sid, "round": 1,
+               "brief": SCOPE_BRIEF(a, doc_a),
+               "brief_text": "<research_brief>…</research_brief>",
+               "complexity": {"level": "deep", "drivers": ["broad question"], "docs_to_read": 9,
+                              "needs_computation": True, "recommended_effort": "high"},
+               "proposal": {"model": "claude-sonnet-5" if thin else "claude-opus-5",
+                            "effort": "medium" if thin else "high",
+                            "note": "deep question, but coverage is thin — proposing a cheaper run"
+                            if thin else "deep question",
+                            "estimated_cost_usd": 0.31}}
+        yield {"type": "scope_done", "scope_id": sid, "round": 1, "ready": False,
+               "needs_answers": True, "usage": {"cost_usd": 0.009}, "duration_s": 2.4,
+               "budget": {}}
+
+    return gen()
+
+
+def SCOPE_BRIEF(citation: str, doc_id: str) -> dict:
+    return {
+        "question": "For FY2022–FY2024, summarise revenue and EBITDA from the audited accounts "
+                    "and reconcile them against the management deck.",
+        "scope": [f"Audited figures only [[{citation}]]"],
+        "out_of_scope": ["The FY2025–27 forecast"],
+        "evidence_plan": [{"doc_id": doc_id, "rel_path": "financial/audited_accounts.pdf",
+                           "why": "the only audited source"}],
+        "deliverable": "prose",
+        "assumptions": ["EBITDA is taken pre-restructuring add-backs"],
+    }
 
 
 def canned(question: str, cits: list[str]):
@@ -190,7 +324,12 @@ async def main() -> int:
     cits = pick_citations()
     print("using citations:", cits)
 
-    agent.ask = lambda question, **kw: canned(question, cits)  # type: ignore[assignment]
+    # What the analyst was actually asked, so the brief-editing checks can prove
+    # the edited text is what ran rather than the model's original wording.
+    asked: list[str] = []
+    agent.ask = lambda question, **kw: (  # type: ignore[assignment]
+        asked.append(question), canned(question, cits))[1]
+    scope.run = lambda question, **kw: canned_scope(question, cits, **kw)  # type: ignore[assignment]
 
     import uvicorn
 
@@ -230,6 +369,86 @@ async def main() -> int:
         await page.fill("#question", "What was FY2024 revenue, and is the largest contract at risk?")
         await page.click("#askBtn")
 
+        # --- scoping: questions, then the brief, then the run ----------------
+        scope_checks: dict[str, bool] = {}
+        try:
+            await page.wait_for_selector("#scopeCard .qgroup:nth-of-type(3)", timeout=20_000)
+        except Exception as exc:  # noqa: BLE001
+            await page.screenshot(path="/tmp/ask-scope-timeout.png", full_page=True)
+            print("TIMED OUT waiting for the clarifying questions:", exc)
+            print("  thread  :", (await page.inner_text("#thread"))[:400])
+            print("  console :", problems or "none")
+            await browser.close()
+            return 1
+        await page.wait_for_timeout(300)
+
+        scope_checks["scope: a round of questions is asked before anything expensive runs"] = (
+            await page.locator("#scopeCard .qgroup").count() == 3)
+        scope_checks["scope: the questions are grounded in real documents"] = (
+            await page.locator("#scopeCard .qwhy .cite").count() >= 2)
+        scope_checks["scope: coverage is shown as a number and a band, not a colour"] = (
+            "%" in await page.inner_text("#scopeCard .coverage")
+            and "expect gaps" in await page.inner_text("#scopeCard .coverage"))
+        scope_checks["scope: what the data room lacks is listed"] = (
+            "audited FY2025 accounts" in await page.inner_text("#scopeCard"))
+        scope_checks["scope: the live round is not busy once the questions land"] = (
+            await page.get_attribute("#scopeCard .body", "aria-busy") == "false")
+        await page.screenshot(path="/tmp/ask-scope.png", full_page=True)
+
+        # a citation inside a clarifying question opens the reader
+        await page.locator("#scopeCard .qwhy .cite").first.click()
+        await page.wait_for_timeout(700)
+        scope_checks["scope: a citation in a question opens the reader"] = (
+            await page.locator("#drawer.open").count() == 1)
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+
+        # number keys pick options; multi-select takes more than one
+        await page.locator('#scopeCard .qgroup[data-qid="q1"] input').first.focus()
+        await page.keyboard.press("2")
+        scope_checks["scope: a number key picks an option"] = (
+            await page.locator('#scopeCard .qgroup[data-qid="q1"] .suggestion.on').count() == 1)
+        await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion').nth(0).click()
+        await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion').nth(1).click()
+        scope_checks["scope: multi-select accepts more than one answer"] = (
+            await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion.on').count() == 2)
+        await page.fill('#scopeCard .qgroup[data-qid="q3"] .othertext', "a findings table")
+        scope_checks["scope: other accepts free text"] = (
+            await page.locator('#scopeCard .qgroup[data-qid="q3"] .suggestion.other.on').count() == 1)
+        scope_checks["scope: progress is counted"] = (
+            "3 of 3 answered" in await page.inner_text("#scopeCard .scopemeta"))
+
+        await page.click("#scopeSubmit")
+        try:
+            await page.wait_for_selector("#briefCard", timeout=20_000)
+        except Exception as exc:  # noqa: BLE001
+            await page.screenshot(path="/tmp/ask-brief-timeout.png", full_page=True)
+            print("TIMED OUT waiting for the brief:", exc)
+            await browser.close()
+            return 1
+        await page.wait_for_timeout(300)
+
+        scope_checks["brief: the rewritten question is editable"] = (
+            len(await page.input_value("#briefText")) > 40
+            and await page.get_attribute("#briefText", "readonly") is None)
+        scope_checks["brief: assumptions and exclusions are listed"] = (
+            await page.locator("#briefAssumed li").count() >= 1
+            and await page.locator("#briefExcluded li").count() >= 1)
+        scope_checks["brief: the documents it starts from are clickable"] = (
+            await page.locator("#briefFocus .cite").count() >= 1)
+        scope_checks["brief: a model and an effort are proposed"] = (
+            await page.input_value("#briefModel") == "claude-sonnet-5"
+            and await page.input_value("#briefEffort") == "high")
+        scope_checks["brief: coverage is recomputed for the narrowed question"] = (
+            "84%" in await page.inner_text("#scopeCard .coverage"))
+        await page.screenshot(path="/tmp/ask-brief.png", full_page=True)
+
+        edited = "EDITED: reconcile FY2024 revenue between the audited accounts and the deck."
+        await page.fill("#briefText", edited)
+        scope_checks["brief: an edit is flagged as such"] = (
+            await page.locator("#briefEditedNote:not(.hidden)").count() == 1)
+        await page.click("#briefRun")
+
         try:
             await page.wait_for_function(
                 "() => document.getElementById('runMeta').textContent.includes('done in')",
@@ -247,6 +466,15 @@ async def main() -> int:
         await page.wait_for_timeout(600)
 
         checks = {
+            **scope_checks,
+            "brief: the run uses the edited text, not the model's wording":
+                bool(asked) and edited in asked[-1],
+            "brief: the analyst is handed the brief as scope, not as a claim to cite":
+                bool(asked) and asked[-1].startswith("<research_brief>"),
+            "scope: the scoping dialogue never enters the analyst's history":
+                await page.evaluate(
+                    "() => state.history.length === 2 "
+                    "&& !JSON.stringify(state.history).includes('Which period')"),
             "unauthenticated visit lands on /login": checks_login,
             "sign-in returns to the app": page.url.rstrip("/").endswith(str(PORT)),
             "user chip shows the account": SMOKE_USER in await page.inner_text("#userChip"),
@@ -254,7 +482,9 @@ async def main() -> int:
                 await page.locator("#adminTabBtn:not(.hidden)").count() == 1,
             "answer rendered": await page.locator(".msg.assistant .body table").count() == 1,
             "citation chips": await page.locator(".msg.assistant .cite").count() >= 3,
-            "thinking shown": "Checking the corpus map" in await page.inner_text(".think"),
+            # Scoped to the answer: the scoping card has a reasoning panel too.
+            "thinking shown":
+                "Checking the corpus map" in await page.inner_text(".msg.assistant .think"),
             "trace ok step": await page.locator(".tstep.ok").count() >= 2,
             "trace err step": await page.locator(".tstep.err").count() == 1,
             "citation panel": await page.locator("#citations .citation").count() >= 2,
@@ -281,6 +511,36 @@ async def main() -> int:
         checks["drawer has text"] = len(await page.inner_text("#drawerText")) > 50
         await page.screenshot(path="/tmp/ask-drawer.png", full_page=True)
         await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+
+        # A question the corpus cannot answer: the warning, the document request
+        # list, and the escape hatch back to the user's own wording.
+        await page.click("#newThread")
+        await page.fill("#question", "What is the pension scheme's funding ratio?")
+        await page.click("#askBtn")
+        await page.wait_for_selector("#scopeCard .qgroup", timeout=20_000)
+        await page.wait_for_timeout(400)
+        checks["thin coverage is called out rather than quietly run"] = (
+            await page.locator("#scopeCard .notices .notice.warn").count() == 1)
+        await page.click("#scopeSkipAll")
+        await page.wait_for_selector("#briefCard", timeout=20_000)
+        await page.wait_for_timeout(300)
+        checks["skipping every question still produces a runnable brief"] = (
+            len(await page.input_value("#briefText")) > 40)
+        checks["a thin question offers to run anyway, not to run confidently"] = (
+            "Run anyway" in await page.inner_text("#briefRun"))
+        await page.screenshot(path="/tmp/ask-thin.png", full_page=True)
+        await page.click("#briefOriginal")
+        await page.wait_for_function(
+            "() => document.getElementById('runMeta').textContent.includes('done in')",
+            timeout=30_000)
+        checks["run original instead sends the question as typed"] = (
+            asked[-1] == "What is the pension scheme's funding ratio?")
+
+        await page.click("#newThread")
+        checks["new thread clears the scoping session"] = (
+            await page.locator("#scopeCard").count() == 0
+            and await page.evaluate("() => sessionStorage.getItem('dd-scope-id') === null"))
 
         # Admin tab: keys, accounts, storage, audit all render from live data.
         await page.click('button[data-tab="admin"]')
@@ -630,7 +890,8 @@ async def main() -> int:
         await browser.close()
 
     print("\nJS problems:", problems or "none")
-    print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
+    print("screenshots: /tmp/ask-scope.png /tmp/ask-brief.png /tmp/ask-thin.png "
+          "/tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
           "/tmp/admin-budgets.png /tmp/help-sharepoint.png")

@@ -37,13 +37,14 @@ from . import (
     ingest,
     manifest,
     pricing,
+    scope,
     search,
     security,
     storage,
     sync,
     uploads,
 )
-from .config import SUPPORTED_EXTS, WORKSTREAMS, settings
+from .config import COMPLEXITY_MODELS, EFFORTS, MODEL_ROLES, SUPPORTED_EXTS, WORKSTREAMS, settings
 from .events import broker, sse
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -403,6 +404,85 @@ async def delete_key(key_id: str, admin: dict = Depends(auth.require_admin)):
     return {"deleted": key_id, "source": credentials.source()}
 
 
+# --- models --------------------------------------------------------------
+
+
+def _checked_model(value: str | None, field: str) -> str | None:
+    """Reject anything we have no price for.
+
+    An unpriced model is not merely unbudgeted — spend would be recorded against
+    a fallback rate, so a limit would silently stop meaning what it says.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value not in pricing.PRICES:
+        raise HTTPException(
+            400, f"unknown {field} {value!r} — pick one of {', '.join(sorted(pricing.PRICES))}"
+        )
+    return value
+
+
+class ModelsBody(BaseModel):
+    models: dict[str, str] | None = None            # role -> model id ("" = inherit)
+    analyst_effort: str | None = None
+    scoper_effort: str | None = None
+    scope_max_rounds: int | None = None
+    complexity_models: dict[str, str] | None = None
+
+
+@app.patch("/api/settings/models")
+async def patch_models(body: ModelsBody, admin: dict = Depends(auth.require_admin)):
+    for role, value in (body.models or {}).items():
+        if role not in MODEL_ROLES:
+            raise HTTPException(400, f"unknown model role {role!r}")
+        # An empty scoper means "inherit the analyst", which is the default and
+        # the cheap choice; the other roles need a real id.
+        if not (value or "").strip() and role != "scoper":
+            raise HTTPException(400, f"{role} model cannot be blank")
+        _checked_model(value, f"{role} model")
+    for level, value in (body.complexity_models or {}).items():
+        if level not in COMPLEXITY_MODELS:
+            raise HTTPException(400, f"unknown complexity level {level!r}")
+        _checked_model(value, f"{level} model")
+    for field in ("analyst_effort", "scoper_effort"):
+        value = getattr(body, field)
+        if value is not None and value not in EFFORTS:
+            raise HTTPException(400, f"unknown {field} {value!r}")
+    if body.scope_max_rounds is not None and not 1 <= body.scope_max_rounds <= 4:
+        raise HTTPException(400, "scope_max_rounds must be between 1 and 4")
+
+    await asyncio.to_thread(
+        settings.set_models,
+        models=body.models, analyst_effort=body.analyst_effort,
+        scoper_effort=body.scoper_effort, scope_max_rounds=body.scope_max_rounds,
+        complexity_models=body.complexity_models,
+    )
+    db.audit("models.update", actor=admin["username"], detail=json.dumps(body.model_dump(
+        exclude_none=True))[:300])
+    manifest.invalidate_manifest()
+    return _models_payload()
+
+
+def _models_payload() -> dict:
+    return {
+        "analyst": settings.analyst_model,
+        "scoper": settings.scoper_model,
+        "scoper_configured": settings.configured_model("scoper"),
+        "carder": settings.carder_model,
+        "verifier": settings.verifier_model,
+        "effort": settings.analyst_effort,
+        "scoper_effort": settings.scoper_effort,
+        "scope_max_rounds": settings.scope_max_rounds,
+        "complexity_models": settings.complexity_models,
+        "env_pinned": settings.model_overrides,
+        "available": [
+            {"id": model, "input_usd": price[0], "output_usd": price[1]}
+            for model, price in sorted(pricing.PRICES.items(), key=lambda kv: kv[1][0])
+        ],
+    }
+
+
 # --- status / config -----------------------------------------------------
 
 
@@ -415,12 +495,7 @@ async def status(request: Request):
         "corpus_root": str(settings.corpus_root) if settings.corpus_root else None,
         "credentials": credentials.source(),
         "has_api_key": credentials.available(),
-        "models": {
-            "analyst": settings.analyst_model,
-            "carder": settings.carder_model,
-            "verifier": settings.verifier_model,
-            "effort": settings.analyst_effort,
-        },
+        "models": _models_payload(),
         "python_tool": settings.enable_python_tool,
         "ocr": settings.ocr_enabled,
         "supported_extensions": sorted(SUPPORTED_EXTS),
@@ -1155,6 +1230,8 @@ class AskBody(BaseModel):
     history: list[dict] = []
     verify: bool = True
     effort: str | None = None
+    model: str | None = None
+    scope_id: str | None = None
 
 
 @app.post("/api/ask")
@@ -1164,11 +1241,13 @@ async def ask(body: AskBody, request: Request):
     db.audit("ask", actor=actor(request), detail=body.question[:300])
 
     who = actor(request)
+    model = _checked_model(body.model, "model")
+    effort = body.effort if body.effort in EFFORTS else None
 
     async def gen():
         async for event in agent.ask(
-            body.question, history=body.history, do_verify=body.verify, effort=body.effort,
-            actor=who,
+            body.question, history=body.history, do_verify=body.verify, effort=effort,
+            model=model, actor=who, scope_id=body.scope_id,
         ):
             yield sse(event)
 
@@ -1177,6 +1256,51 @@ async def ask(body: AskBody, request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- scope --------------------------------------------------------------
+
+
+class ScopeBody(BaseModel):
+    question: str = Field(min_length=2)
+    scope_id: str | None = None
+    answers: list[dict] = []
+
+
+@app.post("/api/scope")
+async def api_scope(body: ScopeBody, request: Request):
+    """Refine a question before the analyst is paid to answer it.
+
+    The scope transcript is deliberately not on the wire: it holds tool results
+    derived from document text and is replayed into a model whose output becomes
+    the analyst's instructions, so a client-supplied one would be an injection
+    path straight into the brief. The client carries only the id.
+    """
+    if not credentials.available():
+        raise HTTPException(400, "no API key configured — add one under Admin → API keys")
+    db.audit("scope", actor=actor(request), detail=body.question[:300])
+
+    who = actor(request)
+
+    async def gen():
+        async for event in scope.run(
+            body.question, scope_id=body.scope_id, answers=body.answers, actor=who,
+        ):
+            yield sse(event)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/scope/{scope_id}")
+async def api_scope_session(scope_id: str, request: Request):
+    found = await asyncio.to_thread(scope.load, scope_id, actor(request))
+    if not found:
+        raise HTTPException(404, "no such scoping session")
+    return found
 
 
 @app.get("/api/qa-log")

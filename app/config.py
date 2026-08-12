@@ -37,16 +37,36 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# The four model roles, each (env var, default). Analyst does the reasoning;
+# scoper refines the question before the analyst is paid to answer it; carder
+# does the bulk indexing pass; verifier re-reads cited spans. See README for the
+# cost rationale. An empty default means "fall back to the analyst's model".
+MODEL_ROLES: dict[str, tuple[str, str]] = {
+    "analyst": ("DD_ANALYST_MODEL", "claude-opus-5"),
+    "scoper": ("DD_SCOPER_MODEL", ""),
+    "carder": ("DD_CARDER_MODEL", "claude-haiku-4-5"),
+    "verifier": ("DD_VERIFIER_MODEL", "claude-haiku-4-5"),
+}
+
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+# What the scoper's complexity read maps onto when it proposes a model for the
+# run. Only a proposal: the brief shows it preselected and the user can change
+# it before approving.
+COMPLEXITY_MODELS: dict[str, str] = {
+    "simple": "claude-sonnet-5",
+    "moderate": "claude-sonnet-5",
+    "deep": "claude-opus-5",
+}
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: _env_path("DD_DATA_DIR", "./data"))
 
-    # Models. Analyst does the reasoning; carder does the bulk indexing pass;
-    # verifier re-reads cited spans. See README for the cost rationale.
-    analyst_model: str = os.environ.get("DD_ANALYST_MODEL", "claude-opus-5")
-    carder_model: str = os.environ.get("DD_CARDER_MODEL", "claude-haiku-4-5")
-    verifier_model: str = os.environ.get("DD_VERIFIER_MODEL", "claude-haiku-4-5")
-    analyst_effort: str = os.environ.get("DD_ANALYST_EFFORT", "high")
+    # Models live below as properties, not fields: each is env-overridable but
+    # also settable from the admin UI, which means the stored value has to be
+    # read on every access rather than frozen at import. See MODEL_ROLES.
 
     # Concurrency
     extract_workers: int = _env_int("DD_EXTRACT_WORKERS", max(2, (os.cpu_count() or 4) - 1))
@@ -246,6 +266,115 @@ class Settings:
     def forget_root(self, path: str) -> None:
         target = str(Path(path).expanduser().resolve())
         self._write_state({"root_history": [h for h in self.root_history if h != target]})
+
+    # --- models ----------------------------------------------------------
+    # Env wins, then whatever an admin saved from the UI, then the built-in
+    # default. Properties rather than dataclass fields because a value saved at
+    # runtime has to take effect without a restart.
+
+    def _model(self, role: str) -> str:
+        env_name, default = MODEL_ROLES[role]
+        stored = (self._state().get("models") or {}).get(role)
+        return (os.environ.get(env_name) or "").strip() or (stored or "").strip() or default
+
+    def _choice(self, env_name: str, key: str, allowed: list[str], default: str) -> str:
+        raw = (os.environ.get(env_name) or "").strip() or str(self._state().get(key) or "").strip()
+        return raw if raw in allowed else default
+
+    def configured_model(self, role: str) -> str:
+        """A role's stored value before inheritance — "" where it inherits."""
+        return self._model(role)
+
+    @property
+    def analyst_model(self) -> str:
+        return self._model("analyst")
+
+    @property
+    def scoper_model(self) -> str:
+        """The model that scopes a question before the analyst answers it.
+
+        Unset means "the analyst's model", and that is the default deliberately.
+        The scoper reuses the analyst's cached prefix (tools → instructions →
+        corpus map), so it *reads* that map at 0.1x instead of writing its own
+        at 2x, and it leaves the cache warm for the run that follows. Prompt
+        caches are per-model, so pointing this at a cheaper model forks the
+        cache and on a large corpus costs more per session, not less.
+        """
+        return self._model("scoper") or self.analyst_model
+
+    @property
+    def carder_model(self) -> str:
+        return self._model("carder")
+
+    @property
+    def verifier_model(self) -> str:
+        return self._model("verifier")
+
+    @property
+    def analyst_effort(self) -> str:
+        return self._choice("DD_ANALYST_EFFORT", "analyst_effort", EFFORTS, "high")
+
+    @property
+    def scoper_effort(self) -> str:
+        """Scoping is narrow and bounded, and the user is waiting on it."""
+        return self._choice("DD_SCOPER_EFFORT", "scoper_effort", EFFORTS, "low")
+
+    @property
+    def scope_max_rounds(self) -> int:
+        """Rounds of clarifying questions before the brief is forced out."""
+        raw = os.environ.get("DD_SCOPE_MAX_ROUNDS") or self._state().get("scope_max_rounds")
+        try:
+            return max(1, min(4, int(raw)))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
+    def complexity_models(self) -> dict[str, str]:
+        stored = self._state().get("complexity_models") or {}
+        return {
+            level: (stored.get(level) or default)
+            for level, default in COMPLEXITY_MODELS.items()
+        }
+
+    @property
+    def model_overrides(self) -> dict[str, bool]:
+        """Which roles the environment pins, so the admin UI can say so."""
+        return {
+            role: bool((os.environ.get(env_name) or "").strip())
+            for role, (env_name, _) in MODEL_ROLES.items()
+        }
+
+    def set_models(
+        self,
+        *,
+        models: dict | None = None,
+        analyst_effort: str | None = None,
+        scoper_effort: str | None = None,
+        scope_max_rounds: int | None = None,
+        complexity_models: dict | None = None,
+    ) -> None:
+        """Persist admin model choices. Callers validate ids against pricing."""
+        patch: dict = {}
+        if models is not None:
+            merged = dict(self._state().get("models") or {})
+            for role, value in models.items():
+                if role in MODEL_ROLES:
+                    merged[role] = (value or "").strip()
+            patch["models"] = merged
+        if analyst_effort is not None:
+            patch["analyst_effort"] = analyst_effort
+        if scoper_effort is not None:
+            patch["scoper_effort"] = scoper_effort
+        if scope_max_rounds is not None:
+            patch["scope_max_rounds"] = int(scope_max_rounds)
+        if complexity_models is not None:
+            merged = dict(self._state().get("complexity_models") or {})
+            for level, value in complexity_models.items():
+                if level in COMPLEXITY_MODELS:
+                    merged[level] = (value or "").strip()
+            patch["complexity_models"] = merged
+        if patch:
+            self._write_state(patch)
 
     def has_api_key(self) -> bool:
         """True when the SDK will find credentials: env var, or an `ant auth login` profile."""

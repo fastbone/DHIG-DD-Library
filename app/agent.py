@@ -129,11 +129,14 @@ async def ask(
     history: list[dict] | None = None,
     do_verify: bool = True,
     effort: str | None = None,
+    model: str | None = None,
     actor: str | None = None,
+    scope_id: str | None = None,
 ) -> AsyncIterator[dict]:
     started = time.time()
     qa_id = uuid.uuid4().hex[:12]
     meter = pricing.Meter()
+    model = model or settings.analyst_model
 
     # Before the corpus map is even built: a refusal should cost nothing and say
     # plainly what the position is, rather than surfacing as a failure mid-answer.
@@ -177,7 +180,7 @@ async def ask(
         for turn in range(MAX_TURNS):
             assistant_blocks: list[dict] = []
             async with client.messages.stream(
-                model=settings.analyst_model,
+                model=model,
                 max_tokens=32_000,
                 system=system,
                 tools=tools.TOOLS,
@@ -200,7 +203,7 @@ async def ask(
                 response = await stream.get_final_message()
 
             cost = pricing.record(
-                settings.analyst_model, response.usage, meter=meter, cache_ttl_1h=True,
+                model, response.usage, meter=meter, cache_ttl_1h=True,
                 attribution=payer,
             )
             yield {
@@ -319,10 +322,17 @@ async def ask(
             " model, duration_s, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 qa_id, question, final_text, json.dumps(citations), json.dumps(verdicts),
-                json.dumps(tool_trace), json.dumps(usage), settings.analyst_model, duration,
+                json.dumps(tool_trace), json.dumps(usage), model, duration,
                 time.time(),
             ),
         )
+        if scope_id:
+            # Imported here rather than at module scope: scope.py builds its
+            # requests out of this module's cached prefix, so a top-level import
+            # would be a cycle.
+            from . import scope
+
+            await asyncio.to_thread(scope.link_answer, scope_id, qa_id)
         broker.log(
             f"Answered in {duration:.0f}s · {len(tool_trace)} tool calls · "
             f"{len(citations)} citations · ${usage['cost_usd']:.3f}",
@@ -331,6 +341,8 @@ async def ask(
         yield {
             "type": "done",
             "qa_id": qa_id,
+            "scope_id": scope_id,
+            "model": model,
             "answer": final_text,
             "citations": citations,
             "verdicts": verdicts,
