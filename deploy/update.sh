@@ -213,8 +213,9 @@ env_drift() {
   # how you stop resetting the admin password on every restart.
   #
   # Only the app's own variables, and only where .env is the source. The image sets
-  # DD_DATA_DIR, DD_HOST and DD_PORT, and docker-compose.yml sets three more of its
-  # own; neither is .env's business, so a key either file supplies is left alone.
+  # DD_DATA_DIR, DD_HOST and DD_PORT, and docker-compose.yml's `environment:` block
+  # sets three more of its own; neither is .env's business, so a key either file
+  # supplies is left alone.
   local -a image_env=()
   local image
   image="$(docker inspect -f '{{.Config.Image}}' "$SERVICE" 2>/dev/null || true)"
@@ -231,7 +232,12 @@ env_drift() {
     if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" .env; then
       continue
     fi
-    if grep -q "$key" docker-compose.yml; then
+    # Set by compose itself? Matched as a YAML mapping key, not anywhere in the
+    # file: DD_HOST_PORT and DD_BIND_ADDR appear only in `${...}` interpolation on
+    # the ports line, so a substring match called them compose-managed and stopped
+    # noticing when they were deleted — and it matched DD_HOST inside DD_HOST_PORT
+    # too, which skipped the image comparison below for a different variable.
+    if grep -Eq "^[[:space:]]+${key}:" docker-compose.yml; then
       continue
     fi
     # Exactly what the image bakes in, rather than merely the same name: a value
