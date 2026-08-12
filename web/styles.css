@@ -191,6 +191,10 @@ textarea { width: 100%; resize: vertical; font-family: var(--sans); }
 .budget-fill { display: block; height: 100%; background: var(--accent); }
 .budget-fill.warn { background: var(--warn); }
 .budget-fill.bad { background: var(--err); }
+/* An answer cut short by a budget: the notice says why, this makes the message
+   itself read as incomplete, so it is not mistaken for a finished answer later. */
+.msg.assistant.stopped-early > .body { border-left: 2px solid var(--warn); padding-left: 11px; }
+.notices:empty { display: none; }
 
 /* progress */
 .progress-wrap { margin-top: 14px; }

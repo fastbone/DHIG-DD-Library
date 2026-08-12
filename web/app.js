@@ -1108,6 +1108,11 @@ $("askForm").addEventListener("submit", async (e) => {
   think.append(thinkBody);
   const body = qs(".body", assistant);
   assistant.insertBefore(think, body);
+  // Notices live beside the answer, not inside it: `body` is replaced wholesale
+  // on every text_delta and again on done, so a notice appended into it would be
+  // wiped by the next token — which is the opposite of the point.
+  const notices = el("div", "notices");
+  assistant.append(notices);
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -1136,7 +1141,7 @@ $("askForm").addEventListener("submit", async (e) => {
           if (ev.reason === "budget") {
             // A spending stop is a decision the reader has to see, not a line in
             // the meta strip that the next status message overwrites.
-            body.insertAdjacentHTML("beforeend",
+            notices.insertAdjacentHTML("beforeend",
               `<div class="notice warn">${esc(ev.message)}</div>`);
             refreshStatus();
           } else {
@@ -1179,7 +1184,7 @@ $("askForm").addEventListener("submit", async (e) => {
           // A budget refusal is a policy outcome, not a fault — say so in the
           // thread and leave it there, rather than flashing a red failure tag.
           if (ev.reason === "budget") {
-            body.insertAdjacentHTML("beforeend",
+            notices.insertAdjacentHTML("beforeend",
               `<div class="notice warn">${esc(ev.message)}</div>`);
             refreshStatus();
           } else {
@@ -1190,6 +1195,7 @@ $("askForm").addEventListener("submit", async (e) => {
         case "done":
           answer = ev.answer || answer;
           body.innerHTML = renderMarkdown(answer);
+          if (ev.stopped_on_budget) assistant.classList.add("stopped-early");
           for (const a of ev.artifacts || []) body.appendChild(artifactRow(a));
           renderCitations(ev.citations, ev.verdicts);
           state.history.push({ role: "user", content: question });
@@ -1524,9 +1530,11 @@ $("addKeyBtn").onclick = async () => {
    than a sentinel number so nobody has to decode -1. */
 function budgetLabel(b) {
   if (!b) return "—";
-  if (b.unlimited) return "unlimited";
-  const of = `$${b.limit_usd.toFixed(2)}`;
-  return b.inherited ? `${of} (default)` : of;
+  const amount = b.unlimited ? "unlimited" : `$${b.limit_usd.toFixed(2)}`;
+  // `inherited` first, always. An account on an unlimited instance default reports
+  // both unlimited and inherited, and reading the value first loses the difference
+  // between "follows the default" and "was set to unlimited here".
+  return b.inherited ? `default (${amount})` : amount;
 }
 
 function budgetBar(b) {
@@ -1619,8 +1627,8 @@ async function patchUser(username, patch) {
    never touches. `default` and `unlimited` are typed as words, matching what the
    API accepts, so there is no sentinel number to remember. */
 function editBudgets(u) {
-  const asCurrent = (b) => (!b ? "default" : b.unlimited ? "unlimited"
-                            : b.inherited ? "default" : String(b.limit_usd));
+  const asCurrent = (b) => (!b || b.inherited ? "default"
+                            : b.unlimited ? "unlimited" : String(b.limit_usd));
   const ask = prompt(
     `Weekly QUESTION budget for ${u.username}.\n\n` +
     `A dollar amount, "unlimited", or "default" to follow the instance setting.\n` +

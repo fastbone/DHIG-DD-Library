@@ -709,9 +709,15 @@ def main() -> int:
           time.localtime(body["week_start"]).tm_wday == 0
           and time.localtime(body["week_start"]).tm_hour == 0,
           time.strftime("%a %H:%M", time.localtime(body.get("week_start", 0))))
-    check("the reset is exactly a week after the start",
-          round(body["resets_at"] - body["week_start"]) == 7 * 24 * 3600,
-          str(body.get("resets_at", 0) - body.get("week_start", 0)))
+    # The contract is "next Monday at midnight", not "168 hours later": a week
+    # containing a daylight-saving change is 167 or 169 hours long, and a fixed
+    # offset would promise a reset at 23:00 or 01:00.
+    reset = time.localtime(body["resets_at"])
+    span_h = (body["resets_at"] - body["week_start"]) / 3600
+    check("the reset is the next Monday at midnight",
+          reset.tm_wday == 0 and reset.tm_hour == 0 and reset.tm_min == 0
+          and 167 <= round(span_h) <= 169,
+          f"{time.strftime('%a %H:%M', reset)} after {span_h:.0f}h")
 
     code, body, _ = admin.post("/api/users/dana", {"budget_ask": 5, "budget_index": "unlimited"})
     b = (body.get("user") or {}).get("budget") or {}
@@ -724,6 +730,13 @@ def main() -> int:
           code == 200 and b.get("ask", {}).get("inherited") is True, str(b.get("ask")))
     check("setting one budget leaves the other alone",
           b.get("index", {}).get("unlimited") is True, str(b.get("index")))
+    admin.post("/api/users/dana", {"budget_ask": "default", "budget_index": "default"})
+    code, body, _ = admin.get("/api/users")
+    dana_b = next(u for u in body["users"] if u["username"] == "dana")["budget"]
+    check("an account inheriting an unlimited default reports as inherited",
+          dana_b["ask"]["inherited"] is True and dana_b["ask"]["unlimited"] is True,
+          str(dana_b["ask"]))
+
     code, body, _ = admin.post("/api/users/dana", {"budget_ask": "twenty quid"})
     check("an unparseable budget is refused rather than stored as zero",
           code == 400, f"got {code}: {str(body)[:120]}")

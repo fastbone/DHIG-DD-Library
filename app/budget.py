@@ -51,8 +51,21 @@ def week_start(now: float | None = None) -> float:
 
 
 def week_end(now: float | None = None) -> float:
-    """When the current allowance resets."""
-    return week_start(now) + 7 * 24 * 3600
+    """When the current allowance resets: the *next* Monday 00:00 local time.
+
+    Deliberately not ``week_start() + 7 days`` in seconds. A week that contains a
+    daylight-saving change is 23 or 25 hours short or long, so a fixed 168-hour
+    offset lands at 23:00 or 01:00 rather than midnight. Enforcement would still be
+    right — `week_start` is derived from the wall clock — but the reset the UI
+    promises and the refusal message quotes would be an hour out twice a year, and
+    a spending limit that misstates its own reset is not one anybody trusts.
+    """
+    start = dt.datetime.fromtimestamp(week_start(now))
+    # Arithmetic on the naive wall clock, then re-localised, so the result is
+    # midnight in whatever offset is in force by then.
+    return (start + dt.timedelta(days=7)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
 
 
 def week_key(now: float | None = None) -> str:

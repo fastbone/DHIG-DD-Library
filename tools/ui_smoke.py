@@ -153,6 +153,11 @@ def canned(question: str, cits: list[str]):
         yield {"type": "phase", "phase": "writing"}
         for i in range(0, len(answer), 24):
             yield {"type": "text_delta", "text": answer[i : i + 24]}
+            if i == 0:
+                # Mid-answer, with plenty of tokens still to come.
+                yield {"type": "status", "reason": "budget",
+                       "message": "Weekly question budget of $4.00 reached. Using this "
+                                  "week's one-time $0.40 overrun to finish this answer."}
             await asyncio.sleep(0.01)
 
         art = docgen.create(
@@ -170,6 +175,7 @@ def canned(question: str, cits: list[str]):
             yield {"type": "verdict", "claim": "…", "citations": [cit],
                    "verdict": verdict, "note": note}
         yield {"type": "done", "qa_id": "smoke", "answer": answer, "citations": citations,
+               "stopped_on_budget": True,
                "verdicts": [{"citations": [a], "verdict": "supported", "note": ""},
                             {"citations": [b], "verdict": "partial", "note": "Notice period differs."}],
                "artifacts": [art], "usage": {"cost_usd": 0.0412}, "duration_s": 6.2,
@@ -255,6 +261,15 @@ async def main() -> int:
             "verdict supported": await page.locator("#citations .v.supported").count() >= 1,
             "verdict partial": await page.locator("#citations .v.partial").count() >= 1,
             "artifact row": await page.locator(".msg.assistant .artifact").count() >= 1,
+            # The notice was emitted mid-answer and then streamed over, and the
+            # answer was re-rendered wholesale on done. It has to still be there:
+            # a budget stop the reader never sees is not a budget stop.
+            "budget notice survives the answer re-rendering":
+                await page.locator(".msg.assistant .notices .notice.warn").count() == 1
+                and "one-time $0.40 overrun"
+                    in await page.inner_text(".msg.assistant .notices"),
+            "an answer stopped by the budget is marked as such":
+                await page.locator(".msg.assistant.stopped-early").count() == 1,
             "cost in runMeta": "$" in await page.inner_text("#runMeta"),
         }
         await page.screenshot(path="/tmp/ask-answer.png", full_page=True)
@@ -531,6 +546,19 @@ async def main() -> int:
         checks["budget: a nearly-spent budget reads as a warning"] = (
             bar is not None and "warn" in bar["cls"]
             and abs(float(bar["width"].rstrip("%")) - 85) < 0.5
+        )
+        # An account on an unlimited instance default must read as following the
+        # default, not as explicitly unlimited: the editor pre-fills from this, so
+        # confusing the two saves an explicit cap and detaches it from the default.
+        _budget.set_budgets("smoke-inheritor", ask="default", index="default", actor="smoke")
+        await page.evaluate("() => loadUsers()")
+        await page.wait_for_timeout(600)
+        labels = await page.evaluate(
+            """() => budgetLabel({unlimited: true, inherited: true, limit_usd: null})
+                    + '|' + budgetLabel({unlimited: true, inherited: false, limit_usd: null})"""
+        )
+        checks["budget: an inherited default is not shown as an explicit unlimited"] = (
+            labels == "default (unlimited)|unlimited"
         )
         await page.screenshot(path="/tmp/admin-budgets.png", full_page=True)
 
