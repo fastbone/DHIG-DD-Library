@@ -256,7 +256,10 @@ prefaces; `tools/api_smoke.py` asserts the prefix directly for that reason.
 **Folders come first.** If the question is scoped to folders (see *Scoping a
 question to folders*), the refiner is given the same ones: it searches inside
 them, its coverage figure is measured against them, and the run the brief
-produces inherits them. Coverage judged against the whole library would be a
+produces inherits them — read back from the session server-side rather than
+taken from the request, because the chip can move between the brief appearing
+and Run being clicked. The answer's provenance line is written from what the run
+actually saw, for the same reason. Coverage judged against the whole library would be a
 different question's answer, and a brief that named documents outside the chosen
 folders would cite files the run is not allowed to open. The folders are fixed
 when the session starts, so a later round cannot widen them underneath a brief
@@ -916,9 +919,9 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 222 checks: auth, CSRF, keys, uploads, access, sync, storage, scope, refinement
+python3 tools/api_smoke.py            # 227 checks: auth, CSRF, keys, uploads, access, sync, storage, scope, refinement
 python3 tools/sync_smoke.py           # 84 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 140 checks: the browser front end, end to end
+python3 tools/ui_smoke.py             # 141 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 

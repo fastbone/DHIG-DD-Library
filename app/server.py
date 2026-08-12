@@ -1365,19 +1365,33 @@ async def ask(body: AskBody, request: Request):
     scope = validated_scope(body.scope)
     if not credentials.available():
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
-    db.audit(
-        "ask", actor=actor(request),
-        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
-    )
 
     who = actor(request)
+    refine_id = body.refine_id
+    if refine_id:
+        # The brief was written against the folders the refinement session was
+        # started with: coverage was measured against them and the evidence plan
+        # names documents inside them. The chip can have moved since — a reload,
+        # or a click between the brief appearing and Run — so the session's
+        # folders win over whatever the client sent. An id that is not this
+        # account's is ignored outright rather than trusted for either field.
+        known_session, locked = await asyncio.to_thread(refine.session_scope, refine_id, who)
+        if not known_session:
+            refine_id = None
+        else:
+            scope = validated_scope(locked)
+
+    db.audit(
+        "ask", actor=who,
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
     model = _checked_model(body.model, "model")
     effort = body.effort if body.effort in EFFORTS else None
 
     async def gen():
         async for event in agent.ask(
             body.question, history=body.history, do_verify=body.verify, effort=effort,
-            model=model, actor=who, scope=scope, refine_id=body.refine_id,
+            model=model, actor=who, scope=scope, refine_id=refine_id,
         ):
             yield sse(event)
 

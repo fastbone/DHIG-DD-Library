@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -132,7 +133,8 @@ def pick_citations() -> list[str]:
     return seen[:2] or ["deadbeefdeadbeef:p1", "deadbeefdeadbeef:p2"]
 
 
-def canned_refine(question: str, cits: list[str], *, refine_id=None, answers=None, **_kw):
+def canned_refine(question: str, cits: list[str], *, refine_id=None, answers=None,
+                  actor=None, scope=None, **_kw):
     """A scripted refinement session: one round of questions, then a brief.
 
     Mirrors app/scope.py's event order exactly — coverage lands before the
@@ -145,7 +147,15 @@ def canned_refine(question: str, cits: list[str], *, refine_id=None, answers=Non
     thin = "pension" in question.lower()
 
     async def gen():
-        sid = refine_id or "smokerefine01"
+        # A fresh id per session, because the server reads a session's folders
+        # from its *first* round: a shared id would hand every later run the
+        # scope of the first question anyone asked.
+        sid = refine_id or "live" + uuid.uuid4().hex[:8]
+        refine.save_round(
+            sid, round_no=2 if refine_id else 1, question=question, answers=answers,
+            payload={"ready": bool(refine_id), "questions": []}, transcript=[], usage={},
+            actor=actor, scope=scope,
+        )
         yield {"type": "refine_probe", "refine_id": sid, "round": 1 if not refine_id else 2,
                "score": 18 if thin else 41, "band": "thin — the data room probably cannot answer this"
                if thin else "partial — expect gaps", "basis": "9 keyword hits across 3 documents",
@@ -266,7 +276,7 @@ def REFINE_BRIEF(citation: str, doc_id: str) -> dict:
     }
 
 
-def canned(question: str, cits: list[str]):
+def canned(question: str, cits: list[str], scope=None):
     a, b = (cits + cits)[:2]
     answer = (
         f"Revenue reached EUR 412.6 million in FY2024, up 10.9% year on year [[{a}]].\n\n"
@@ -280,9 +290,13 @@ def canned(question: str, cits: list[str]):
     )
 
     async def gen():
+        # Carries `scope` exactly as agent.ask does: the answer's provenance note
+        # is written from this event, not from the chip, because the server can
+        # lock a brief to the folders its refinement session was started with.
         yield {"type": "status", "message": "corpus map: 8 documents, ~224 tokens (full mode)",
-               "qa_id": "smoke", "manifest": {"mode": "full", "chars": 896, "approx_tokens": 224,
-                                              "n_indexed": 8, "n_unindexed": 0}}
+               "qa_id": "smoke", "scope": list(scope or []),
+               "manifest": {"mode": "full", "chars": 896, "approx_tokens": 224,
+                            "n_indexed": 8, "n_unindexed": 0}}
         yield {"type": "phase", "phase": "thinking"}
         for chunk in ["Checking the corpus map for audited accounts. ",
                       "The figure should come from the workbook, not the extracted text — ",
@@ -356,7 +370,7 @@ async def main() -> int:
 
     def _ask(question, **kw):
         asked.append({"question": question, **kw})
-        return canned(question, cits)
+        return canned(question, cits, scope=kw.get("scope"))
 
     agent.ask = _ask  # type: ignore[assignment]
 
@@ -1324,6 +1338,30 @@ async def main() -> int:
             len(asked) >= 2
             and asked[-1].get("scope") == [leaf["path"] for leaf in leaves]
         )
+
+        # The brief was written against the folders the session started with, so
+        # a chip moved between the brief appearing and Run must not change what
+        # the answer reads: coverage and the evidence plan were measured on the
+        # old ones. Driven by clearing the chip while the brief is on screen, from
+        # a fresh thread so the finished run's own brief card — still in the
+        # transcript, disabled — is not what gets clicked.
+        await page.click("#newThread")
+        await page.fill("#question", "And what about the contracts?")
+        await page.click("#askBtn")
+        await page.wait_for_selector("#refineCard .qgroup", timeout=20_000)
+        await page.click("#refineSkipAll")
+        await page.wait_for_selector("#briefCard", timeout=20_000)
+        await page.evaluate("() => setScope([])")          # the reader widens the chip
+        await page.click("#briefRun")
+        await page.wait_for_function(
+            "() => document.getElementById('runMeta').textContent.includes('done in')",
+            timeout=30_000)
+        await page.wait_for_timeout(300)
+        checks["scope: a brief runs against the folders it was written for"] = (
+            asked[-1].get("scope") == [leaf["path"] for leaf in leaves]
+        )
+        await page.evaluate(
+            "(paths) => setScope(paths)", [leaf["path"] for leaf in leaves])
         # Scrolled back to weeks later, "not in the data room" has to carry what
         # the room was at the time.
         checks["scope: the answer says what it was allowed to see"] = (

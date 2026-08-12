@@ -616,13 +616,22 @@ def _coerce(payload: dict, probed: dict) -> dict:
         for o in (q.get("options") or [])[:MAX_OPTIONS]:
             if not isinstance(o, dict) or not _clean(o.get("label"), 200):
                 continue
+            claimed = [e for e in (o.get("evidence") or [])[:4] if str(e).strip()]
+            resolved = [
+                _clean(e, 160) for e in claimed if str(e).partition(":")[0] in known
+            ]
+            # An option that named documents and had every one of them dropped is
+            # ungrounded: the model asserted evidence that does not exist, and a
+            # clickable choice resting on nothing is worse than one fewer choice.
+            # An option that never claimed any is a different thing — "an answer
+            # in chat" has no document behind it and is not supposed to — so the
+            # test is "claimed and lost", not "empty".
+            if claimed and not resolved:
+                continue
             options.append({
                 "label": _clean(o.get("label"), 200),
                 "detail": _clean(o.get("detail"), 200),
-                "evidence": [
-                    _clean(e, 160) for e in (o.get("evidence") or [])[:4]
-                    if str(e).partition(":")[0] in known
-                ],
+                "evidence": resolved,
             })
         kind = q.get("kind") if q.get("kind") in ("single", "multi", "free") else "single"
         if not options and kind != "free":
@@ -834,6 +843,26 @@ def load(refine_id: str, actor: str | None = None) -> dict | None:
             ),
         },
     }
+
+
+def session_scope(refine_id: str, actor: str | None = None) -> tuple[bool, list[str]]:
+    """The folders a refinement session was started with.
+
+    Returns ``(found, scope)``. `found` is False when the id is unknown or
+    belongs to another account, which is the caller's cue to ignore it rather
+    than to trust whatever came with it.
+    """
+    row = db.one(
+        "SELECT scope, actor FROM refine_rounds WHERE refine_id=? ORDER BY round LIMIT 1",
+        (refine_id,),
+    )
+    if row is None or (actor and row["actor"] and row["actor"] != actor):
+        return False, []
+    try:
+        stored = json.loads(row["scope"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return True, []
+    return True, [p for p in stored if isinstance(p, str) and p]
 
 
 def save_round(

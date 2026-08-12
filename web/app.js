@@ -1858,9 +1858,13 @@ async function refineStream(body) {
   card.append(head, think, qbox, notices);
   card.addEventListener("submit", (e) => { e.preventDefault(); submitRefineRound(); });
   card.addEventListener("keydown", onRefineKeydown);
-  // Only the live round answers to #refineCard; earlier rounds stay in the thread
-  // as the record of how the question got here.
-  for (const old of thread.querySelectorAll("#refineCard")) old.removeAttribute("id");
+  // Only the live round answers to these ids; earlier rounds stay in the thread
+  // as the record of how the question got here, but must stop answering to them.
+  // Their controls too: a disabled button from round one still holding
+  // #refineSubmit is what $() would hand back.
+  for (const stale of thread.querySelectorAll(
+    "#refineCard, #refineSubmit, #refineSkipAll, #refineDraft"
+  )) stale.removeAttribute("id");
   card.id = "refineCard";
   // A new round supersedes the brief that came with the last one. Leaving that
   // card on screen leaves a live Run button whose textarea belongs to the old
@@ -1993,6 +1997,15 @@ function refineFooter() {
 function renderBrief() {
   if (!refine.brief) return;
   refine.briefCard?.remove();
+  // The pointer is not enough: a finished run clears it while leaving the card
+  // in the thread as part of the record, so an earlier brief can still be
+  // holding these ids. Ids belong to the live brief, the transcript keeps the
+  // rest.
+  for (const stale of $("thread").querySelectorAll(
+    "#briefCard, #briefText, #briefRun, #briefOriginal, #briefMore, #briefModel,"
+    + " #briefEffort, #briefEditedNote, #briefCovers, #briefExcludes, #briefAssumed,"
+    + " #briefFocus"
+  )) stale.removeAttribute("id");
   const card = document.createElement("form");
   card.className = "msg brief";
   card.id = "briefCard";
@@ -2183,6 +2196,13 @@ async function restoreRefine() {
   refine.complexity = s.complexity;
   refine.coverage = s.coverage;
   refine.questions = s.questions || [];
+  // The chip has to match what will actually run. The folders were fixed when
+  // the session started and the server enforces them on the answer regardless,
+  // so showing yesterday's chip over a restored brief would state the wrong
+  // thing about a run already decided.
+  if (JSON.stringify(s.scope || []) !== JSON.stringify(state.scope)) {
+    setScope(s.scope || []);
+  }
 
   const thread = $("thread");
   if (qs(".empty", thread)) thread.innerHTML = "";
@@ -2235,14 +2255,18 @@ async function runAsk(question, opts = {}) {
   assistant.append(notices);
   // Stated on the answer itself, not only on the chip: scrolled back to weeks
   // later, "not in the data room" has to carry what the room was at the time.
-  if (state.scope.length) {
-    const names = state.scope.map((p) => p.replace(/\/$/, "").split("/").pop());
+  // Written from the run's own status event rather than from the chip, because
+  // the two can differ: a brief runs against the folders its refinement session
+  // was started with, whatever the chip says by the time Run is clicked.
+  const markScope = (scope) => {
+    if (!Array.isArray(scope) || !scope.length || qs(".scope-note", assistant)) return;
+    const names = scope.map((p) => p.replace(/\/$/, "").split("/").pop());
     assistant.insertBefore(
       el("div", "scope-note muted small",
          `Scoped to ${names.join(", ")} — documents elsewhere were not readable.`),
       think,
     );
-  }
+  };
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -2271,6 +2295,7 @@ async function runAsk(question, opts = {}) {
 
     const ctx = { notices, think, thinkBody, body };
     for await (const ev of sseStream(res)) {
+      if (ev.type === "status") markScope(ev.scope);
       if (handleCommonEvent(ev, ctx)) continue;
       switch (ev.type) {
         case "text_delta":

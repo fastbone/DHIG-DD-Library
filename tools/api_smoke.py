@@ -1296,6 +1296,45 @@ def main() -> int:
     _bdb.execute("DELETE FROM units WHERE doc_id=?", (_known_doc_id,))
     _bdb.execute("DELETE FROM documents WHERE id=?", (_known_doc_id,))
 
+    # An option that named documents and lost all of them is ungrounded: the
+    # model asserted evidence that does not exist. An option that never claimed
+    # any is a different thing — "an answer in chat" has no document behind it
+    # and is not supposed to — so only the first kind is dropped.
+    _mixed = json.loads(json.dumps(raw_round))
+    _mixed["questions"] = [{
+        "id": "q1", "question": "What should the output be?", "why": "w",
+        "kind": "single", "default": "an answer in chat",
+        "options": [
+            {"label": "an answer in chat", "detail": "fastest", "evidence": []},
+            {"label": "from the FY24 pack", "detail": "d", "evidence": ["deadbeefdeadbeef"]},
+        ],
+    }]
+    _labels = [o["label"] for o in _refine._coerce(_mixed, empty_probe)["questions"][0]["options"]]
+    check("an option whose every document was dropped does not reach the reader",
+          "from the FY24 pack" not in _labels, str(_labels))
+    check("an option that never claimed a document is kept",
+          "an answer in chat" in _labels, str(_labels))
+
+    # The brief was written against the folders the session started with, so
+    # those folders decide the run — not whatever the client posts alongside the
+    # id. A chip moved between the brief appearing and Run would otherwise
+    # answer it against a different corpus than its coverage was measured on.
+    _refine_id = "smokerefine99"
+    _bdb.execute(
+        "INSERT OR REPLACE INTO refine_rounds(id, refine_id, round, question, scope, answers,"
+        " payload, transcript, ready, coverage, usage, model, effort, actor, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("smokerr99", _refine_id, 1, "q", json.dumps(["/locked/folder"]), "[]", "{}", "[]",
+         1, 80, "{}", "claude-opus-5", "low", "alice", time.time()),
+    )
+    check("a session's folders are readable by the account that owns it",
+          _refine.session_scope(_refine_id, "alice") == (True, ["/locked/folder"]))
+    check("another account's session is not found rather than trusted",
+          _refine.session_scope(_refine_id, "dana") == (False, []))
+    check("an unknown session is not found rather than trusted",
+          _refine.session_scope("nosuchsession", "alice") == (False, []))
+    _bdb.execute("DELETE FROM refine_rounds WHERE refine_id=?", (_refine_id,))
+
     # A missing session is a 404, not someone else's brief.
     code, _, _ = admin.get("/api/refine/deadbeefdead")
     check("an unknown refinement session is not found", code == 404, f"got {code}")
