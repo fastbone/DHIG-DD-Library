@@ -554,8 +554,11 @@ service running.
 looks like the app ignoring it. The script compares the running container's
 environment against `.env` and recreates the container when they differ, even
 with no new commit, naming the variables that were not in effect (names only,
-never values). `--status` reports the same comparison, which is the first thing
-to check when the app is not honouring what `.env` says:
+never values). Deleting or commenting out a line counts as a difference too —
+the old value stays in the container until it is replaced, which is how
+`DD_ADMIN_RESET_PASSWORD=1` outlives being removed. `--status` reports the same
+comparison, and is the first thing to check when the app is not honouring what
+`.env` says:
 
 ```
 $ ./deploy/update.sh --status

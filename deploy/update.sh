@@ -22,7 +22,8 @@
 # container is *created*, so a `restart` keeps the old ones and a raised limit
 # silently does not apply. The script compares the running container's
 # environment against .env and recreates when they differ, rather than reporting
-# "nothing to do" for a change that has not taken effect.
+# "nothing to do" for a change that has not taken effect. Deleting a line counts
+# as a difference: the old value stays in the container until it is replaced.
 #
 # Run it as a user in the `docker` group, from the repository checkout. Safe to
 # put in cron: concurrent runs are serialised by a lock and a no-op update
@@ -45,9 +46,12 @@ STATUS_ONLY=0
 BACKUP_ONLY=0
 RECREATE=0
 HEALTH_TIMEOUT=180
-# Keys whose value in the running container differs from .env, filled in by
-# env_drift(). Names only — the file holds the admin password and the API key.
+# How the running container's environment differs from .env, filled in by
+# env_drift(): DRIFTED for a changed value, REMOVED for a key the container still
+# carries that .env no longer declares. Names only — the file holds the admin
+# password and the API key.
 DRIFTED=()
+REMOVED=()
 
 # --- output --------------------------------------------------------------
 
@@ -157,10 +161,13 @@ env_drift() {
   # raised, with nothing anywhere to say why. `up -d` normally notices, but only
   # if it is reached at all, and a no-op update used to exit before it.
   #
-  # Sets DRIFTED to the key names that differ and returns 0 when any do. Names
-  # only, never values: .env holds DD_ADMIN_PASSWORD and the API key, and this
-  # output goes to a terminal, a cron mail and whatever log collects it.
+  # Sets DRIFTED to the keys whose value differs and REMOVED to the keys the
+  # container still carries that .env no longer declares, and returns 0 when
+  # either is non-empty. Names only, never values: .env holds DD_ADMIN_PASSWORD
+  # and the API key, and this output goes to a terminal, a cron mail and whatever
+  # log collects it.
   DRIFTED=()
+  REMOVED=()
   [[ -f .env ]] || return 1
   local created created_epoch env_epoch
   created="$(docker inspect -f '{{.Created}}' "$SERVICE" 2>/dev/null || true)"
@@ -199,7 +206,43 @@ env_drift() {
     done
     [[ "$want" == "$got" ]] || DRIFTED+=("$key")
   done < .env
-  (( ${#DRIFTED[@]} > 0 ))
+
+  # The other direction. Deleting a line — or commenting it out — leaves the value
+  # in the running container, so the app goes on using a setting the file no longer
+  # mentions. DD_ADMIN_RESET_PASSWORD is the one that bites: removing it is exactly
+  # how you stop resetting the admin password on every restart.
+  #
+  # Only the app's own variables, and only where .env is the source. The image sets
+  # DD_DATA_DIR, DD_HOST and DD_PORT, and docker-compose.yml sets three more of its
+  # own; neither is .env's business, so a key either file supplies is left alone.
+  local -a image_env=()
+  local image
+  image="$(docker inspect -f '{{.Config.Image}}' "$SERVICE" 2>/dev/null || true)"
+  if [[ -n "$image" ]]; then
+    mapfile -t image_env < <(
+      docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$image" 2>/dev/null || true
+    )
+  fi
+  for entry in "${live[@]}"; do
+    key="${entry%%=*}"
+    [[ "$key" == DD_* || "$key" == ANTHROPIC_* ]] || continue
+    # Still declared in .env? Then the loop above has already judged it. An
+    # anchored match, so a commented-out line does not count as declared.
+    if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" .env; then
+      continue
+    fi
+    if grep -q "$key" docker-compose.yml; then
+      continue
+    fi
+    # Exactly what the image bakes in, rather than merely the same name: a value
+    # deleted from .env that shadowed an image default is still a change.
+    if [[ ${#image_env[@]} -gt 0 ]] && printf '%s\n' "${image_env[@]}" | grep -qxF "$entry"; then
+      continue
+    fi
+    REMOVED+=("$key")
+  done
+
+  (( ${#DRIFTED[@]} > 0 || ${#REMOVED[@]} > 0 ))
 }
 
 port_conflict() {
@@ -232,7 +275,8 @@ show_status() {
     info "env       no container to compare .env against"
   elif env_drift; then
     warn "env       .env has been edited since the container was created"
-    warn "          not yet in effect: ${DRIFTED[*]}"
+    (( ${#DRIFTED[@]} )) && warn "          not yet in effect: ${DRIFTED[*]}"
+    (( ${#REMOVED[@]} )) && warn "          still set in the container, gone from .env: ${REMOVED[*]}"
     warn "          apply with: ./deploy/update.sh  (or docker compose up -d)"
   else
     info "env       matches .env"
@@ -452,7 +496,8 @@ NEW_SHA="$(git rev-parse HEAD)"
 # is the container that has to be replaced.
 if env_drift; then
   warn "the running container's environment differs from .env — it will be recreated"
-  warn "changed: ${DRIFTED[*]}"
+  (( ${#DRIFTED[@]} )) && warn "changed: ${DRIFTED[*]}"
+  (( ${#REMOVED[@]} )) && warn "no longer in .env: ${REMOVED[*]}"
   RECREATE=1
 fi
 
