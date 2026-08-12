@@ -190,7 +190,16 @@ async def main() -> int:
     cits = pick_citations()
     print("using citations:", cits)
 
-    agent.ask = lambda question, **kw: canned(question, cits)  # type: ignore[assignment]
+    # The scope the browser actually sent, recorded where it lands: the route
+    # validates it and hands it to the agent, and that hand-off is the thing worth
+    # asserting — a chip that looks right while posting nothing is the failure.
+    asked: list[dict] = []
+
+    def _ask(question, **kw):
+        asked.append(kw)
+        return canned(question, cits)
+
+    agent.ask = _ask  # type: ignore[assignment]
 
     import uvicorn
 
@@ -214,8 +223,19 @@ async def main() -> int:
         )
         page = await browser.new_page(viewport={"width": 1500, "height": 1000})
         page.on("pageerror", lambda e: problems.append(f"pageerror: {e}"))
-        page.on("console", lambda m: problems.append(f"console.error: {m.text}")
-                if m.type == "error" else None)
+        # Some checks below refuse requests on purpose, and the browser logs every
+        # non-2xx as a console error. Those are the subject of the check, not a
+        # defect, so they are muted for exactly as long as they are expected.
+        expect_http = {"on": False}
+
+        def on_console(m):
+            if m.type != "error":
+                return
+            if expect_http["on"] and "Failed to load resource" in m.text:
+                return
+            problems.append(f"console.error: {m.text}")
+
+        page.on("console", on_console)
 
         # Sign in through the real login form.
         await page.goto(f"http://127.0.0.1:{PORT}/", wait_until="networkidle")
@@ -887,6 +907,244 @@ async def main() -> int:
         )
         await page.screenshot(path="/tmp/search-ask-mount.png", full_page=True)
 
+        # ── scoping a question to folders ─────────────────────────────────
+        checks["scope: the first question was asked against the whole corpus"] = (
+            bool(asked) and asked[0].get("scope") == []
+        )
+        await page.click('button[data-tab="ask"]')
+        checks["scope: the chip starts at the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(700)
+        rows = page.locator("#scopeTree .scope-row")
+        checks["scope: the chip opens a tree of folders that hold documents"] = (
+            await page.locator("#scopeModal.open").count() == 1 and await rows.count() >= 2
+        )
+        # The estimate is the reason to scope at all — the map is the standing
+        # per-turn cost, so its size has to be visible at the moment of choosing.
+        whole_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: the unscoped estimate states the map size and its cost per turn"] = (
+            "whole corpus" in whole_estimate and "tokens" in whole_estimate
+            and "per turn" in whole_estimate
+        )
+
+        # Pick the leaf folders, not the root: a scope that covers everything is
+        # indistinguishable from no scope and would prove nothing.
+        leaves = await page.evaluate(
+            """() => [...document.querySelectorAll('#scopeTree .scope-row')]
+                 .map((r, i) => ({i, depth: parseInt(r.style.paddingLeft) || 0,
+                                  path: r.querySelector('input').value}))
+                 .filter((r) => r.depth > 0).slice(0, 2)"""
+        )
+        for leaf in leaves:
+            await rows.nth(leaf["i"]).locator("input").check()
+        await page.wait_for_timeout(900)
+        scoped_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: ticking folders re-estimates against the selection"] = (
+            len(leaves) == 2 and " of " in scoped_estimate
+            and scoped_estimate != whole_estimate
+        )
+        await page.screenshot(path="/tmp/ask-scope.png", full_page=True)
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(300)
+        chip = await page.inner_text("#scopeChip")
+        checks["scope: the chip reports the selection and its document count"] = (
+            "2 folders" in chip and "docs" in chip
+            and await page.locator("#scopeModal.open").count() == 0
+        )
+
+        await page.fill("#question", "Is there anything about payroll in here?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            "() => document.getElementById('runMeta').textContent.includes('done in')",
+            timeout=30_000,
+        )
+        await page.wait_for_timeout(400)
+        checks["scope: a scoped question posts the folder prefixes"] = (
+            len(asked) >= 2
+            and asked[-1].get("scope") == [leaf["path"] for leaf in leaves]
+        )
+        # Scrolled back to weeks later, "not in the data room" has to carry what
+        # the room was at the time.
+        checks["scope: the answer says what it was allowed to see"] = (
+            "Scoped to" in await page.locator(".msg.assistant").last.inner_text()
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(600)
+        checks["scope: reopening the tree keeps the selection ticked"] = (
+            await page.locator("#scopeTree input:checked").count() == 2
+        )
+
+        # The estimate's replies race the same way the search box's do: ticking a
+        # third folder while the two-folder estimate is in flight must not leave
+        # the price of two under a selection of three.
+        # Only the first estimate is stalled; the one that follows it is answered
+        # live, so the fake reply necessarily lands second.
+        stalled = {"used": False}
+
+        async def stall_estimate(route):
+            if "scope=" in route.request.url and not stalled["used"]:
+                stalled["used"] = True
+                await asyncio.sleep(1.5)
+                await route.fulfill(
+                    status=200, content_type="application/json",
+                    body=json.dumps({"mode": "full", "chars": 1, "approx_tokens": 7777,
+                                     "n_indexed": 7777, "n_indexed_total": 7777,
+                                     "n_unindexed": 0, "scope": [], "rollup": {},
+                                     "cost_per_turn_usd": 0.0}),
+                )
+            else:
+                await route.continue_()
+
+        await page.route("**/api/manifest**", stall_estimate)
+        # Pinned by value, not by ":not(:checked)": locators re-resolve, and after
+        # the tick that selector points at a different box, so the uncheck would
+        # silently land on the wrong one — as a no-op, firing no second request.
+        spare = await page.locator(
+            "#scopeTree .scope-row input:not(:checked)").first.get_attribute("value")
+        third = page.locator(f'#scopeTree input[value="{spare}"]')
+        await third.check()                        # stalled request in flight
+        await page.wait_for_timeout(500)
+        await third.uncheck()                      # newer request, answered live
+        await page.wait_for_timeout(2000)
+        checks["scope: a stale estimate cannot overwrite a newer one"] = (
+            stalled["used"]
+            and await page.locator("#scopeTree input:checked").count() == 2
+            and "7,777" not in await page.inner_text("#scopeEstimate")
+        )
+        await page.unroute("**/api/manifest**", stall_estimate)
+
+        await page.click("#scopeClear")
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(200)
+        checks["scope: clearing returns to the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+
+        # A saved scope outlives the corpus it names — delete an extracted folder
+        # or re-point the app and the server rejects those prefixes, which without
+        # a prune leaves *every* question failing on a chip nobody suspects.
+        await page.evaluate(
+            """() => { setScope(["/nowhere/at/all", "/also/gone"]); }"""
+        )
+        checks["scope: a stale saved scope is restored before it is checked"] = (
+            "2 folders" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(800)
+        checks["scope: folders that no longer exist are dropped from a saved scope"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "no longer exist" in await page.inner_text("#toast")
+        )
+        await page.click("#scopeClose")
+        await page.wait_for_timeout(200)
+
+        # The corpus can also change between choosing a scope and asking, so the
+        # refusal itself has to recover. What it must never do is report a
+        # re-check that has not happened: the reader would ask again into the same
+        # refusal believing it was fixed. Folders is broken here on purpose.
+        async def break_folders(route):
+            await route.fulfill(status=500, content_type="application/json",
+                                body='{"error": "no"}')
+
+        expect_http["on"] = True
+        await page.route("**/api/corpus/folders", break_folders)
+        await page.evaluate("""() => { setScope(["/nowhere/at/all"]); }""")
+        await page.fill("#question", "anything?")
+        await page.click("#askBtn")
+        await page.wait_for_timeout(1200)
+        notice = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: a refused scope is not reported as re-checked when it was not"] = (
+            "could not be re-read" in notice and "narrowed" not in notice
+            # …and the chip still says what it still is.
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", break_folders)
+
+        # Now with the folder list reachable but slow: the message may only appear
+        # once the re-check has finished, or a quick retry posts the stale prefixes
+        # again. The chip must already be clear by the time the reader is told.
+        async def slow_folders(route):
+            await asyncio.sleep(1.2)
+            await route.continue_()
+
+        await page.route("**/api/corpus/folders", slow_folders)
+        await page.fill("#question", "anything at all?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        # Every folder in that scope was dead, so the retry would run against the
+        # *whole* library — the message has to say that rather than "narrowed",
+        # which would understate what the next answer can see.
+        widened = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: the reader is told only after the scope has actually changed"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "the scope is now the whole corpus" in widened
+            and "narrowed" not in widened
+        )
+        await page.unroute("**/api/corpus/folders", slow_folders)
+
+        # A scope that is partly dead is narrowed, not cleared, and must say so:
+        # "narrowed" and "cleared" leave the next answer looking at very different
+        # amounts of the library, so one message cannot serve both.
+        live = await page.evaluate(
+            """() => scopeFolders.find((f) => f.depth > 0)?.path || null"""
+        )
+        await page.evaluate(
+            """(live) => { setScope([live, "/gone/for/good"]); }""", live
+        )
+        await page.fill("#question", "and now?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        partial = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: a partly dead scope is narrowed, not silently widened"] = (
+            bool(live)
+            and "narrowed to the 1 folder" in partial
+            and "whole corpus" not in partial
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+
+        # And with no corpus roots left at all, "those folders are still offered"
+        # is simply false — every ask would keep failing on a chip the reader was
+        # told was fine.
+        async def no_roots(route):
+            await route.fulfill(status=200, content_type="application/json",
+                                body=json.dumps({"folders": [], "roots": []}))
+
+        await page.route("**/api/corpus/folders", no_roots)
+        # The narrowing above left a live folder, which the server accepts — so
+        # give it a dead one again, or there is no refusal to recover from.
+        await page.evaluate("""() => { setScope(["/nothing/here/either"]); }""")
+        await page.fill("#question", "last try?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        rootless = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: losing every corpus root is not reported as folders still offered"] = (
+            "no longer knows of any corpus folder" in rootless
+            and "still offers" not in rootless
+            and "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", no_roots)
+        expect_http["on"] = False
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -939,7 +1197,8 @@ async def main() -> int:
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
           "/tmp/admin-budgets.png /tmp/sync-detail.png /tmp/sync-detail-live.png "
-          "/tmp/search-tab.png /tmp/search-ask-mount.png /tmp/help-sharepoint.png")
+          "/tmp/search-tab.png /tmp/search-ask-mount.png /tmp/ask-scope.png "
+          "/tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

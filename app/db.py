@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS qa_log (
     created_at  REAL NOT NULL
 );
 
+-- Which folders one question was allowed to see. A separate table rather than a
+-- qa_log column because the schema is applied as one pass of CREATE TABLE IF NOT
+-- EXISTS with no migration step: a new column would never appear on an existing
+-- database. Absent row = the whole corpus, which is also every question asked
+-- before folder scoping existed.
+CREATE TABLE IF NOT EXISTS qa_scopes (
+    qa_id       TEXT PRIMARY KEY,
+    scope       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,

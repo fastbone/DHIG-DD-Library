@@ -1192,10 +1192,69 @@ async def api_search(
     }
 
 
+@app.get("/api/corpus/folders")
+async def api_folders():
+    """The folder tree a question can be scoped to, with per-folder counts.
+
+    Signed in, not admin: choosing what a question may see is part of asking one.
+    """
+    roots = [r["path"] for r in storage.known_roots()]
+    return {"folders": search.folder_tree(roots), "roots": roots}
+
+
+def validated_scope(scope: list[str]) -> list[str]:
+    """Every prefix must sit inside a root the app knows about.
+
+    A scope is only ever a filter over paths already in the database, so an
+    unknown prefix cannot leak anything — it would simply match nothing. It is
+    rejected anyway, because a silently empty corpus reads as an empty data room,
+    and that is the one thing this feature exists to keep the reader from
+    concluding by accident.
+    """
+    roots = [Path(r["path"]) for r in storage.known_roots()]
+    out: list[str] = []
+    for raw in scope:
+        prefix = (raw or "").strip()
+        if not prefix:
+            continue
+        # No resolve(): these are paths recorded at ingest, and a root that has
+        # since been unmounted must still be selectable in the question log's terms.
+        target = Path(prefix)
+        if not any(target == r or security.is_within(target, r) for r in roots):
+            raise HTTPException(
+                400, f"folder is outside every known corpus root: {prefix}"
+            )
+        out.append(str(target))
+    return out
+
+
 @app.get("/api/manifest")
-async def api_manifest(full: bool = False):
-    m = manifest.build()
-    out = {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed", "rollup")}
+async def api_manifest(full: bool = False, scope: str | None = None):
+    # `scope` is a JSON array so the estimate shown next to the folder picker is
+    # the same figure the question will actually pay for.
+    prefixes: list[str] = []
+    if scope:
+        try:
+            parsed = json.loads(scope)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "scope must be a JSON array of paths") from exc
+        if not isinstance(parsed, list):
+            raise HTTPException(400, "scope must be a JSON array of paths")
+        prefixes = validated_scope([str(p) for p in parsed])
+    m = manifest.build(prefixes)
+    out = {
+        k: m[k]
+        for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed",
+                  "n_indexed_total", "scope", "rollup")
+    }
+    # The standing per-turn cost of carrying this map, priced the same way the
+    # Indexing tab prices the full one — so the saving from a scope is visible at
+    # the moment of choosing it rather than a week later on the bill.
+    out["cost_per_turn_usd"] = round(
+        m["approx_tokens"] * pricing.PRICES.get(settings.analyst_model, (5, 25))[0]
+        * pricing.CACHE_READ_MULTIPLIER / 1_000_000,
+        4,
+    )
     if full:
         out["text"] = m["text"]
     return out
@@ -1209,20 +1268,29 @@ class AskBody(BaseModel):
     history: list[dict] = []
     verify: bool = True
     effort: str | None = None
+    scope: list[str] = []
 
 
 @app.post("/api/ask")
 async def ask(body: AskBody, request: Request):
+    # Validated before the stream opens: an SSE body cannot carry a 400, and a
+    # rejected scope inside the stream would surface as a failed answer. Before
+    # the credentials gate too — a request this app would refuse whatever its
+    # configuration should be told which of the two problems is its own.
+    scope = validated_scope(body.scope)
     if not credentials.available():
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
-    db.audit("ask", actor=actor(request), detail=body.question[:300])
+    db.audit(
+        "ask", actor=actor(request),
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
 
     who = actor(request)
 
     async def gen():
         async for event in agent.ask(
             body.question, history=body.history, do_verify=body.verify, effort=body.effort,
-            actor=who,
+            actor=who, scope=scope,
         ):
             yield sse(event)
 
@@ -1237,12 +1305,16 @@ async def ask(body: AskBody, request: Request):
 async def qa_log(limit: int = 50):
     out = []
     for r in db.rows(
-        "SELECT id, question, answer, citations, verdicts, usage, duration_s, created_at"
-        " FROM qa_log ORDER BY created_at DESC LIMIT ?",
+        "SELECT q.id, q.question, q.answer, q.citations, q.verdicts, q.usage, q.duration_s,"
+        " q.created_at, s.scope FROM qa_log q"
+        " LEFT JOIN qa_scopes s ON s.qa_id = q.id"
+        " ORDER BY q.created_at DESC LIMIT ?",
         (min(limit, 200),),
     ):
         d = dict(r)
-        for k in ("citations", "verdicts", "usage"):
+        # A past "not in the data room" is uninterpretable without knowing what the
+        # question was allowed to see, so the scope travels with the log entry.
+        for k in ("citations", "verdicts", "usage", "scope"):
             try:
                 d[k] = json.loads(d[k] or "[]")
             except (json.JSONDecodeError, TypeError):

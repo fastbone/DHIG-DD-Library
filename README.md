@@ -131,6 +131,9 @@ citation opens the source document at that exact page. With verification on,
 each cited claim is re-checked against its cited span by a second model and
 badged `supported` / `partial` / `unsupported`.
 
+The **scope** chip beside *effort* limits one question to part of the library —
+any number of folders, at any depth. See *Scoping a question to folders* below.
+
 **Deliverables tab** — Word, Excel, PowerPoint and Markdown documents the
 analyst generated, plus the question log: every question, its citations, its
 verdicts and its cost.
@@ -306,6 +309,67 @@ where it stands. Sweeps get no overrun and need none.
 Everyone sees their own position: when a cap applies, the header carries a
 `this week $3.40 / $4.00` pill that turns amber near the limit, so the number is
 not something you first learn by being refused.
+
+## Scoping a question to folders
+
+By default the assistant carries a one-line card for **every** indexed document
+in its context. That is what makes it aware of the whole library without ever
+loading it — and it is also a standing per-turn cost and a standing distraction.
+The *scope* chip on the Ask tab narrows one question to a chosen set of folders:
+
+- **Precision.** A question about the SPA should not have four thousand HR
+  documents in the map competing for attention.
+- **Cost.** The map is paid for on every turn. A 250K-token map is ~$0.12 a turn
+  at cache-read rates; a 20K-token subfolder map is ~$0.01. The picker shows both
+  figures — documents, tokens, dollars per turn — as you tick folders, so the
+  saving is visible at the moment of choosing rather than a week later.
+- **Honesty.** "Not in the data room" becomes "not in the folders you selected",
+  which is a narrower and more useful finding.
+
+The tree offers only folders that actually contain indexed documents, with a
+count on each, and is built by grouping the paths already in the catalogue rather
+than by walking the disk — a folder full of files that failed to extract would
+otherwise be a trap. Counts are per document and deduplicated across a folder's
+subtree.
+
+**The scope narrows the map and is enforced in the tool dispatcher, not merely
+described to the model.** `search_corpus` and `list_documents` are filtered;
+`read_document` and `document_card` refuse an out-of-scope id in words ("that
+document is outside the folders selected for this question") so the model reports
+the limit instead of guessing at a gap; a card's near-duplicate family is filtered
+too, since that list is *other documents* and handing over their ids gives the
+model something to cite that it cannot open; `run_python` is handed a corpus map
+containing only in-scope documents, since otherwise the scope would be bypassable
+in three lines of Python; and verification will not open an out-of-scope citation,
+because that pass takes the doc_id in the answer on trust. Describing a scope without enforcing it
+would be worse than not having one: the model would cite documents it could not
+open and mis-state what it had looked at.
+
+Matching is on `abs_path`, not `rel_path` — the latter is relative to whichever
+root was active at ingest and collides between corpora. A document counts as
+in scope if **any** of its filings is: documents are content-addressed, so
+identical bytes in two folders are one row whose canonical path is wherever it
+was seen first, and matching only that path would hide a document that genuinely
+sits in the folder the reader picked.
+
+A stored scope outlives the corpus it names: delete an extracted folder or
+re-point the app and its prefixes are no longer inside any known root, so the
+browser re-checks them against the roots whenever it loads the tree, drops what
+is gone, and says so — silently answering against more of the library than the
+reader chose would be the worst available outcome. A refusal from `/api/ask`
+re-checks the scope too, for a corpus that changed between choosing and asking,
+and it waits for that re-check before reporting it: claiming a scope has been
+fixed when the folder list could not even be re-read sends the reader straight
+back into the same refusal. Which outcome it was matters as much as that it
+happened, so `pruneScope` returns the outcome rather than a count — narrowed,
+cleared, no roots left, nothing to drop, could not look — and each has its own
+sentence. "Narrowed" and "cleared" in particular are not interchangeable: a
+retry after a clear runs against the whole library, and the reader has to be
+told that before they ask again.
+
+A scope is sticky for the browser session, echoed on the answer itself, and
+recorded against the question in the Deliverables log — because a past
+"not found" is uninterpretable without knowing what that question could see.
 
 ## Accounts and access
 
@@ -737,9 +801,9 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 89 checks: auth, CSRF, keys, uploads, access, sync, storage
-python3 tools/sync_smoke.py           # 68 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 36 checks: the browser front end, end to end
+python3 tools/api_smoke.py            # 190 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
+python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
+python3 tools/ui_smoke.py             # 109 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 
@@ -751,7 +815,14 @@ immediately, a stored API key round-trips through encryption and is never echoed
 back, an archive with a `../` member extracts its safe files and refuses the
 rest, browsing outside the permitted roots is refused — as is naming such a path
 directly to the corpus-root and ingest routes — and every privileged action
-lands in the audit log. It also pins the ingest walk: a folder named `data` is
+lands in the audit log. Folder scoping is pinned here too: the tree offers only
+folders that hold indexed documents (and not the host's directories above the
+root), a scoped map is smaller than the full one and its header names both the
+scope and the fraction it covers, an out-of-scope `read_document` is refused in
+words, `run_python` sees only in-scope documents, a prefix outside every known
+root is a 400 before the answer stream opens, and a document filed both inside
+and outside a scope is in scope — the dedupe interaction that is easy to get
+backwards. It also pins the ingest walk: a folder named `data` is
 scanned like any other, the app's own text mirror never re-enters the corpus as
 source material, and an unreadable folder is reported rather than skipped in
 silence.
@@ -772,7 +843,9 @@ streaming answer, reasoning panel, tool trace, citation chips that open the
 source at the cited page, verdict badges, artifact download, the admin surfaces,
 a drag-and-drop archive upload through to extraction, and the connected-library
 pane — including that a sync event drives the sync progress bar and not the
-indexing one. Screenshots land in `/tmp`. Requires `pip install playwright` and a
+indexing one. On the search box it pins that a stale response cannot overwrite
+newer hits; on the scope chip, that ticking folders re-prices the map and that a
+scoped question actually posts its prefixes. Screenshots land in `/tmp`. Requires `pip install playwright` and a
 Chromium binary (set `DD_CHROMIUM` if it is not at `/opt/pw-browsers/chromium`).
 
 `container_check.sh` recreates the image's constraints without Docker — a
@@ -790,8 +863,8 @@ unprivileged account.
 app/
   config.py       settings, supported formats, workstream taxonomy, browse roots
   db.py           SQLite schema (documents, units + FTS5, occurrences, jobs,
-                  qa_log, users, sessions, api_keys, archives, sync_connections,
-                  audit, logs, spend, user_budgets, sync_runs)
+                  qa_log, qa_scopes, users, sessions, api_keys, archives,
+                  sync_connections, audit, logs, spend, user_budgets, sync_runs)
   security.py     scrypt password hashing, session tokens, AES-GCM at rest
   auth.py         users, sessions, roles, login throttle, route guards
   credentials.py  API key storage and Anthropic client construction
@@ -804,7 +877,8 @@ app/
                   history, scheduling
   storage.py      disk usage and the reclaim operations
   manifest.py     the sweep (one card per document) and the corpus map
-  search.py       BM25 search, catalogue browsing, corpus statistics
+  search.py       BM25 search, catalogue browsing, the folder tree and the
+                  scope filter, corpus statistics
   tools.py        the analyst's tool definitions and handlers
   agent.py        the streaming tool loop, system prompt, citation parsing
   verify.py       re-read each cited span and judge the claim
@@ -832,6 +906,15 @@ deploy/
 map, with the cache breakpoint on the map. Tool definitions are kept in a fixed
 sorted order and the map is rebuilt only after a sweep, because any byte change
 in that prefix throws away the cache that makes the whole approach affordable.
+
+**A question's scope is enforced, not announced.** `tools.dispatch` takes the
+scope and applies it to every tool that can reach a document; `manifest.build`
+takes it and shrinks the map. Adding a new tool means deciding what the scope
+means for it. A tool that quietly ignores it hands the model documents the reader
+excluded, which is worse than having no scope at all — the answer would cite
+files it was told it could not see. Note the limit of the guarantee: `run_python`
+gets a scoped corpus map, but the subprocess still has a filesystem, so the scope
+is an attention boundary and not a sandbox (see *Security and confidentiality*).
 
 **Documents are content-addressed** (`sha256[:16]`). This is what makes ingest
 resumable and idempotent, and it is why exact duplicates cannot exist as

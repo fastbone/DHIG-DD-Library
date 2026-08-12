@@ -1316,6 +1316,220 @@ $("question").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("askForm").requestSubmit();
 });
 
+/* ── question scope: which folders the assistant may see ──────────────── */
+// Sticky for the browser session, not the account: a scope belongs to the piece
+// of work in front of you, and inheriting yesterday's on a fresh sign-in would
+// silently narrow a question nobody meant to narrow.
+const SCOPE_KEY = "dd.scope";
+state.scope = (() => {
+  try { return JSON.parse(sessionStorage.getItem(SCOPE_KEY) || "[]"); } catch { return []; }
+})();
+let scopeDraft = [];
+let scopeFolders = [];
+let scopeEstimateTimer = null;
+let scopeEstimateIssued = 0;
+
+// A stored scope outlives the corpus it names. Delete an extracted folder, or
+// re-point the app, and the saved prefixes are no longer inside any known root —
+// at which point the server rejects them and *every* question 400s until someone
+// thinks to clear the chip by hand. So the restored scope is checked against the
+// roots the server will check it against, and anything gone is dropped.
+// Returns *what happened*, not a count. Two rounds of review went on this
+// function because a single number cannot distinguish outcomes that read
+// differently to the reader — "narrowed" and "cleared" send a retry against very
+// different amounts of the library, and "nothing to drop" and "there are no roots
+// at all" are opposite facts. One state, one sentence, one source of truth for
+// both the toast and the message on a refused question.
+//   not_scoped | unknown | no_roots | unchanged | narrowed | cleared
+function pruneScope(roots) {
+  if (!state.scope.length) return { kind: "not_scoped" };
+  // The caller could not read the list; it must not be treated as "no roots".
+  if (!Array.isArray(roots)) return { kind: "unknown" };
+  const before = state.scope.length;
+  // Said out loud in every case that changes the scope, never silently: the
+  // alternative is a question quietly answered against more of the library than
+  // the reader chose.
+  if (!roots.length) {
+    setScope([]);
+    toast("No corpus folders are configured any more — back to the whole corpus.", true);
+    return { kind: "no_roots", lost: before };
+  }
+  const inside = (p) => roots.some((r) => {
+    const root = r.replace(/\/$/, "");
+    return p === root || p.startsWith(root + "/");
+  });
+  const kept = state.scope.filter(inside);
+  if (kept.length === before) return { kind: "unchanged" };
+  const lost = before - kept.length;
+  setScope(kept);
+  toast(
+    `${lost} folder${lost === 1 ? "" : "s"} in your saved scope no longer exist — ` +
+    (kept.length ? "scope narrowed to what is left." : "back to the whole corpus."),
+    true,
+  );
+  return kept.length ? { kind: "narrowed", lost, kept: kept.length } : { kind: "cleared", lost };
+}
+
+function setScope(paths) {
+  state.scope = paths;
+  sessionStorage.setItem(SCOPE_KEY, JSON.stringify(paths));
+  renderScopeChip();
+}
+
+// Re-check the saved scope after the server has refused it, and return what to
+// tell the reader — one sentence per outcome, each of them true. Where the scope
+// widened, the sentence says so: a reader who retries needs to know the answer
+// will now come from more of the library than they picked.
+const SCOPE_RECHECK_NOTE = {
+  narrowed: (r) =>
+    `the scope has been narrowed to the ${r.kept} folder${r.kept === 1 ? "" : "s"}`
+    + " that still exist; ask again.",
+  cleared: () =>
+    "none of those folders exist any more, so the scope is now the whole corpus —"
+    + " ask again only if that is what you want.",
+  no_roots: () =>
+    "the app no longer knows of any corpus folder, so the scope has been cleared"
+    + " and the whole library is in play.",
+  unchanged: () =>
+    "the folder list still offers those folders, so this looks like a server-side"
+    + " change; clear the scope chip to ask against the whole corpus.",
+  not_scoped: () => "the scope is already empty; ask again.",
+  unknown: () =>
+    "the folder list could not be re-read, so the scope is unchanged; clear the"
+    + " scope chip to ask against the whole corpus.",
+};
+
+async function recheckScope() {
+  let roots;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+    roots = r.roots;
+  } catch {
+    roots = undefined;   // → "unknown": could not look, rather than "no roots"
+  }
+  const outcome = pruneScope(roots);
+  return (SCOPE_RECHECK_NOTE[outcome.kind] || SCOPE_RECHECK_NOTE.unknown)(outcome);
+}
+
+function scopeCount(paths) {
+  // Nested selections would double-count, and a parent already covers its
+  // children, so count only the outermost picks.
+  const outer = paths.filter((p) => !paths.some((q) => q !== p && p.startsWith(q.replace(/\/$/, "") + "/")));
+  return outer.reduce(
+    (n, p) => n + (scopeFolders.find((f) => f.path === p)?.n_indexed || 0), 0);
+}
+
+function renderScopeChip() {
+  const chip = $("scopeChip");
+  if (!chip) return;
+  const n = state.scope.length;
+  chip.classList.toggle("on", n > 0);
+  if (!n) {
+    chip.textContent = "scope: whole corpus";
+    chip.title = "Limit this question to part of the library";
+    return;
+  }
+  const docs = scopeCount(state.scope);
+  chip.textContent = `scope: ${n} folder${n === 1 ? "" : "s"}${docs ? ` · ${nfmt(docs)} docs` : ""}`;
+  chip.title = state.scope.join("\n");
+}
+
+function scopeDraftPaths() {
+  return [...document.querySelectorAll("#scopeTree input:checked")].map((i) => i.value);
+}
+
+async function updateScopeEstimate() {
+  // Debouncing only delays the starts; the replies still race. Ticking a third
+  // folder while the two-folder estimate is in flight must not leave the price of
+  // two folders under a selection of three.
+  const mine = ++scopeEstimateIssued;
+  const paths = scopeDraftPaths();
+  const box = $("scopeEstimate");
+  box.textContent = "estimating…";
+  try {
+    const q = paths.length ? `?scope=${encodeURIComponent(JSON.stringify(paths))}` : "";
+    const m = await api(`/api/manifest${q}`);
+    if (mine !== scopeEstimateIssued) return;
+    const total = m.n_indexed_total ?? m.n_indexed;
+    box.innerHTML = paths.length
+      ? `${nfmt(m.n_indexed)} of ${nfmt(total)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`
+      : `whole corpus: ${nfmt(m.n_indexed)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`;
+  } catch (e) {
+    if (mine !== scopeEstimateIssued) return;
+    box.textContent = e.message;
+  }
+}
+
+function renderScopeTree() {
+  const tree = $("scopeTree");
+  if (!scopeFolders.length) {
+    tree.innerHTML = `<span class="muted small">No indexed folders yet.</span>`;
+    return;
+  }
+  tree.innerHTML = "";
+  let currentRoot = null;
+  for (const f of scopeFolders) {
+    if (f.root !== currentRoot) {
+      currentRoot = f.root;
+      if (f.depth > 0) tree.append(el("div", "scope-root muted small", currentRoot));
+    }
+    const row = el("label", "scope-row");
+    row.style.paddingLeft = `${f.depth * 18}px`;
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.value = f.path;
+    cb.checked = scopeDraft.includes(f.path);
+    cb.onchange = () => {
+      clearTimeout(scopeEstimateTimer);
+      scopeEstimateTimer = setTimeout(updateScopeEstimate, 250);
+    };
+    row.append(cb);
+    row.append(el("span", "n", f.name || f.path));
+    row.append(el("span", "tag dupe", `${nfmt(f.n_indexed)} indexed`));
+    if (f.n_documents > f.n_indexed) {
+      row.append(el("span", "tag", `${nfmt(f.n_documents - f.n_indexed)} not indexed`));
+    }
+    tree.append(row);
+  }
+}
+
+async function openScopeModal() {
+  scopeDraft = [...state.scope];
+  $("scopeModal").classList.add("open");
+  $("scopeTree").innerHTML = `<span class="muted small">loading…</span>`;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+    pruneScope(r.roots);
+    scopeDraft = [...state.scope];
+  } catch (e) {
+    $("scopeTree").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+    return;
+  }
+  renderScopeTree();
+  updateScopeEstimate();
+}
+
+function closeScopeModal() {
+  $("scopeModal").classList.remove("open");
+}
+
+$("scopeChip").onclick = openScopeModal;
+$("scopeClose").onclick = closeScopeModal;
+$("scopeModal").onclick = (e) => { if (e.target.id === "scopeModal") closeScopeModal(); };
+$("scopeClear").onclick = () => {
+  for (const cb of document.querySelectorAll("#scopeTree input")) cb.checked = false;
+  updateScopeEstimate();
+};
+$("scopeApply").onclick = () => {
+  setScope(scopeDraftPaths());
+  closeScopeModal();
+};
+renderScopeChip();
+
 $("askForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (state.running) return;
@@ -1348,6 +1562,16 @@ $("askForm").addEventListener("submit", async (e) => {
   // wiped by the next token — which is the opposite of the point.
   const notices = el("div", "notices");
   assistant.append(notices);
+  // Stated on the answer itself, not only on the chip: scrolled back to weeks
+  // later, "not in the data room" has to carry what the room was at the time.
+  if (state.scope.length) {
+    const names = state.scope.map((p) => p.replace(/\/$/, "").split("/").pop());
+    assistant.insertBefore(
+      el("div", "scope-note muted small",
+         `Scoped to ${names.join(", ")} — documents elsewhere were not readable.`),
+      think,
+    );
+  }
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -1366,9 +1590,24 @@ $("askForm").addEventListener("submit", async (e) => {
       body: JSON.stringify({
         question, history: state.history,
         verify: $("verifyToggle").checked, effort: $("effort").value,
+        scope: state.scope,
       }),
     });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) {
+      const detail = (await res.text()) || res.statusText;
+      // The corpus can be re-pointed or an extracted folder deleted between
+      // choosing a scope and asking. Recover here rather than leaving every
+      // question failing on a chip nobody suspects.
+      if (res.status === 400 && detail.includes("outside every known corpus root")) {
+        // Awaited, and the message says what actually happened. Reporting a
+        // re-check that is still in flight — or that failed — would send the
+        // reader straight back into the same refusal believing it was fixed.
+        // Awaiting also closes the retry window: `state.running` is still set,
+        // so nothing can post the stale prefixes while this resolves.
+        throw new Error(`${detail} — ${await recheckScope()}`);
+      }
+      throw new Error(detail);
+    }
 
     for await (const ev of sseStream(res)) {
       switch (ev.type) {
@@ -1578,9 +1817,16 @@ async function loadQaLog() {
     for (const e of r.entries) {
       const bad = (e.verdicts || []).filter((v) => v.verdict === "unsupported" || v.verdict === "partial").length;
       const n = el("div", "qa-entry");
+      // The scope belongs on the log line: an answer that found nothing means
+      // something different depending on how much of the library it could open.
+      const scope = e.scope || [];
+      const scopeTag = scope.length
+        ? `<span class="tag" title="${esc(scope.join("\n"))}">scoped: ${
+            esc(scope.map((p) => p.replace(/\/$/, "").split("/").pop()).join(", ").slice(0, 60))}</span> · `
+        : "";
       n.innerHTML = `<div class="q">${esc(e.question.slice(0, 190))}</div>
         <div class="muted small">${new Date(e.created_at * 1000).toLocaleString()} ·
-        ${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
+        ${scopeTag}${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
         ${money(e.usage?.cost_usd)} · ${Number(e.duration_s || 0).toFixed(0)}s</div>`;
       const detail = el("div", "body hidden");
       detail.innerHTML = renderMarkdown(e.answer || "");
@@ -2127,6 +2373,13 @@ refreshStatus().then(() => {
   searchMounts.corpus = searchPanel("searchCorpusMount", { compact: true });
   searchMounts.ask = searchPanel("searchAskMount", { compact: true });
 });
+// A scope restored from the session has paths but no counts; the chip needs the
+// counts to say how much of the library the next question can actually see.
+if (state.scope.length) {
+  api("/api/corpus/folders")
+    .then((r) => { scopeFolders = r.folders || []; pruneScope(r.roots); renderScopeChip(); })
+    .catch(() => {});
+}
 loadDocs();
 loadArchives();
 loadConnections();
