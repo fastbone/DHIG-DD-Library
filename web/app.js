@@ -160,6 +160,10 @@ async function refreshStatus() {
   if (wsSel.options.length <= 1) {
     for (const w of s.workstreams) wsSel.append(new Option(w, w));
   }
+  // Same refill-if-empty rule for the search filters. They are mounted after the
+  // first status call, but that call can fail — and then the taxonomy has to
+  // arrive with a later poll or the filter stays permanently empty.
+  for (const panel of Object.values(searchMounts)) panel?.fillWorkstreams?.();
 
   $("manifestStats").innerHTML = [
     ["mode", s.manifest.mode],
@@ -2016,16 +2020,25 @@ function searchPanel(mount, { compact = false } = {}) {
   const ws = qs(".search-ws", box);
   const fam = qs(".search-family", box);
 
-  if (ws) {
-    // Populated from whatever the corpus actually contains, like the docs filter.
+  // Populated from whatever the corpus actually contains, like the docs filter.
+  // Re-callable, and a no-op once filled, because the first status call can fail.
+  function fillWorkstreams() {
+    if (!ws || ws.options.length > 1) return;
     for (const w of state.status?.workstreams || []) {
       const o = el("option", null, w);
       o.value = w;
       ws.append(o);
     }
   }
+  fillWorkstreams();
+
+  // Every keystroke starts a request and they do not come back in order. Only the
+  // newest one may write to the DOM, or a slow response for "ind" lands on top of
+  // the hits for "indemnity" — or on top of the cleared box.
+  let issued = 0;
 
   async function run() {
+    const mine = ++issued;
     const q = input.value.trim();
     if (q.length < 2) {
       // "Nothing typed yet" and "nothing matched" are different states, and telling
@@ -2040,6 +2053,7 @@ function searchPanel(mount, { compact = false } = {}) {
     note.textContent = "searching…";
     try {
       const r = await api(`/api/search?${p}`);
+      if (mine !== issued) return;
       const first = r.hits[0];
       if (first?.error) {
         note.textContent = "";
@@ -2056,6 +2070,7 @@ function searchPanel(mount, { compact = false } = {}) {
       }
       for (const h of r.hits) hits.append(searchHit(h, compact));
     } catch (e) {
+      if (mine !== issued) return;
       note.textContent = "";
       hits.innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
     }
@@ -2067,7 +2082,7 @@ function searchPanel(mount, { compact = false } = {}) {
   if (ws) ws.onchange = run;
   if (fam) fam.onchange = run;
   run();
-  return { run, focus: () => input.focus() };
+  return { run, focus: () => input.focus(), fillWorkstreams };
 }
 
 function searchHit(h, compact) {

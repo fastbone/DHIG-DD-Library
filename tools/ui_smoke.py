@@ -813,6 +813,56 @@ async def main() -> int:
             "no passage matches" in (await page.inner_text("#searchFullMount")).lower()
         )
 
+        # Responses do not come back in the order the keystrokes went out. A slow
+        # one for an abandoned query must not overwrite the newer results — nor the
+        # cleared box. Stall exactly the abandoned query and let the newer one pass.
+        async def stall_stale(route):
+            if "q=aaaaaa&" in route.request.url or route.request.url.endswith("q=aaaaaa"):
+                await asyncio.sleep(1.5)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"query": "aaaaaa", "hits": [], "n_hits": 7777,
+                                     "n_documents": 7777}),
+                )
+            else:
+                await route.continue_()
+
+        await page.route("**/api/search?**", stall_stale)
+        await page.fill("#searchFullMount .search-q", "aaaaaa")
+        await page.wait_for_timeout(500)          # request in flight, still stalled
+        await page.fill("#searchFullMount .search-q", "revenue")
+        await page.wait_for_timeout(1600)         # newer lands, then the stale one
+        checks["search: a stale response cannot overwrite newer hits"] = (
+            "7,777" not in await page.inner_text("#searchFullMount .search-note")
+            and await page.locator("#searchFullMount .search-hit").count() >= 1
+        )
+        await page.fill("#searchFullMount .search-q", "aaaaaa")
+        await page.wait_for_timeout(500)
+        await page.fill("#searchFullMount .search-q", "")   # cleared while in flight
+        await page.wait_for_timeout(1600)
+        checks["search: a stale response cannot overwrite the cleared box"] = (
+            "two characters"
+            in (await page.inner_text("#searchFullMount .search-hits")).lower()
+        )
+        await page.unroute("**/api/search?**", stall_stale)
+
+        # The filters are populated at mount from the first status call — which can
+        # fail. Then the taxonomy has to arrive with a later poll, exactly as the
+        # Documents filter already does, or the filter is empty for the session.
+        refill = await page.evaluate(
+            """async () => {
+                 const sel = document.querySelector('#searchFullMount .search-ws');
+                 for (const o of [...sel.options].slice(1)) o.remove();
+                 const before = sel.options.length;
+                 await refreshStatus();
+                 return {before, after: sel.options.length};
+               }"""
+        )
+        checks["search: a later status poll refills an empty workstream filter"] = (
+            refill["before"] == 1 and refill["after"] > 1
+        )
+
         # All three mounts are the same component; a mount that was never wired is
         # the failure this catches.
         for mount, tab in (("searchCorpusMount", "corpus"), ("searchAskMount", "ask")):
