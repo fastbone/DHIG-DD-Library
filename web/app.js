@@ -1322,13 +1322,13 @@ let scopeEstimateIssued = 0;
 // thinks to clear the chip by hand. So the restored scope is checked against the
 // roots the server will check it against, and anything gone is dropped.
 function pruneScope(roots) {
-  if (!state.scope.length || !Array.isArray(roots) || !roots.length) return;
+  if (!state.scope.length || !Array.isArray(roots) || !roots.length) return 0;
   const inside = (p) => roots.some((r) => {
     const root = r.replace(/\/$/, "");
     return p === root || p.startsWith(root + "/");
   });
   const kept = state.scope.filter(inside);
-  if (kept.length === state.scope.length) return;
+  if (kept.length === state.scope.length) return 0;
   const lost = state.scope.length - kept.length;
   setScope(kept);
   // Said out loud, never silently: the alternative is a question quietly
@@ -1338,12 +1338,32 @@ function pruneScope(roots) {
     (kept.length ? "scope narrowed to what is left." : "back to the whole corpus."),
     true,
   );
+  return lost;
 }
 
 function setScope(paths) {
   state.scope = paths;
   sessionStorage.setItem(SCOPE_KEY, JSON.stringify(paths));
   renderScopeChip();
+}
+
+// Re-check the saved scope after the server has refused it, and return what to
+// tell the reader — one sentence per outcome, each of them true. The three cases
+// are genuinely different: pruned, nothing to prune, and could not look.
+async function recheckScope() {
+  let roots;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+    roots = r.roots;
+  } catch {
+    return "the folder list could not be re-read, so the scope is unchanged;"
+      + " clear the scope chip to ask against the whole corpus.";
+  }
+  return pruneScope(roots)
+    ? "the scope has been narrowed to the folders that still exist; ask again."
+    : "the folder list still offers those folders, so this may be a server-side"
+      + " change; clear the scope chip to ask against the whole corpus.";
 }
 
 function scopeCount(paths) {
@@ -1533,10 +1553,12 @@ $("askForm").addEventListener("submit", async (e) => {
       // choosing a scope and asking. Recover here rather than leaving every
       // question failing on a chip nobody suspects.
       if (res.status === 400 && detail.includes("outside every known corpus root")) {
-        api("/api/corpus/folders")
-          .then((r) => { scopeFolders = r.folders || []; pruneScope(r.roots); })
-          .catch(() => {});
-        throw new Error(`${detail} — the scope has been re-checked; ask again.`);
+        // Awaited, and the message says what actually happened. Reporting a
+        // re-check that is still in flight — or that failed — would send the
+        // reader straight back into the same refusal believing it was fixed.
+        // Awaiting also closes the retry window: `state.running` is still set,
+        // so nothing can post the stale prefixes while this resolves.
+        throw new Error(`${detail} — ${await recheckScope()}`);
       }
       throw new Error(detail);
     }

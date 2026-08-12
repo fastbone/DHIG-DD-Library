@@ -333,7 +333,11 @@ A stored scope outlives the corpus it names: delete an extracted folder or
 re-point the app and its prefixes are no longer inside any known root, so the
 browser re-checks them against the roots whenever it loads the tree, drops what
 is gone, and says so — silently answering against more of the library than the
-reader chose would be the worst available outcome.
+reader chose would be the worst available outcome. A refusal from `/api/ask`
+re-checks the scope too, for a corpus that changed between choosing and asking,
+and it waits for that re-check before reporting it: claiming a scope has been
+fixed when the folder list could not even be re-read sends the reader straight
+back into the same refusal.
 
 A scope is sticky for the browser session, echoed on the answer itself, and
 recorded against the question in the Deliverables log — because a past
@@ -712,7 +716,7 @@ network — each uses its own temporary data directory.
 ```bash
 python3 tools/api_smoke.py            # 190 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
 python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 105 checks: the browser front end, end to end
+python3 tools/ui_smoke.py             # 107 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 

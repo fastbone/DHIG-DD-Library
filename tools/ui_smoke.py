@@ -223,8 +223,19 @@ async def main() -> int:
         )
         page = await browser.new_page(viewport={"width": 1500, "height": 1000})
         page.on("pageerror", lambda e: problems.append(f"pageerror: {e}"))
-        page.on("console", lambda m: problems.append(f"console.error: {m.text}")
-                if m.type == "error" else None)
+        # Some checks below refuse requests on purpose, and the browser logs every
+        # non-2xx as a console error. Those are the subject of the check, not a
+        # defect, so they are muted for exactly as long as they are expected.
+        expect_http = {"on": False}
+
+        def on_console(m):
+            if m.type != "error":
+                return
+            if expect_http["on"] and "Failed to load resource" in m.text:
+                return
+            problems.append(f"console.error: {m.text}")
+
+        page.on("console", on_console)
 
         # Sign in through the real login form.
         await page.goto(f"http://127.0.0.1:{PORT}/", wait_until="networkidle")
@@ -1022,6 +1033,53 @@ async def main() -> int:
         )
         await page.click("#scopeClose")
         await page.wait_for_timeout(200)
+
+        # The corpus can also change between choosing a scope and asking, so the
+        # refusal itself has to recover. What it must never do is report a
+        # re-check that has not happened: the reader would ask again into the same
+        # refusal believing it was fixed. Folders is broken here on purpose.
+        async def break_folders(route):
+            await route.fulfill(status=500, content_type="application/json",
+                                body='{"error": "no"}')
+
+        expect_http["on"] = True
+        await page.route("**/api/corpus/folders", break_folders)
+        await page.evaluate("""() => { setScope(["/nowhere/at/all"]); }""")
+        await page.fill("#question", "anything?")
+        await page.click("#askBtn")
+        await page.wait_for_timeout(1200)
+        notice = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: a refused scope is not reported as re-checked when it was not"] = (
+            "could not be re-read" in notice and "has been narrowed" not in notice
+            # …and the chip still says what it still is.
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", break_folders)
+
+        # Now with the folder list reachable but slow: the message may only appear
+        # once the re-check has finished, or a quick retry posts the stale prefixes
+        # again. The chip must already be clear by the time the reader is told.
+        async def slow_folders(route):
+            await asyncio.sleep(1.2)
+            await route.continue_()
+
+        await page.route("**/api/corpus/folders", slow_folders)
+        await page.fill("#question", "anything at all?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        checks["scope: the reader is told only after the scope has actually changed"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "has been narrowed"
+            in await page.locator(".msg.assistant").last.inner_text()
+        )
+        await page.unroute("**/api/corpus/folders", slow_folders)
+        expect_http["on"] = False
 
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
