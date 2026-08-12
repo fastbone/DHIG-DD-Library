@@ -337,7 +337,12 @@ reader chose would be the worst available outcome. A refusal from `/api/ask`
 re-checks the scope too, for a corpus that changed between choosing and asking,
 and it waits for that re-check before reporting it: claiming a scope has been
 fixed when the folder list could not even be re-read sends the reader straight
-back into the same refusal.
+back into the same refusal. Which outcome it was matters as much as that it
+happened, so `pruneScope` returns the outcome rather than a count — narrowed,
+cleared, no roots left, nothing to drop, could not look — and each has its own
+sentence. "Narrowed" and "cleared" in particular are not interchangeable: a
+retry after a clear runs against the whole library, and the reader has to be
+told that before they ask again.
 
 A scope is sticky for the browser session, echoed on the answer itself, and
 recorded against the question in the Deliverables log — because a past
@@ -716,7 +721,7 @@ network — each uses its own temporary data directory.
 ```bash
 python3 tools/api_smoke.py            # 190 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
 python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 107 checks: the browser front end, end to end
+python3 tools/ui_smoke.py             # 109 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 

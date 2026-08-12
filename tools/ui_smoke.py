@@ -1050,7 +1050,7 @@ async def main() -> int:
         await page.wait_for_timeout(1200)
         notice = await page.locator(".msg.assistant").last.inner_text()
         checks["scope: a refused scope is not reported as re-checked when it was not"] = (
-            "could not be re-read" in notice and "has been narrowed" not in notice
+            "could not be re-read" in notice and "narrowed" not in notice
             # …and the chip still says what it still is.
             and "1 folder" in await page.inner_text("#scopeChip")
         )
@@ -1073,12 +1073,70 @@ async def main() -> int:
                }""",
             timeout=15_000,
         )
+        # Every folder in that scope was dead, so the retry would run against the
+        # *whole* library — the message has to say that rather than "narrowed",
+        # which would understate what the next answer can see.
+        widened = await page.locator(".msg.assistant").last.inner_text()
         checks["scope: the reader is told only after the scope has actually changed"] = (
             "whole corpus" in await page.inner_text("#scopeChip")
-            and "has been narrowed"
-            in await page.locator(".msg.assistant").last.inner_text()
+            and "the scope is now the whole corpus" in widened
+            and "narrowed" not in widened
         )
         await page.unroute("**/api/corpus/folders", slow_folders)
+
+        # A scope that is partly dead is narrowed, not cleared, and must say so:
+        # "narrowed" and "cleared" leave the next answer looking at very different
+        # amounts of the library, so one message cannot serve both.
+        live = await page.evaluate(
+            """() => scopeFolders.find((f) => f.depth > 0)?.path || null"""
+        )
+        await page.evaluate(
+            """(live) => { setScope([live, "/gone/for/good"]); }""", live
+        )
+        await page.fill("#question", "and now?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        partial = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: a partly dead scope is narrowed, not silently widened"] = (
+            bool(live)
+            and "narrowed to the 1 folder" in partial
+            and "whole corpus" not in partial
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+
+        # And with no corpus roots left at all, "those folders are still offered"
+        # is simply false — every ask would keep failing on a chip the reader was
+        # told was fine.
+        async def no_roots(route):
+            await route.fulfill(status=200, content_type="application/json",
+                                body=json.dumps({"folders": [], "roots": []}))
+
+        await page.route("**/api/corpus/folders", no_roots)
+        # The narrowing above left a live folder, which the server accepts — so
+        # give it a dead one again, or there is no refusal to recover from.
+        await page.evaluate("""() => { setScope(["/nothing/here/either"]); }""")
+        await page.fill("#question", "last try?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        rootless = await page.locator(".msg.assistant").last.inner_text()
+        checks["scope: losing every corpus root is not reported as folders still offered"] = (
+            "no longer knows of any corpus folder" in rootless
+            and "still offers" not in rootless
+            and "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", no_roots)
         expect_http["on"] = False
 
         # Last, because it navigates away from the app. Same page deliberately: the

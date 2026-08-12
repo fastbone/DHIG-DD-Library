@@ -1321,24 +1321,40 @@ let scopeEstimateIssued = 0;
 // at which point the server rejects them and *every* question 400s until someone
 // thinks to clear the chip by hand. So the restored scope is checked against the
 // roots the server will check it against, and anything gone is dropped.
+// Returns *what happened*, not a count. Two rounds of review went on this
+// function because a single number cannot distinguish outcomes that read
+// differently to the reader — "narrowed" and "cleared" send a retry against very
+// different amounts of the library, and "nothing to drop" and "there are no roots
+// at all" are opposite facts. One state, one sentence, one source of truth for
+// both the toast and the message on a refused question.
+//   not_scoped | unknown | no_roots | unchanged | narrowed | cleared
 function pruneScope(roots) {
-  if (!state.scope.length || !Array.isArray(roots) || !roots.length) return 0;
+  if (!state.scope.length) return { kind: "not_scoped" };
+  // The caller could not read the list; it must not be treated as "no roots".
+  if (!Array.isArray(roots)) return { kind: "unknown" };
+  const before = state.scope.length;
+  // Said out loud in every case that changes the scope, never silently: the
+  // alternative is a question quietly answered against more of the library than
+  // the reader chose.
+  if (!roots.length) {
+    setScope([]);
+    toast("No corpus folders are configured any more — back to the whole corpus.", true);
+    return { kind: "no_roots", lost: before };
+  }
   const inside = (p) => roots.some((r) => {
     const root = r.replace(/\/$/, "");
     return p === root || p.startsWith(root + "/");
   });
   const kept = state.scope.filter(inside);
-  if (kept.length === state.scope.length) return 0;
-  const lost = state.scope.length - kept.length;
+  if (kept.length === before) return { kind: "unchanged" };
+  const lost = before - kept.length;
   setScope(kept);
-  // Said out loud, never silently: the alternative is a question quietly
-  // answered against more of the library than the reader chose.
   toast(
     `${lost} folder${lost === 1 ? "" : "s"} in your saved scope no longer exist — ` +
     (kept.length ? "scope narrowed to what is left." : "back to the whole corpus."),
     true,
   );
-  return lost;
+  return kept.length ? { kind: "narrowed", lost, kept: kept.length } : { kind: "cleared", lost };
 }
 
 function setScope(paths) {
@@ -1348,8 +1364,28 @@ function setScope(paths) {
 }
 
 // Re-check the saved scope after the server has refused it, and return what to
-// tell the reader — one sentence per outcome, each of them true. The three cases
-// are genuinely different: pruned, nothing to prune, and could not look.
+// tell the reader — one sentence per outcome, each of them true. Where the scope
+// widened, the sentence says so: a reader who retries needs to know the answer
+// will now come from more of the library than they picked.
+const SCOPE_RECHECK_NOTE = {
+  narrowed: (r) =>
+    `the scope has been narrowed to the ${r.kept} folder${r.kept === 1 ? "" : "s"}`
+    + " that still exist; ask again.",
+  cleared: () =>
+    "none of those folders exist any more, so the scope is now the whole corpus —"
+    + " ask again only if that is what you want.",
+  no_roots: () =>
+    "the app no longer knows of any corpus folder, so the scope has been cleared"
+    + " and the whole library is in play.",
+  unchanged: () =>
+    "the folder list still offers those folders, so this looks like a server-side"
+    + " change; clear the scope chip to ask against the whole corpus.",
+  not_scoped: () => "the scope is already empty; ask again.",
+  unknown: () =>
+    "the folder list could not be re-read, so the scope is unchanged; clear the"
+    + " scope chip to ask against the whole corpus.",
+};
+
 async function recheckScope() {
   let roots;
   try {
@@ -1357,13 +1393,10 @@ async function recheckScope() {
     scopeFolders = r.folders || [];
     roots = r.roots;
   } catch {
-    return "the folder list could not be re-read, so the scope is unchanged;"
-      + " clear the scope chip to ask against the whole corpus.";
+    roots = undefined;   // → "unknown": could not look, rather than "no roots"
   }
-  return pruneScope(roots)
-    ? "the scope has been narrowed to the folders that still exist; ask again."
-    : "the folder list still offers those folders, so this may be a server-side"
-      + " change; clear the scope chip to ask against the whole corpus.";
+  const outcome = pruneScope(roots);
+  return (SCOPE_RECHECK_NOTE[outcome.kind] || SCOPE_RECHECK_NOTE.unknown)(outcome);
 }
 
 function scopeCount(paths) {
