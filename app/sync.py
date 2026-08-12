@@ -120,14 +120,24 @@ def _public(row) -> dict | None:
     return d
 
 
+# The connection, plus when a sync was last *attempted* — which its own columns do
+# not record. A failed run writes `error` and leaves `last_sync_at` at the last
+# clean sync, so without this an error sits next to a timestamp from before it and
+# reads as though it had just happened. It is also what the schedule counts from.
+_WITH_ATTEMPT = (
+    "SELECT c.*, (SELECT MAX(started_at) FROM sync_runs WHERE conn_id=c.id)"
+    " AS last_attempt_at FROM sync_connections c"
+)
+
+
 def get(conn_id: str) -> dict | None:
-    return _public(db.one("SELECT * FROM sync_connections WHERE id=?", (conn_id,)))
+    return _public(db.one(f"{_WITH_ATTEMPT} WHERE c.id=?", (conn_id,)))
 
 
 def listing() -> list[dict]:
     return [
         _public(r)
-        for r in db.rows("SELECT * FROM sync_connections ORDER BY label COLLATE NOCASE")
+        for r in db.rows(f"{_WITH_ATTEMPT} ORDER BY c.label COLLATE NOCASE")
     ]
 
 
@@ -419,6 +429,17 @@ class SyncJob:
             args += ["--include", f"*{ext}"]
         return args
 
+    def _scope(self, row: dict) -> list[str]:
+        """Which remote objects this connection moves — filters and size ceiling.
+
+        One list, used by both the transfer and the `size` preflight that decides
+        whether it is allowed to start. They have to agree. Sizing the library
+        without `--max-size` measures bytes the transfer would skip, so a library
+        comfortably inside DD_MAX_SYNC_GB gets refused over files that would never
+        be fetched — and the free-space check demands room for them too.
+        """
+        return [*self._filters(row), "--max-size", f"{settings.max_file_mb}M"]
+
     async def _run_rclone(self, args: list[str], env: dict, *, parse: bool) -> int:
         """Run rclone, streaming its JSON log. Returns the exit code."""
         # stdout is discarded rather than piped: progress and errors come on
@@ -563,8 +584,12 @@ class SyncJob:
     # --- lifecycle -------------------------------------------------------
 
     async def _preflight(self, row: dict, env: dict, mirror: Path) -> None:
-        """Refuse a library that will not fit before fetching any of it."""
-        args = ["size", ":onedrive:", "--json", *self._filters(row)]
+        """Refuse a library that will not fit before fetching any of it.
+
+        Measured over exactly what the transfer would move (see `_scope`), so the
+        figure in a refusal is the figure that would land on disk.
+        """
+        args = ["size", ":onedrive:", "--json", *self._scope(row)]
         # Registered and bounded like the transfer: a hung listing must be
         # cancellable from the UI and must honour DD_SYNC_TIMEOUT, or the job sits
         # there holding the one-sync-at-a-time lock with no way out.
@@ -607,8 +632,10 @@ class SyncJob:
 
         if remote_bytes > settings.max_sync_gb * 1e9:
             raise SyncError(
-                f"the library is {remote_bytes / 1e9:.1f} GB, over the "
-                f"{settings.max_sync_gb} GB limit (raise DD_MAX_SYNC_GB if that is intended)"
+                f"the library holds {remote_bytes / 1e9:.1f} GB this connection "
+                f"would mirror, over the {settings.max_sync_gb} GB limit (raise "
+                "DD_MAX_SYNC_GB if that is intended — a change to it takes effect "
+                "when the container is recreated, not on restart)"
             )
         # Only the bytes not already mirrored have to fit. Comparing the whole
         # library against free space refuses every resync of a library that only
@@ -619,9 +646,10 @@ class SyncJob:
         needed = max(0, remote_bytes - held)
         if needed > free:
             raise SyncError(
-                f"the library is {remote_bytes / 1e9:.1f} GB and {held / 1e9:.1f} GB is "
-                f"already mirrored, so it needs another {needed / 1e9:.1f} GB — only "
-                f"{free / 1e9:.1f} GB is free on the data volume"
+                f"the library holds {remote_bytes / 1e9:.1f} GB to mirror and "
+                f"{held / 1e9:.1f} GB is already mirrored, so it needs another "
+                f"{needed / 1e9:.1f} GB — only {free / 1e9:.1f} GB is free on the "
+                "data volume"
             )
         self.total = count
         # What the library *holds*, as distinct from what this run moves. The row
@@ -630,8 +658,10 @@ class SyncJob:
         self.library_files = count
         self.library_bytes = remote_bytes
         self.library_measured = True
+        scope = ("the indexable types, " if row["only_supported_types"] else "")
         broker.log(
-            f"{count} file(s), {remote_bytes / 1e9:.2f} GB in the library · "
+            f"{count} file(s), {remote_bytes / 1e9:.2f} GB to mirror "
+            f"({scope}under {settings.max_file_mb} MB each) · "
             f"{held / 1e9:.2f} GB already mirrored · {free / 1e9:.1f} GB free."
         )
         self._publish(message="starting transfer")
@@ -685,10 +715,9 @@ class SyncJob:
                 # not logged at this level, so the volume tracks what changed
                 # rather than the size of the library.
                 "-v",
-                "--max-size", f"{settings.max_file_mb}M",
                 "--transfers", "4", "--checkers", "8",
                 "--low-level-retries", "5", "--retries", "3",
-                *self._filters(row),
+                *self._scope(row),
             ]
             if row["mirror_deletions"]:
                 # A connection pointed at the wrong library must not be able to
@@ -813,13 +842,21 @@ class SyncJob:
 
 
 def due_connections(now: float | None = None) -> list[dict]:
-    """Connections whose interval has elapsed. Manual-only ones never are."""
+    """Connections whose interval has elapsed. Manual-only ones never are.
+
+    Measured from the last *attempt*, not the last success. A failed run leaves
+    `last_sync_at` at whenever the library last synced cleanly, so scheduling off
+    that alone makes a failing connection due on every tick: an hourly library
+    that is being refused re-lists its whole remote once a minute, which is a lot
+    of Graph traffic to arrive at the same error. The interval is what the person
+    asked for, and it applies to retries too.
+    """
     now = time.time() if now is None else now
     due = []
     for row in db.rows(
-        "SELECT * FROM sync_connections WHERE interval_minutes > 0 AND status != 'syncing'"
+        f"{_WITH_ATTEMPT} WHERE c.interval_minutes > 0 AND c.status != 'syncing'"
     ):
-        last = row["last_sync_at"] or 0
+        last = max(row["last_sync_at"] or 0, row["last_attempt_at"] or 0)
         if now - last >= row["interval_minutes"] * 60:
             due.append(_public(row))
     return due

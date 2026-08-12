@@ -12,21 +12,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# Values that were set but could not be read, so the default is in force instead.
+# Collected rather than logged, because this module is imported before there is
+# anywhere to log to; the server drains it at startup. A silent fallback here is
+# how "I raised DD_MAX_SYNC_GB and it still refuses at the old number" happens.
+CONFIG_WARNINGS: list[str] = []
+
+
+def _malformed(name: str, raw: str, default: object) -> None:
+    CONFIG_WARNINGS.append(
+        f"{name}={raw!r} is not a number — using the default {default} instead."
+    )
+
+
 def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser().resolve()
 
 
 def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
     try:
-        return int(os.environ[name])
-    except (KeyError, ValueError):
+        return int(raw.strip())
+    except ValueError:
+        _malformed(name, raw, default)
         return default
 
 
 def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
     try:
-        return float(os.environ.get(name, "").strip() or default)
+        return float(raw.strip())
     except ValueError:
+        _malformed(name, raw, default)
         return default
 
 
