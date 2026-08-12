@@ -119,8 +119,22 @@ async function refreshStatus() {
     ["map/turn", money(s.manifest_cost_per_turn_usd)],
     ["spent", money(s.lifetime_usage.cost_usd)],
   ];
+  // Your own remaining allowance, next to the lifetime total. Shown only when a
+  // cap actually applies: a pill reading "unlimited" is noise, and being told the
+  // number only at the moment you are refused is the wrong time to learn it.
+  const mine = s.budget?.ask;
+  let budgetPill = "";
+  if (mine && !mine.unlimited) {
+    const resets = new Date(s.budget.resets_at * 1000);
+    const cls = mine.exhausted ? "warn" : mine.remaining_usd < mine.limit_usd * 0.2 ? "warn" : "";
+    budgetPill =
+      `<span class="pill ${cls}" title="Your weekly question budget. Resets ${resets.toLocaleString()}` +
+      `${s.budget.grace_available ? " · one-time overrun still available" : " · overrun used this week"}">` +
+      `<span class="muted">this week</span><b>${money(mine.spent_usd)} / ${money(mine.limit_usd)}</b></span>`;
+  }
   $("headPills").innerHTML =
     pills.map(([k, v]) => `<span class="pill"><span class="muted">${k}</span><b>${v}</b></span>`).join("") +
+    budgetPill +
     (s.has_api_key
       ? `<span class="pill ok" title="credentials: ${esc(s.credentials)}">${esc(s.models.analyst)}</span>`
       : `<span class="pill warn">no API key</span>`);
@@ -1094,6 +1108,11 @@ $("askForm").addEventListener("submit", async (e) => {
   think.append(thinkBody);
   const body = qs(".body", assistant);
   assistant.insertBefore(think, body);
+  // Notices live beside the answer, not inside it: `body` is replaced wholesale
+  // on every text_delta and again on done, so a notice appended into it would be
+  // wiped by the next token — which is the opposite of the point.
+  const notices = el("div", "notices");
+  assistant.append(notices);
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -1119,7 +1138,15 @@ $("askForm").addEventListener("submit", async (e) => {
     for await (const ev of sseStream(res)) {
       switch (ev.type) {
         case "status":
-          $("runMeta").dataset.base = esc(ev.message || "");
+          if (ev.reason === "budget") {
+            // A spending stop is a decision the reader has to see, not a line in
+            // the meta strip that the next status message overwrites.
+            notices.insertAdjacentHTML("beforeend",
+              `<div class="notice warn">${esc(ev.message)}</div>`);
+            refreshStatus();
+          } else {
+            $("runMeta").dataset.base = esc(ev.message || "");
+          }
           break;
         case "thinking_delta":
           think.classList.remove("hidden");
@@ -1154,16 +1181,26 @@ $("askForm").addEventListener("submit", async (e) => {
           loadArtifacts();
           break;
         case "error":
-          toast(ev.message, true);
-          body.innerHTML += `<div class="tag bad">${esc(ev.message)}</div>`;
+          // A budget refusal is a policy outcome, not a fault — say so in the
+          // thread and leave it there, rather than flashing a red failure tag.
+          if (ev.reason === "budget") {
+            notices.insertAdjacentHTML("beforeend",
+              `<div class="notice warn">${esc(ev.message)}</div>`);
+            refreshStatus();
+          } else {
+            toast(ev.message, true);
+            body.innerHTML += `<div class="tag bad">${esc(ev.message)}</div>`;
+          }
           break;
         case "done":
           answer = ev.answer || answer;
           body.innerHTML = renderMarkdown(answer);
+          if (ev.stopped_on_budget) assistant.classList.add("stopped-early");
           for (const a of ev.artifacts || []) body.appendChild(artifactRow(a));
           renderCitations(ev.citations, ev.verdicts);
           state.history.push({ role: "user", content: question });
           state.history.push({ role: "assistant", content: answer });
+          refreshStatus();
           $("runMeta").innerHTML =
             `done in ${ev.duration_s}s · ${money(ev.usage.cost_usd)} · ` +
             `${(ev.citations || []).length} citations · ${(ev.verdicts || []).length} checked`;
@@ -1488,22 +1525,69 @@ $("addKeyBtn").onclick = async () => {
   } catch (e) { toast(e.message, true); }
 };
 
+/* A weekly cap is one of three things, and the difference matters: a number, no
+   cap at all, or "whatever the instance default is". Rendered as words rather
+   than a sentinel number so nobody has to decode -1. */
+function budgetLabel(b) {
+  if (!b) return "—";
+  const amount = b.unlimited ? "unlimited" : `$${b.limit_usd.toFixed(2)}`;
+  // `inherited` first, always. An account on an unlimited instance default reports
+  // both unlimited and inherited, and reading the value first loses the difference
+  // between "follows the default" and "was set to unlimited here".
+  return b.inherited ? `default (${amount})` : amount;
+}
+
+function budgetBar(b) {
+  if (!b || b.unlimited || !b.limit_usd) return "";
+  const pct = Math.min(100, (b.spent_usd / b.limit_usd) * 100);
+  const cls = pct >= 100 ? "bad" : pct >= 80 ? "warn" : "";
+  return `<span class="budget-track"><span class="budget-fill ${cls}"
+            style="width:${pct.toFixed(1)}%"></span></span>`;
+}
+
 async function loadUsers() {
   let r;
   try { r = await api("/api/users"); } catch (e) { return; }
   $("accountCount").textContent = `${r.users.length} account${r.users.length === 1 ? "" : "s"}`;
+  // The next reset as an instant, in the reader's own timezone. The boundary is
+  // Monday midnight on the server, which is not necessarily Monday midnight where
+  // the reader is sitting — so show when it actually happens for them.
+  const resets = new Date(r.resets_at * 1000).toLocaleString([], {
+    weekday: "long", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+  const dflt = (v) => (v < 0 ? "unlimited" : `$${v.toFixed(2)}`);
+  $("budgetNote").innerHTML =
+    `Weekly budgets reset <strong>${esc(resets)}</strong>, then every Monday
+     · instance defaults: questions ${dflt(r.budget_defaults.ask)},
+     indexing ${dflt(r.budget_defaults.index)}
+     · one-time overrun ${r.budget_defaults.grace_pct}% of the question budget`;
   const box = $("userList");
   box.innerHTML = "";
   for (const u of r.users) {
     const row = el("div", "rowitem");
     const meta = el("div", "meta");
+    const ask = u.budget?.ask, idx = u.budget?.index;
     meta.innerHTML = `<div class="t">${esc(u.username)}
       <span class="tag">${esc(u.role)}</span>
       ${u.disabled ? '<span class="tag bad">disabled</span>' : ""}
-      ${u.must_change_password ? '<span class="tag flag">must change password</span>' : ""}</div>
+      ${u.must_change_password ? '<span class="tag flag">must change password</span>' : ""}
+      ${ask?.exhausted ? '<span class="tag bad">question budget spent</span>' : ""}
+      ${idx?.exhausted ? '<span class="tag bad">indexing budget spent</span>' : ""}</div>
       <div class="muted small">created ${new Date(u.created_at * 1000).toLocaleDateString()}
-        ${u.last_login_at ? "· last sign-in " + new Date(u.last_login_at * 1000).toLocaleString() : "· never signed in"}</div>`;
+        ${u.last_login_at ? "· last sign-in " + new Date(u.last_login_at * 1000).toLocaleString() : "· never signed in"}</div>
+      <div class="budget-line">
+        <span>questions <strong>$${ask ? ask.spent_usd.toFixed(2) : "0.00"}</strong>
+          of ${budgetLabel(ask)}</span>${budgetBar(ask)}
+        <span>indexing <strong>$${idx ? idx.spent_usd.toFixed(2) : "0.00"}</strong>
+          of ${budgetLabel(idx)}</span>${budgetBar(idx)}
+        ${u.budget && !u.budget.grace_available
+          ? '<span class="muted">overrun used this week</span>' : ""}
+      </div>`;
     const actions = el("div", "actions");
+
+    const budgetBtn = el("button", "ghost", "budgets");
+    budgetBtn.onclick = () => editBudgets(u);
+    actions.append(budgetBtn);
 
     const roleBtn = el("button", "ghost", u.role === "admin" ? "make analyst" : "make admin");
     roleBtn.onclick = () => patchUser(u.username, { role: u.role === "admin" ? "analyst" : "admin" });
@@ -1534,7 +1618,33 @@ async function patchUser(username, patch) {
     await api(`/api/users/${username}`, { method: "POST", body: patch });
     toast(`Updated ${username}`);
     loadUsers();
+    if (username === state.user?.username) refreshStatus();
   } catch (e) { toast(e.message, true); }
+}
+
+/* Both caps in one dialog, because they are set together and the interesting
+   question is the pair: an admin who sweeps needs an indexing budget an analyst
+   never touches. `default` and `unlimited` are typed as words, matching what the
+   API accepts, so there is no sentinel number to remember. */
+function editBudgets(u) {
+  const asCurrent = (b) => (!b || b.inherited ? "default"
+                            : b.unlimited ? "unlimited" : String(b.limit_usd));
+  const ask = prompt(
+    `Weekly QUESTION budget for ${u.username}.\n\n` +
+    `A dollar amount, "unlimited", or "default" to follow the instance setting.\n` +
+    `0 means this account cannot ask questions at all.`,
+    asCurrent(u.budget?.ask)
+  );
+  if (ask === null) return;
+  const index = prompt(
+    `Weekly INDEXING budget for ${u.username}.\n\n` +
+    `Covers sweeps — the catalogue cards. A full library is typically $10–25, so ` +
+    `an account that never sweeps can be left at 0.\n\n` +
+    `A dollar amount, "unlimited", or "default".`,
+    asCurrent(u.budget?.index)
+  );
+  if (index === null) return;
+  patchUser(u.username, { budget_ask: ask.trim(), budget_index: index.trim() });
 }
 
 $("addUserBtn").onclick = async () => {

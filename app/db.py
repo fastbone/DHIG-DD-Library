@@ -253,6 +253,40 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, ts DESC);
+
+-- Every paid API call, attributed to whoever caused it. The running meters in
+-- pricing.py are per-process and vanish on restart; a weekly limit has to be
+-- answerable from disk, and "what did this cost and who spent it" is a question
+-- worth being able to answer months later regardless.
+CREATE TABLE IF NOT EXISTS spend (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL NOT NULL,
+    username TEXT,                    -- NULL when nothing initiated it (never blocked)
+    budget   TEXT NOT NULL,           -- ask | index
+    kind     TEXT NOT NULL,           -- analyst | verifier | carder
+    model    TEXT,
+    cost_usd REAL NOT NULL,
+    input_tokens       INTEGER DEFAULT 0,
+    output_tokens      INTEGER DEFAULT 0,
+    cache_read_tokens  INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    ref      TEXT                     -- qa id or job id
+);
+CREATE INDEX IF NOT EXISTS idx_spend_user ON spend(username, budget, ts);
+CREATE INDEX IF NOT EXISTS idx_spend_ts   ON spend(ts DESC);
+
+-- Per-account weekly caps. A separate table rather than columns on `users`
+-- because the schema is one pass of CREATE TABLE IF NOT EXISTS with no migration
+-- step, so a new column would never appear on a database that already exists.
+-- NULL means "inherit the instance default"; see budget.UNLIMITED for the rest.
+CREATE TABLE IF NOT EXISTS user_budgets (
+    username   TEXT PRIMARY KEY,
+    ask_usd    REAL,
+    index_usd  REAL,
+    grace_week TEXT,                  -- ISO week in which the ask grace was claimed
+    updated_at REAL,
+    updated_by TEXT
+);
 """
 
 
@@ -616,6 +650,66 @@ def log_counts() -> dict:
         )
     ]
     return counts
+
+
+# --- spend ledger --------------------------------------------------------
+
+
+def spend_record(
+    username: str | None,
+    budget: str,
+    kind: str,
+    model: str | None,
+    cost_usd: float,
+    *,
+    usage: dict | None = None,
+    ref: str | None = None,
+) -> None:
+    """Append one paid call. Never raises — accounting must not fail a request."""
+    u = usage or {}
+    try:
+        execute(
+            "INSERT INTO spend(ts, username, budget, kind, model, cost_usd, input_tokens,"
+            " output_tokens, cache_read_tokens, cache_write_tokens, ref)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), username, budget, kind, model, float(cost_usd),
+             u.get("input_tokens", 0), u.get("output_tokens", 0),
+             u.get("cache_read_tokens", 0), u.get("cache_write_tokens", 0), ref),
+        )
+    except Exception:  # noqa: BLE001 — a missed ledger row is not worth a 500
+        pass
+
+
+def spend_since(since: float, username: str | None = None, budget: str | None = None) -> float:
+    """Total USD spent since a timestamp, optionally for one user and budget."""
+    where = ["ts >= ?"]
+    params: list = [since]
+    if username is not None:
+        where.append("username = ?")
+        params.append(username)
+    if budget is not None:
+        where.append("budget = ?")
+        params.append(budget)
+    return float(scalar(f"SELECT SUM(cost_usd) FROM spend WHERE {' AND '.join(where)}", params, 0.0))
+
+
+def spend_by_user(since: float) -> dict[str, dict[str, float]]:
+    """``{username: {"ask": x, "index": y, "total": z}}`` since a timestamp.
+
+    One query rather than two per account, because the accounts list renders a
+    figure for every user and a per-user query there is a loop over the table.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for r in rows(
+        "SELECT username, budget, SUM(cost_usd) AS total FROM spend"
+        " WHERE ts >= ? AND username IS NOT NULL GROUP BY username, budget",
+        (since,),
+    ):
+        entry = out.setdefault(r["username"], {"ask": 0.0, "index": 0.0, "total": 0.0})
+        if r["budget"] in entry:
+            entry[r["budget"]] = float(r["total"] or 0.0)
+        entry["total"] += float(r["total"] or 0.0)
+    return out
 
 
 def log_clear(levels: Iterable[str] | None = None) -> int:

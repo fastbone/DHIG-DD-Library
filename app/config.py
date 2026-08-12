@@ -23,6 +23,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -92,6 +99,21 @@ class Settings:
     # per problem file, and the point of keeping them is to still have the
     # failures after a restart, so this is generous. 0 disables trimming.
     log_retention: int = _env_int("DD_LOG_RETENTION", 20_000)
+
+    # --- weekly spending limits ------------------------------------------
+    # Two budgets, because the two ways of spending money here are nothing alike:
+    # asking questions is small and constant, indexing a library is one large
+    # deliberate act. A single pooled figure would either be too small to sweep
+    # with or too large to be a limit on questions.
+    #
+    # These are the instance defaults an account inherits when it has no explicit
+    # setting of its own. -1 is unlimited, and is the default so that adding this
+    # feature changes nothing until someone sets a number. 0 means no spending.
+    weekly_budget_ask_usd: float = _env_float("DD_WEEKLY_BUDGET_ASK_USD", -1.0)
+    weekly_budget_index_usd: float = _env_float("DD_WEEKLY_BUDGET_INDEX_USD", -1.0)
+    # An answer that stops halfway has spent money and produced nothing, so a user
+    # may overrun the ask budget by this much to finish one — once per week.
+    budget_grace_pct: float = _env_float("DD_BUDGET_GRACE_PCT", 10.0)
 
     def __post_init__(self) -> None:
         for d in (

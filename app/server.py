@@ -29,6 +29,7 @@ from . import (
     access,
     agent,
     auth,
+    budget,
     credentials,
     db,
     extract,
@@ -98,6 +99,12 @@ async def lifespan(app: FastAPI):
     broker.sink = lambda ev: db.log_record(
         ev["level"], ev["message"], source=ev.get("source"),
         context=ev.get("context"), job_id=ev.get("job_id"),
+    )
+    # Paid calls land in the spend ledger, which is what the weekly limits are
+    # measured against. Registered here for the same reason as the log sink:
+    # pricing.py stays importable without pulling in the database.
+    pricing.sink = lambda at, model, cost, usage: db.spend_record(
+        at.username, at.budget, at.kind, model, cost, usage=usage, ref=at.ref,
     )
     auth.bootstrap()
     storage.housekeeping()
@@ -254,7 +261,24 @@ class UserBody(BaseModel):
 
 @app.get("/api/users")
 async def list_users(_: dict = Depends(auth.require_admin)):
-    return {"users": auth.list_users(), "roles": list(auth.ROLES)}
+    users = auth.list_users()
+    spend = db.spend_by_user(budget.week_start())
+    for u in users:
+        u["budget"] = budget.status(u["username"])
+        u["spend_this_week"] = spend.get(u["username"], {"ask": 0.0, "index": 0.0,
+                                                        "total": 0.0})
+    return {
+        "users": users,
+        "roles": list(auth.ROLES),
+        "budget_defaults": {
+            "ask": settings.weekly_budget_ask_usd,
+            "index": settings.weekly_budget_index_usd,
+            "grace_pct": settings.budget_grace_pct,
+            "unlimited": budget.UNLIMITED,
+        },
+        "week_start": budget.week_start(),
+        "resets_at": budget.week_end(),
+    }
 
 
 @app.post("/api/users")
@@ -273,6 +297,11 @@ class UserPatch(BaseModel):
     role: str | None = None
     disabled: bool | None = None
     password: str | None = None
+    # A number, "unlimited", or "default" to inherit the instance setting.
+    # Strings on the wire so nobody has to remember a sentinel number, and so
+    # a typed 0 unambiguously means "no spending" rather than the opposite.
+    budget_ask: float | str | None = None
+    budget_index: float | str | None = None
 
 
 @app.post("/api/users/{username}")
@@ -286,8 +315,17 @@ async def patch_user(username: str, body: UserPatch, admin: dict = Depends(auth.
             auth.update_user, username, role=body.role, disabled=body.disabled,
             actor=admin["username"],
         )
+        fields = body.model_fields_set
+        if "budget_ask" in fields or "budget_index" in fields:
+            await asyncio.to_thread(
+                budget.set_budgets, username,
+                ask=body.budget_ask if "budget_ask" in fields else ...,
+                index=body.budget_index if "budget_index" in fields else ...,
+                actor=admin["username"],
+            )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    user["budget"] = budget.status(username.strip().lower())
     return {"user": user}
 
 
@@ -297,6 +335,7 @@ async def remove_user(username: str, admin: dict = Depends(auth.require_admin)):
         raise HTTPException(400, "you cannot delete your own account")
     try:
         await asyncio.to_thread(auth.delete_user, username, actor=admin["username"])
+        await asyncio.to_thread(budget.forget, username)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"deleted": username}
@@ -405,6 +444,9 @@ async def status(request: Request):
         },
         "recent_jobs": db.recent_jobs(8),
         "lifetime_usage": pricing.lifetime.snapshot(),
+        # The signed-in user's own position, so an analyst can see where they
+        # stand before asking rather than only when refused.
+        "budget": budget.status(user["username"]),
     }
 
 
@@ -606,7 +648,12 @@ async def start_sweep(body: SweepBody, request: Request):
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
     if any(k.startswith("sweep-") for k in JOBS):
         raise HTTPException(409, "a sweep is already running")
-    job = manifest.SweepJob(redo=body.redo)
+    who = actor(request)
+    try:
+        await asyncio.to_thread(budget.require, who, "index")
+    except budget.BudgetExceeded as exc:
+        raise HTTPException(402, str(exc)) from exc
+    job = manifest.SweepJob(redo=body.redo, actor=who)
     JOBS[job.id] = job
     db.audit("sweep.start", actor=actor(request), detail=f"redo={body.redo}")
 
@@ -1116,9 +1163,12 @@ async def ask(body: AskBody, request: Request):
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
     db.audit("ask", actor=actor(request), detail=body.question[:300])
 
+    who = actor(request)
+
     async def gen():
         async for event in agent.ask(
-            body.question, history=body.history, do_verify=body.verify, effort=body.effort
+            body.question, history=body.history, do_verify=body.verify, effort=body.effort,
+            actor=who,
         ):
             yield sse(event)
 
