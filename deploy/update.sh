@@ -330,19 +330,22 @@ sync_env() {
   # two things preflight checked before it was opened.
   grep -Eq '^DD_SECRET_KEY=.+' .env \
     || die "DD_SECRET_KEY is empty in .env — refusing to deploy without it."
-  local before="${BIND_ADDR}:${HOST_PORT}"
+  local addr_before="${BIND_ADDR}:${HOST_PORT}" port_before="$HOST_PORT"
   read_env_addressing
-  if [[ "${BIND_ADDR}:${HOST_PORT}" != "$before" ]]; then
+  if [[ "${BIND_ADDR}:${HOST_PORT}" != "$addr_before" ]]; then
     info "published address is now ${BIND_ADDR}:${HOST_PORT} — the reverse proxy needs to agree"
-    # port_conflict is the wrong test here: it forgives a busy port when our own
-    # container exists, which during an update it does — on the *old* port. The
-    # new one is nobody's yet, so anything listening on it is a conflict, and
-    # finding out at `up` time means a failed swap and a rollback onto a .env
-    # that still names the busy port.
-    if port_listening "$HOST_PORT"; then
-      die "${HOST_PORT} is already in use. Pick another port with DD_HOST_PORT \
+  fi
+  # Only a *changed port* gets the strict test, and it has to be the strict one:
+  # port_conflict forgives a busy port when our own container exists, which during
+  # an update it does — on the old port. A port nobody held before is nobody's, so
+  # anything listening on it is a real conflict, and finding out at `up` time means
+  # a failed swap and a rollback onto a .env that still names the busy port.
+  # An unchanged port is ours already, bind address edited or not: `up` releases
+  # and rebinds it, so port_listening seeing our own docker-proxy there is not a
+  # conflict.
+  if [[ "$HOST_PORT" != "$port_before" ]] && port_listening "$HOST_PORT"; then
+    die "${HOST_PORT} is already in use. Pick another port with DD_HOST_PORT \
 in .env and update the reverse proxy."
-    fi
   fi
   return 0
 }
