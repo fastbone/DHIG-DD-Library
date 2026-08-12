@@ -217,6 +217,7 @@ including one quoting a limit that has since been raised.
 Raising a limit in `.env` reaches the app only when the container is **recreated**:
 
 ```bash
+./deploy/update.sh        # recreates when .env has drifted; --status just reports
 docker compose up -d      # re-reads .env
 docker compose restart    # does NOT — the old values stay
 ```
@@ -535,6 +536,7 @@ cd /opt/dd-library
 ./deploy/update.sh --status     # what is running now
 ./deploy/update.sh --dry-run    # print the plan, change nothing
 ./deploy/update.sh --rollback   # back to the previous commit
+./deploy/update.sh --recreate   # recreate the container even with no new commit
 ```
 
 What it does, in order: takes a `flock` so two runs can't overlap; refuses to
@@ -546,6 +548,21 @@ container still serves**; swaps; then polls `/api/health` for up to three
 minutes. If the new version doesn't come up healthy it restores the previous
 commit, brings the old one back and exits non-zero — a failed update leaves the
 service running.
+
+**An `.env` edit is a deploy.** `env_file` values are read when a container is
+*created*, so `docker compose restart` keeps the old ones — a raised limit then
+looks like the app ignoring it. The script compares the running container's
+environment against `.env` and recreates the container when they differ, even
+with no new commit, naming the variables that were not in effect (names only,
+never values). `--status` reports the same comparison, which is the first thing
+to check when the app is not honouring what `.env` says:
+
+```
+$ ./deploy/update.sh --status
+     env       .env has been edited since the container was created
+               not yet in effect: DD_MAX_SYNC_GB
+               apply with: ./deploy/update.sh  (or docker compose up -d)
+```
 
 Nightly, unattended:
 

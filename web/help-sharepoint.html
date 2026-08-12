@@ -487,8 +487,10 @@ Grant-PnPAzureADAppSitePermission `
       </p>
       <p>
         Raising the limit in <code>.env</code> takes effect when the container is
-        <em>recreated</em> (<code>docker compose up -d</code>), not on
-        <code>docker compose restart</code>, which keeps the old values. The
+        <em>recreated</em> — <code>./deploy/update.sh</code> on the host, or
+        <code>docker compose up -d</code> — not on <code>docker compose restart</code>,
+        which keeps the old values. <code>./deploy/update.sh --status</code> says whether
+        what is running matches the file. The
         <em>up to N GB</em> figure above the connections is the running app's own limit, so
         compare it with the refusal: the same number means the limit really was reached,
         a lower one means the new value has not been picked up yet. A stored failure also

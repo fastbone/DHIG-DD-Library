@@ -10,12 +10,19 @@
 #   ./deploy/update.sh --branch main   # deploy a different branch
 #   ./deploy/update.sh --keep 10       # keep 10 backups instead of 5
 #   ./deploy/update.sh --force         # deploy even with local modifications
+#   ./deploy/update.sh --recreate      # recreate the container even with no new commit
 #
 # Order matters. The new image is built while the old container is still
 # serving, so the only downtime is the container swap (seconds). If the new
 # container fails its health check the script restores the previous commit,
 # rebuilds and brings the old version back up, then exits non-zero — a failed
 # update leaves the service running, not down.
+#
+# An edit to .env alone is a deploy too. `env_file` values are read when the
+# container is *created*, so a `restart` keeps the old ones and a raised limit
+# silently does not apply. The script compares the running container's
+# environment against .env and recreates when they differ, rather than reporting
+# "nothing to do" for a change that has not taken effect.
 #
 # Run it as a user in the `docker` group, from the repository checkout. Safe to
 # put in cron: concurrent runs are serialised by a lock and a no-op update
@@ -36,7 +43,11 @@ DRY_RUN=0
 ROLLBACK=0
 STATUS_ONLY=0
 BACKUP_ONLY=0
+RECREATE=0
 HEALTH_TIMEOUT=180
+# Keys whose value in the running container differs from .env, filled in by
+# env_drift(). Names only — the file holds the admin password and the API key.
+DRIFTED=()
 
 # --- output --------------------------------------------------------------
 
@@ -70,6 +81,7 @@ while (( $# )); do
     --backup-only) BACKUP_ONLY=1 ;;
     --prune)      DO_PRUNE=1 ;;
     --force)      FORCE=1 ;;
+    --recreate)   RECREATE=1 ;;
     --branch)     BRANCH="${2:?--branch needs a name}"; shift ;;
     --keep)       KEEP_BACKUPS="${2:?--keep needs a number}"; shift ;;
     --timeout)    HEALTH_TIMEOUT="${2:?--timeout needs seconds}"; shift ;;
@@ -138,6 +150,58 @@ container_state() {
   printf '%s' "${s:-absent}"
 }
 
+env_drift() {
+  # Is the running container carrying the current .env? Compose reads env_file
+  # when it *creates* a container, so an edit plus `docker compose restart` keeps
+  # the old values — the app then goes on enforcing a limit that .env says was
+  # raised, with nothing anywhere to say why. `up -d` normally notices, but only
+  # if it is reached at all, and a no-op update used to exit before it.
+  #
+  # Sets DRIFTED to the key names that differ and returns 0 when any do. Names
+  # only, never values: .env holds DD_ADMIN_PASSWORD and the API key, and this
+  # output goes to a terminal, a cron mail and whatever log collects it.
+  DRIFTED=()
+  [[ -f .env ]] || return 1
+  local created created_epoch env_epoch
+  created="$(docker inspect -f '{{.Created}}' "$SERVICE" 2>/dev/null || true)"
+  [[ -n "$created" ]] || return 1
+  # Cheap gate: an .env untouched since the container was created cannot have
+  # drifted, and this keeps a quoting difference we parse differently from
+  # compose from swapping the container on every cron run.
+  created_epoch="$(date -d "$created" +%s 2>/dev/null || echo 0)"
+  env_epoch="$(stat -c %Y .env 2>/dev/null || echo 0)"
+  (( created_epoch > 0 && env_epoch > created_epoch )) || return 1
+
+  local -a live
+  mapfile -t live < <(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SERVICE" 2>/dev/null || true
+  )
+  local line key want got entry
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    key="${key#export }"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    want="${line#*=}"
+    # Compose strips one layer of matching quotes from an env_file value.
+    if [[ "$want" == \"*\" || "$want" == \'*\' ]] && (( ${#want} >= 2 )); then
+      want="${want:1:${#want}-2}"
+    fi
+    got=""
+    for entry in "${live[@]}"; do
+      if [[ "$entry" == "$key="* ]]; then
+        got="${entry#*=}"
+        break
+      fi
+    done
+    [[ "$want" == "$got" ]] || DRIFTED+=("$key")
+  done < .env
+  (( ${#DRIFTED[@]} > 0 ))
+}
+
 port_conflict() {
   # Something else on our port would make `up` fail with a confusing bind
   # error. Our own container holding it is expected, so ignore that case.
@@ -161,6 +225,17 @@ show_status() {
     ok "responding"
   else
     warn "not responding"
+  fi
+  # The question this answers is "why is the app not honouring what .env says",
+  # and it is the first thing to rule out before going looking in the app.
+  if [[ "$(container_state)" == "absent" ]]; then
+    info "env       no container to compare .env against"
+  elif env_drift; then
+    warn "env       .env has been edited since the container was created"
+    warn "          not yet in effect: ${DRIFTED[*]}"
+    warn "          apply with: ./deploy/update.sh  (or docker compose up -d)"
+  else
+    info "env       matches .env"
   fi
   if [[ -f "$PREV_SHA_FILE" ]]; then
     info "rollback  $(cat "$PREV_SHA_FILE")"
@@ -290,7 +365,14 @@ deploy_current_tree() {
   run compose "${build_args[@]}"
 
   step "Swapping the container"
-  run compose up -d --remove-orphans
+  # `up -d` recreates a container whose resolved config has changed, env_file
+  # contents included. --force-recreate when we already know the environment has
+  # drifted, or were asked to: it costs the same few seconds and does not depend
+  # on the compose version agreeing with us about what counts as a change. A
+  # container that only reads .env at creation is not worth being subtle about.
+  local up_args=(up -d --remove-orphans)
+  (( RECREATE )) && up_args+=(--force-recreate)
+  run compose "${up_args[@]}"
 }
 
 # --- rollback ------------------------------------------------------------
@@ -364,12 +446,27 @@ nothing you need."
 fi
 
 NEW_SHA="$(git rev-parse HEAD)"
+
+# An .env edit is a deploy the running container has not had. Checked whether or
+# not the commit moved, because the image may well be identical either way and it
+# is the container that has to be replaced.
+if env_drift; then
+  warn "the running container's environment differs from .env — it will be recreated"
+  warn "changed: ${DRIFTED[*]}"
+  RECREATE=1
+fi
+
 if [[ "$NEW_SHA" == "$OLD_SHA" ]]; then
-  if [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+  # No new commit is not the same as nothing to do: exiting here on a changed
+  # .env is what makes a raised limit look like a limit the app is ignoring.
+  if (( RECREATE )); then
+    step "No new commit, but the container needs replacing"
+  elif [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
     ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
     exit 0
+  else
+    warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
   fi
-  warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
 else
   step "Changes to deploy"
   git --no-pager log --oneline --no-decorate "$OLD_SHA..$NEW_SHA" | sed 's/^/    /'
