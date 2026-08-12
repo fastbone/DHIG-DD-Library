@@ -13,6 +13,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import sys
 import tempfile
 import threading
@@ -21,6 +22,7 @@ import zipfile
 from pathlib import Path
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -732,6 +734,159 @@ def main() -> int:
           str(body)[:160])
     code, body, _ = admin.get("/api/sync/connections")
     check("no connections remain", code == 200 and body["connections"] == [], str(body)[:160])
+
+    print("\n— folder-scoped questions —")
+    from app import db as _sdb
+    from app import manifest as _manifest
+    from app import search as _search
+    from app import tools as _tools
+
+    # Cards, stamped directly: the manifest is assembled from carded documents and
+    # carding them for real would spend money this test is not allowed to spend.
+    for r in _sdb.rows("SELECT id, filename FROM documents WHERE status='extracted'"):
+        _sdb.execute(
+            "UPDATE documents SET status='carded', title=?, doc_type='other',"
+            " workstream='financial', parties='[]', period_covered='', key_figures='[]',"
+            " summary='synthetic card for the api smoke test', languages='[\"en\"]',"
+            " card_flags='[]', carded_at=? WHERE id=?",
+            (r["filename"], time.time(), r["id"]),
+        )
+    _manifest.invalidate_manifest()
+
+    code, body, _ = admin.get("/api/corpus/folders")
+    folders = {f["path"]: f for f in body.get("folders", [])}
+    deal = next((p for p in folders if p.endswith("/deal")), None)
+    sub = next((p for p in folders if p.endswith("/deal/sub")), None)
+    check("the folder tree lists folders that hold indexed documents",
+          code == 200 and deal and sub, str(sorted(folders))[:200])
+    check("a parent folder's count includes its subtree",
+          bool(deal and sub) and folders[deal]["n_indexed"] > folders[sub]["n_indexed"],
+          f"{deal and folders[deal]['n_indexed']} vs {sub and folders[sub]['n_indexed']}")
+    # Rooted at the corpus roots, not at "/": every level of the host's directory
+    # layout above the data room is true, pickable and useless.
+    check("the tree does not offer the host's directories above the root",
+          "/" not in folders and "/tmp" not in folders, str(sorted(folders))[:120])
+    # Choosing what a question may see is part of asking one, so this is not admin.
+    scoper = Client()
+    admin.post("/api/users",
+               {"username": "scoper", "password": "scope-pass-7", "role": "analyst"})
+    _, scoper_login, _ = scoper.post("/api/login",
+                                     {"username": "scoper", "password": "scope-pass-7"})
+    scoper.csrf = (scoper_login.get("user") or {}).get("csrf")
+    code, body, _ = scoper.get("/api/corpus/folders")
+    check("an analyst can read the folder tree", code == 200 and body.get("folders"),
+          f"got {code}")
+    code, _, _ = anon.get("/api/corpus/folders")
+    check("the folder tree needs a session", code == 401, f"got {code}")
+
+    inside = {d["id"] for d in _search.list_documents(scope=[sub], limit=500)["documents"]}
+    everything = {d["id"] for d in _search.list_documents(limit=500)["documents"]}
+    check("a scoped list_documents excludes documents outside the scope",
+          inside and inside < everything, f"{len(inside)} of {len(everything)}")
+    hits = _search.search("findings", limit=50, scope=[sub])
+    check("a scoped search returns only in-scope passages",
+          all(h.get("doc_id") in inside for h in hits), str(hits)[:160])
+
+    # The mechanism the whole feature rests on: the map itself has to shrink, or
+    # the assistant still knows about — and cites — everything.
+    full_map = _manifest.build()
+    scoped_map = _manifest.build([sub])
+    check("the scoped corpus map is smaller than the full one",
+          scoped_map["chars"] < full_map["chars"] and scoped_map["n_indexed"] < full_map["n_indexed"],
+          f"{scoped_map['chars']}c/{scoped_map['n_indexed']}d vs "
+          f"{full_map['chars']}c/{full_map['n_indexed']}d")
+    head = scoped_map["text"].split("\n", 2)
+    check("the scoped map names the scope and the fraction it covers",
+          "scoped to sub" in head[0]
+          and f"{scoped_map['n_indexed']} of {full_map['n_indexed']}" in head[1],
+          " | ".join(head[:2])[:200])
+    check("the full map is unchanged by a scoped build next to it in the cache",
+          "scoped to" not in _manifest.build()["text"].split("\n", 1)[0],
+          _manifest.build()["text"].split("\n", 1)[0])
+
+    outsider = next(iter(everything - inside))
+    refused = _tools.dispatch("read_document", {"doc_id": outsider}, [sub])
+    check("reading an out-of-scope document is refused in words, not silence",
+          "outside the folders" in (refused.get("error") or ""), str(refused)[:160])
+    carded = _tools.dispatch("document_card", {"doc_id": outsider}, [sub])
+    check("an out-of-scope card is refused too",
+          "outside the folders" in (carded.get("error") or ""), str(carded)[:160])
+    allowed = _tools.dispatch("read_document", {"doc_id": next(iter(inside))}, [sub])
+    check("an in-scope document still reads normally",
+          not allowed.get("error") and allowed.get("text"), str(allowed)[:160])
+    # Otherwise the scope is bypassable in three lines of Python.
+    reachable = _tools._corpus_map([sub])
+    check("run_python's corpus map honours the scope",
+          set(reachable) == inside, f"{len(reachable)} entries vs {len(inside)} in scope")
+
+    # The dedupe interaction that is easy to get backwards: identical bytes filed
+    # in two folders are ONE content-addressed document, whose canonical abs_path
+    # is wherever it was seen first. Matching only that path would hide a document
+    # that genuinely sits in the folder the reader picked.
+    twin_dir = root / "second-room"
+    twin_dir.mkdir(parents=True, exist_ok=True)
+    twin_src = next(
+        p for p in _ingest.scan(Path(extract_dir)).files if p.name == "more.md"
+    )
+    (twin_dir / "copy.md").write_bytes(twin_src.read_bytes())
+    code, body, _ = admin.post("/api/ingest", {"path": str(twin_dir)})
+    wait_for_job(admin, lambda s: not s["jobs_running"], timeout=60)
+    twin = _sdb.one(
+        "SELECT doc_id FROM occurrences WHERE abs_path=?", (str(twin_dir / "copy.md"),)
+    )
+    filings = [
+        r["abs_path"]
+        for r in _sdb.rows("SELECT abs_path FROM occurrences WHERE doc_id=?",
+                           (twin["doc_id"] if twin else "",))
+    ]
+    # Asserted for both folders deliberately: exactly one of them is the
+    # non-canonical filing, and which one is an ingest-order detail.
+    check("a document filed both inside and outside a scope is in scope either way",
+          twin is not None
+          and _search.in_scope(twin["doc_id"], [str(twin_dir)])
+          and _search.in_scope(twin["doc_id"], [sub]),
+          f"filed at {filings}")
+    # Removed again: the storage section that follows asserts that purging drops
+    # *every* document once the extracted folder is deleted, and a copy living
+    # outside it would survive and make that count wrong.
+    shutil.rmtree(twin_dir, ignore_errors=True)
+
+    code, body, _ = admin.get(
+        "/api/manifest?scope=" + urllib.parse.quote(json.dumps([sub])))
+    check("the manifest route prices the scoped map for the picker",
+          code == 200 and body["n_indexed"] == scoped_map["n_indexed"]
+          and body["n_indexed_total"] == full_map["n_indexed"]
+          and body["cost_per_turn_usd"] >= 0, str(body)[:200])
+    code, body, _ = admin.get("/api/manifest?scope=" + urllib.parse.quote(json.dumps(["/etc"])))
+    check("a scope outside every known root is refused", code == 400, f"got {code}")
+    code, body, _ = admin.get("/api/manifest?scope=not-json")
+    check("a malformed scope is refused", code == 400, f"got {code}")
+
+    # An SSE body cannot carry a 400, so the scope has to be rejected before the
+    # stream opens rather than surfacing as a failed answer.
+    code, body, _ = admin.post(
+        "/api/ask", {"question": "what is revenue", "scope": ["/etc/passwd"]})
+    check("asking with a scope outside the known roots is refused before streaming",
+          code == 400 and "outside every known corpus root" in str(body),
+          f"got {code}: {str(body)[:120]}")
+
+    # The scope has to survive the answer: a past "not in the data room" is
+    # uninterpretable without knowing how much of the room was visible.
+    _sdb.execute(
+        "INSERT INTO qa_log(id, question, answer, citations, verdicts, tool_calls, usage,"
+        " model, duration_s, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("scopedqa0001", "anything in here?", "No.", "[]", "[]", "[]", "{}", "m", 1.0,
+         time.time()),
+    )
+    _sdb.execute("INSERT OR REPLACE INTO qa_scopes(qa_id, scope) VALUES(?,?)",
+                 ("scopedqa0001", json.dumps([sub])))
+    code, body, _ = admin.get("/api/qa-log?limit=5")
+    entry = next((e for e in body["entries"] if e["id"] == "scopedqa0001"), None)
+    check("the question log carries the scope the answer could see",
+          entry is not None and entry.get("scope") == [sub], str(entry)[:200])
+    older = next((e for e in body["entries"] if e["id"] != "scopedqa0001"), None)
+    check("a question asked without a scope reports an empty one, not an error",
+          older is None or older.get("scope") == [], str(older)[:120])
 
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")

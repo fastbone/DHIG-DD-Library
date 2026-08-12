@@ -190,7 +190,16 @@ async def main() -> int:
     cits = pick_citations()
     print("using citations:", cits)
 
-    agent.ask = lambda question, **kw: canned(question, cits)  # type: ignore[assignment]
+    # The scope the browser actually sent, recorded where it lands: the route
+    # validates it and hands it to the agent, and that hand-off is the thing worth
+    # asserting — a chip that looks right while posting nothing is the failure.
+    asked: list[dict] = []
+
+    def _ask(question, **kw):
+        asked.append(kw)
+        return canned(question, cits)
+
+    agent.ask = _ask  # type: ignore[assignment]
 
     import uvicorn
 
@@ -770,6 +779,81 @@ async def main() -> int:
             and "$5.40 of $4.00" in over["text"] and "-$" not in over["text"]
         )
 
+        # ── scoping a question to folders ─────────────────────────────────
+        checks["scope: the first question was asked against the whole corpus"] = (
+            bool(asked) and asked[0].get("scope") == []
+        )
+        await page.click('button[data-tab="ask"]')
+        checks["scope: the chip starts at the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(700)
+        rows = page.locator("#scopeTree .scope-row")
+        checks["scope: the chip opens a tree of folders that hold documents"] = (
+            await page.locator("#scopeModal.open").count() == 1 and await rows.count() >= 2
+        )
+        # The estimate is the reason to scope at all — the map is the standing
+        # per-turn cost, so its size has to be visible at the moment of choosing.
+        whole_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: the unscoped estimate states the map size and its cost per turn"] = (
+            "whole corpus" in whole_estimate and "tokens" in whole_estimate
+            and "per turn" in whole_estimate
+        )
+
+        # Pick the leaf folders, not the root: a scope that covers everything is
+        # indistinguishable from no scope and would prove nothing.
+        leaves = await page.evaluate(
+            """() => [...document.querySelectorAll('#scopeTree .scope-row')]
+                 .map((r, i) => ({i, depth: parseInt(r.style.paddingLeft) || 0,
+                                  path: r.querySelector('input').value}))
+                 .filter((r) => r.depth > 0).slice(0, 2)"""
+        )
+        for leaf in leaves:
+            await rows.nth(leaf["i"]).locator("input").check()
+        await page.wait_for_timeout(900)
+        scoped_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: ticking folders re-estimates against the selection"] = (
+            len(leaves) == 2 and " of " in scoped_estimate
+            and scoped_estimate != whole_estimate
+        )
+        await page.screenshot(path="/tmp/ask-scope.png", full_page=True)
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(300)
+        chip = await page.inner_text("#scopeChip")
+        checks["scope: the chip reports the selection and its document count"] = (
+            "2 folders" in chip and "docs" in chip
+            and await page.locator("#scopeModal.open").count() == 0
+        )
+
+        await page.fill("#question", "Is there anything about payroll in here?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            "() => document.getElementById('runMeta').textContent.includes('done in')",
+            timeout=30_000,
+        )
+        await page.wait_for_timeout(400)
+        checks["scope: a scoped question posts the folder prefixes"] = (
+            len(asked) >= 2
+            and asked[-1].get("scope") == [leaf["path"] for leaf in leaves]
+        )
+        # Scrolled back to weeks later, "not in the data room" has to carry what
+        # the room was at the time.
+        checks["scope: the answer says what it was allowed to see"] = (
+            "Scoped to" in await page.locator(".msg.assistant").last.inner_text()
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(600)
+        checks["scope: reopening the tree keeps the selection ticked"] = (
+            await page.locator("#scopeTree input:checked").count() == 2
+        )
+        await page.click("#scopeClear")
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(200)
+        checks["scope: clearing returns to the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -822,7 +906,7 @@ async def main() -> int:
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
           "/tmp/admin-budgets.png /tmp/sync-detail.png /tmp/sync-detail-live.png "
-          "/tmp/help-sharepoint.png")
+          "/tmp/ask-scope.png /tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

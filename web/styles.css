@@ -493,3 +493,21 @@ body.centered { display: grid; place-items: center; min-height: 100vh; padding: 
 .usage-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
 .audit-table td { font-size: 12px; }
 .audit-table tbody tr { cursor: default; }
+
+/* question scope: the folder picker and its chip */
+button.ghost.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.scope-tree {
+  max-height: 46vh; overflow-y: auto; margin: 10px 0 12px; padding: 6px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+}
+.scope-root {
+  font-family: var(--mono); font-size: 11px; padding: 6px 4px 2px;
+  overflow-wrap: anywhere;
+}
+.scope-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
+  cursor: pointer; font-size: 13px;
+}
+.scope-row:hover { background: var(--accent-soft); }
+.scope-row .n { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.scope-note { margin: 0 0 6px; }

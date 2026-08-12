@@ -1297,6 +1297,130 @@ $("question").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("askForm").requestSubmit();
 });
 
+/* ── question scope: which folders the assistant may see ──────────────── */
+// Sticky for the browser session, not the account: a scope belongs to the piece
+// of work in front of you, and inheriting yesterday's on a fresh sign-in would
+// silently narrow a question nobody meant to narrow.
+const SCOPE_KEY = "dd.scope";
+state.scope = (() => {
+  try { return JSON.parse(sessionStorage.getItem(SCOPE_KEY) || "[]"); } catch { return []; }
+})();
+let scopeDraft = [];
+let scopeFolders = [];
+let scopeEstimateTimer = null;
+
+function scopeCount(paths) {
+  // Nested selections would double-count, and a parent already covers its
+  // children, so count only the outermost picks.
+  const outer = paths.filter((p) => !paths.some((q) => q !== p && p.startsWith(q.replace(/\/$/, "") + "/")));
+  return outer.reduce(
+    (n, p) => n + (scopeFolders.find((f) => f.path === p)?.n_indexed || 0), 0);
+}
+
+function renderScopeChip() {
+  const chip = $("scopeChip");
+  if (!chip) return;
+  const n = state.scope.length;
+  chip.classList.toggle("on", n > 0);
+  if (!n) {
+    chip.textContent = "scope: whole corpus";
+    chip.title = "Limit this question to part of the library";
+    return;
+  }
+  const docs = scopeCount(state.scope);
+  chip.textContent = `scope: ${n} folder${n === 1 ? "" : "s"}${docs ? ` · ${nfmt(docs)} docs` : ""}`;
+  chip.title = state.scope.join("\n");
+}
+
+function scopeDraftPaths() {
+  return [...document.querySelectorAll("#scopeTree input:checked")].map((i) => i.value);
+}
+
+async function updateScopeEstimate() {
+  const paths = scopeDraftPaths();
+  const box = $("scopeEstimate");
+  box.textContent = "estimating…";
+  try {
+    const q = paths.length ? `?scope=${encodeURIComponent(JSON.stringify(paths))}` : "";
+    const m = await api(`/api/manifest${q}`);
+    const total = m.n_indexed_total ?? m.n_indexed;
+    box.innerHTML = paths.length
+      ? `${nfmt(m.n_indexed)} of ${nfmt(total)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`
+      : `whole corpus: ${nfmt(m.n_indexed)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`;
+  } catch (e) {
+    box.textContent = e.message;
+  }
+}
+
+function renderScopeTree() {
+  const tree = $("scopeTree");
+  if (!scopeFolders.length) {
+    tree.innerHTML = `<span class="muted small">No indexed folders yet.</span>`;
+    return;
+  }
+  tree.innerHTML = "";
+  let currentRoot = null;
+  for (const f of scopeFolders) {
+    if (f.root !== currentRoot) {
+      currentRoot = f.root;
+      if (f.depth > 0) tree.append(el("div", "scope-root muted small", currentRoot));
+    }
+    const row = el("label", "scope-row");
+    row.style.paddingLeft = `${f.depth * 18}px`;
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.value = f.path;
+    cb.checked = scopeDraft.includes(f.path);
+    cb.onchange = () => {
+      clearTimeout(scopeEstimateTimer);
+      scopeEstimateTimer = setTimeout(updateScopeEstimate, 250);
+    };
+    row.append(cb);
+    row.append(el("span", "n", f.name || f.path));
+    row.append(el("span", "tag dupe", `${nfmt(f.n_indexed)} indexed`));
+    if (f.n_documents > f.n_indexed) {
+      row.append(el("span", "tag", `${nfmt(f.n_documents - f.n_indexed)} not indexed`));
+    }
+    tree.append(row);
+  }
+}
+
+async function openScopeModal() {
+  scopeDraft = [...state.scope];
+  $("scopeModal").classList.add("open");
+  $("scopeTree").innerHTML = `<span class="muted small">loading…</span>`;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+  } catch (e) {
+    $("scopeTree").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+    return;
+  }
+  renderScopeTree();
+  updateScopeEstimate();
+}
+
+function closeScopeModal() {
+  $("scopeModal").classList.remove("open");
+}
+
+$("scopeChip").onclick = openScopeModal;
+$("scopeClose").onclick = closeScopeModal;
+$("scopeModal").onclick = (e) => { if (e.target.id === "scopeModal") closeScopeModal(); };
+$("scopeClear").onclick = () => {
+  for (const cb of document.querySelectorAll("#scopeTree input")) cb.checked = false;
+  updateScopeEstimate();
+};
+$("scopeApply").onclick = () => {
+  state.scope = scopeDraftPaths();
+  sessionStorage.setItem(SCOPE_KEY, JSON.stringify(state.scope));
+  renderScopeChip();
+  closeScopeModal();
+};
+renderScopeChip();
+
 $("askForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (state.running) return;
@@ -1329,6 +1453,16 @@ $("askForm").addEventListener("submit", async (e) => {
   // wiped by the next token — which is the opposite of the point.
   const notices = el("div", "notices");
   assistant.append(notices);
+  // Stated on the answer itself, not only on the chip: scrolled back to weeks
+  // later, "not in the data room" has to carry what the room was at the time.
+  if (state.scope.length) {
+    const names = state.scope.map((p) => p.replace(/\/$/, "").split("/").pop());
+    assistant.insertBefore(
+      el("div", "scope-note muted small",
+         `Scoped to ${names.join(", ")} — documents elsewhere were not readable.`),
+      think,
+    );
+  }
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -1347,6 +1481,7 @@ $("askForm").addEventListener("submit", async (e) => {
       body: JSON.stringify({
         question, history: state.history,
         verify: $("verifyToggle").checked, effort: $("effort").value,
+        scope: state.scope,
       }),
     });
     if (!res.ok) throw new Error((await res.text()) || res.statusText);
@@ -1559,9 +1694,16 @@ async function loadQaLog() {
     for (const e of r.entries) {
       const bad = (e.verdicts || []).filter((v) => v.verdict === "unsupported" || v.verdict === "partial").length;
       const n = el("div", "qa-entry");
+      // The scope belongs on the log line: an answer that found nothing means
+      // something different depending on how much of the library it could open.
+      const scope = e.scope || [];
+      const scopeTag = scope.length
+        ? `<span class="tag" title="${esc(scope.join("\n"))}">scoped: ${
+            esc(scope.map((p) => p.replace(/\/$/, "").split("/").pop()).join(", ").slice(0, 60))}</span> · `
+        : "";
       n.innerHTML = `<div class="q">${esc(e.question.slice(0, 190))}</div>
         <div class="muted small">${new Date(e.created_at * 1000).toLocaleString()} ·
-        ${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
+        ${scopeTag}${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
         ${money(e.usage?.cost_usd)} · ${Number(e.duration_s || 0).toFixed(0)}s</div>`;
       const detail = el("div", "body hidden");
       detail.innerHTML = renderMarkdown(e.answer || "");
@@ -1978,6 +2120,13 @@ $("refreshAudit").onclick = loadAudit;
 
 /* ── boot ────────────────────────────────────────────────────────────── */
 refreshStatus();
+// A scope restored from the session has paths but no counts; the chip needs the
+// counts to say how much of the library the next question can actually see.
+if (state.scope.length) {
+  api("/api/corpus/folders")
+    .then((r) => { scopeFolders = r.folders || []; renderScopeChip(); })
+    .catch(() => {});
+}
 loadDocs();
 loadArchives();
 loadConnections();

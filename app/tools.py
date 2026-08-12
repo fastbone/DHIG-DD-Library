@@ -189,10 +189,26 @@ def all_docs():
 '''
 
 
-def _corpus_map() -> dict:
+OUT_OF_SCOPE = (
+    "That document is outside the folders selected for this question. "
+    "Say so rather than guessing at its contents — the reader chose the folders."
+)
+
+
+def _corpus_map(scope=None) -> dict:
+    """The doc_id → paths map handed to run_python.
+
+    Scoping it is how the scope survives `run_python`: `dd.path`, `dd.find`,
+    `dd.text` and `dd.all_docs` all read from this map, so a map that stops at the
+    selected folders stops all four. Note this narrows what the *tools* offer, not
+    what the subprocess could reach — the sandbox has a filesystem, and that has
+    always been a trust boundary with the model rather than a wall (see README).
+    """
+    scope_sql, params = search.scope_clause(scope)
+    where = f" WHERE {scope_sql}" if scope_sql else ""
     out = {}
     for r in db.rows(
-        "SELECT id, abs_path, rel_path, title FROM documents"
+        f"SELECT id, abs_path, rel_path, title FROM documents{where}", params
     ):
         out[r["id"]] = {
             "abs_path": r["abs_path"],
@@ -203,13 +219,13 @@ def _corpus_map() -> dict:
     return out
 
 
-def run_python(code: str) -> dict:
+def run_python(code: str, scope=None) -> dict:
     if not settings.enable_python_tool:
         return {"error": "run_python is disabled (DD_ENABLE_PYTHON=0)"}
     with tempfile.TemporaryDirectory(prefix="dd-py-") as tmp:
         tmpdir = Path(tmp)
         (tmpdir / "dd.py").write_text(PRELUDE)
-        (tmpdir / "corpus.json").write_text(json.dumps(_corpus_map()))
+        (tmpdir / "corpus.json").write_text(json.dumps(_corpus_map(scope)))
         (tmpdir / "script.py").write_text(code)
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -303,7 +319,13 @@ def document_card(doc_id: str) -> dict:
     }
 
 
-def dispatch(name: str, payload: dict) -> dict:
+def dispatch(name: str, payload: dict, scope=None) -> dict:
+    """Run one tool call, restricted to `scope` if one is set.
+
+    The scope is enforced here rather than only described in the system prompt.
+    Every tool that can reach a document takes it: a scope the model is merely told
+    about is a scope it can forget, and the reader chose these folders.
+    """
     if name == "search_corpus":
         limit = max(1, min(int(payload.get("limit") or 20), 60))
         hits = search.search(
@@ -312,6 +334,7 @@ def dispatch(name: str, payload: dict) -> dict:
             workstream=payload.get("workstream"),
             doc_type=payload.get("doc_type"),
             doc_id=payload.get("doc_id"),
+            scope=scope,
         )
         return {"n_hits": len(hits), "hits": hits}
     if name == "list_documents":
@@ -321,6 +344,7 @@ def dispatch(name: str, payload: dict) -> dict:
             doc_type=payload.get("doc_type"),
             flagged=bool(payload.get("flagged")),
             duplicates=payload.get("duplicates") or "all",
+            scope=scope,
             limit=max(1, min(int(payload.get("limit") or 60), 300)),
             offset=int(payload.get("offset") or 0),
         )
@@ -330,16 +354,24 @@ def dispatch(name: str, payload: dict) -> dict:
                 d.pop(k, None)
         return result
     if name == "read_document":
+        doc_id = payload.get("doc_id", "")
+        # An explicit refusal, not empty output: the model has to be able to tell the
+        # reader what it could not open, rather than reporting a gap in the corpus.
+        if not search.in_scope(doc_id, scope):
+            return {"error": OUT_OF_SCOPE, "doc_id": doc_id}
         return read_document(
-            payload.get("doc_id", ""),
+            doc_id,
             payload.get("anchor"),
             payload.get("char_start", 0),
             payload.get("max_chars", 12_000),
         )
     if name == "document_card":
-        return document_card(payload.get("doc_id", ""))
+        doc_id = payload.get("doc_id", "")
+        if not search.in_scope(doc_id, scope):
+            return {"error": OUT_OF_SCOPE, "doc_id": doc_id}
+        return document_card(doc_id)
     if name == "run_python":
-        return run_python(payload.get("code", ""))
+        return run_python(payload.get("code", ""), scope)
     if name == "create_deliverable":
         return docgen.create(payload)
     return {"error": f"unknown tool {name}"}

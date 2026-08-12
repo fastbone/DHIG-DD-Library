@@ -85,8 +85,8 @@ def parse_citations(text: str) -> list[dict]:
     return list(seen.values())
 
 
-def system_blocks() -> tuple[list[dict], dict]:
-    m = manifest.build()
+def system_blocks(scope=None) -> tuple[list[dict], dict]:
+    m = manifest.build(scope)
     return (
         [
             {"type": "text", "text": INSTRUCTIONS},
@@ -130,6 +130,7 @@ async def ask(
     do_verify: bool = True,
     effort: str | None = None,
     actor: str | None = None,
+    scope: list[str] | None = None,
 ) -> AsyncIterator[dict]:
     started = time.time()
     qa_id = uuid.uuid4().hex[:12]
@@ -144,23 +145,37 @@ async def ask(
                "budget": await asyncio.to_thread(budget.status, actor)}
         return
 
-    system, m = system_blocks()
+    scope = [p for p in (scope or []) if p]
+    system, m = system_blocks(scope)
 
+    folders = ", ".join(p.rstrip("/").rsplit("/", 1)[-1] for p in scope)
     yield {
         "type": "status",
         "message": f"corpus map: {m['n_indexed']} documents, ~{m['approx_tokens']:,} tokens"
-        f" ({m['mode']} mode)",
+        f" ({m['mode']} mode)" + (f" · scoped to {folders}" if scope else ""),
         "qa_id": qa_id,
+        "scope": scope,
         "manifest": {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed")},
     }
 
     if m["n_indexed"] == 0:
         yield {
             "type": "error",
-            "message": "No documents are indexed yet. Point the app at a corpus, run Ingest, "
-            "then run the Sweep.",
+            "message": (
+                f"No indexed documents in {folders}. Widen the scope, or run the Sweep "
+                "if the folders were only just ingested."
+                if scope
+                else "No documents are indexed yet. Point the app at a corpus, run Ingest, "
+                "then run the Sweep."
+            ),
         }
         return
+
+    if scope:
+        db.execute(
+            "INSERT OR REPLACE INTO qa_scopes(qa_id, scope) VALUES(?,?)",
+            (qa_id, json.dumps(scope)),
+        )
 
     messages: list[dict] = list(history or [])
     messages.append({"role": "user", "content": question})
@@ -268,7 +283,7 @@ async def ask(
                             artifacts.append(out)
                             yield {"type": "artifact", **out}
                     else:
-                        out = await asyncio.to_thread(tools.dispatch, tu.name, payload)
+                        out = await asyncio.to_thread(tools.dispatch, tu.name, payload, scope)
                 except Exception as exc:  # noqa: BLE001
                     out = {"error": f"{type(exc).__name__}: {exc}"}
                 is_error = bool(isinstance(out, dict) and out.get("error"))
@@ -332,6 +347,7 @@ async def ask(
             "type": "done",
             "qa_id": qa_id,
             "answer": final_text,
+            "scope": scope,
             "citations": citations,
             "verdicts": verdicts,
             "artifacts": artifacts,
