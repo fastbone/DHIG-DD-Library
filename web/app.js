@@ -523,9 +523,62 @@ function onJob(ev) {
   $(which + "Meta").textContent = bits.join(" · ");
   const cancelBtn = $(which + "Cancel");
   if (cancelBtn) cancelBtn.dataset.job = ev.job_id;
+  if (ev.job_kind === "sync") onSyncJobDetail(ev);
+  // The ingest chained onto a sync writes the indexed and dropped counts onto the
+  // run row after the sync's own terminal event, so an open detail view needs a
+  // second look once that finishes.
+  if (ev.job_kind === "ingest" && ev.status !== "running" && runState.connId) {
+    setTimeout(() => loadRunList({ select: runState.runId }), 400);
+  }
   if (ev.status !== "running") {
     hideProgress(which);
     setTimeout(() => { refreshStatus(); loadDocs(); loadArchives(); loadConnections(); }, 300);
+  }
+}
+
+/* Keep an open detail modal live from the event stream rather than polling: the
+   event already carries the figures, so a watched sync updates on rclone's own
+   2-second cadence at no request cost. */
+function onSyncJobDetail(ev) {
+  if (!runState.connId || ev.conn_id !== runState.connId) return;
+  if (ev.status === "running") {
+    if (runState.runId && runState.runId !== ev.job_id) {
+      // A different run started while this was open. Follow it only if what is on
+      // screen has already finished — otherwise the reader deliberately opened
+      // something else and should keep it.
+      if (runState.current && runState.current.status === "running") return;
+      runState.current = null;
+      loadRunList({ listOnly: true });
+    }
+    runState.runId = ev.job_id;
+    // Only carry forward what belongs to *this* run. Merging whatever was last
+    // rendered would paint a previous run's changed-file list and start time onto
+    // a new live one, and it would stick.
+    const cur = runState.current && runState.current.id === ev.job_id
+      ? runState.current : {};
+    renderRunDetail({
+      ...cur,
+      id: ev.job_id, status: "running", live: true,
+      started_at: cur.started_at || Date.now() / 1000 - (ev.elapsed_s || 0),
+      transferred: ev.done, unchanged: ev.skipped, deleted: ev.deleted, errors: ev.failed,
+      bytes: ev.bytes_done, transferring: ev.transferring || [],
+      speed_bps: ev.speed_bps, eta_s: ev.eta_s, elapsed_s: ev.elapsed_s,
+      library_bytes: ev.library_bytes ?? cur.library_bytes,
+      message: ev.message,
+    });
+  } else {
+    // Finished: re-read *this* run explicitly, because loadRunList keeps whatever
+    // is already selected and the pane would otherwise sit on its last live frame
+    // — still labelled running, with no change list — which is exactly the answer
+    // someone watched the sync to get.
+    //
+    // But only if it is still the run on screen when the timer fires. Four hundred
+    // milliseconds is long enough to click another run in the history, and
+    // overwriting that choice is the same hijack the live path refuses to do.
+    setTimeout(() => {
+      if (runState.runId === ev.job_id) loadRunList({ select: ev.job_id });
+      else loadRunList({ listOnly: true });   // its row still needs its final status
+    }, 400);
   }
 }
 function hideProgress(which) {
@@ -759,6 +812,8 @@ async function loadConnections() {
         $("syncMeta").textContent = "starting …";
       } catch (e) { toast(e.message, true); }
     };
+    const detailBtn = el("button", "ghost", c.status === "syncing" ? "watch" : "detail");
+    detailBtn.onclick = () => openRunModal(c);
     const testBtn = el("button", "ghost", "test");
     testBtn.onclick = async () => {
       testBtn.disabled = true;
@@ -790,11 +845,172 @@ async function loadConnections() {
         loadConnections(); refreshStatus();
       } catch (e) { toast(e.message, true); }
     };
-    actions.append(syncBtn, testBtn, editBtn, useBtn, delBtn);
+    actions.append(syncBtn, detailBtn, testBtn, editBtn, useBtn, delBtn);
     row.append(meta, actions);
     box.append(row);
   }
 }
+
+/* ── sync run detail ─────────────────────────────────────────────────── */
+/* "Did the sync work" is answered by the row. "What did it change" is not, and
+   that is the question someone has on a Monday. The modal shows one run — live if
+   it is still going, otherwise as it finished — with the history beside it. */
+const runState = { connId: null, runId: null, label: "" };
+
+const secs = (s) =>
+  s == null ? "—" : s < 60 ? `${Math.round(s)}s`
+  : s < 3600 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`
+  : `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+
+const RUN_STATUS = { ok: "ok", running: "dupe", failed: "bad", cancelled: "flag" };
+
+function runRow(run, active) {
+  const item = el("div", "rowitem" + (active ? " on" : ""));
+  const when = new Date(run.started_at * 1000);
+  const tag = RUN_STATUS[run.status] || "dupe";
+  item.innerHTML = `<div class="meta">
+      <div class="t"><span class="tag ${tag}">${esc(run.status)}</span>
+        ${when.toLocaleDateString([], { day: "numeric", month: "short" })}
+        ${when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
+      <div class="muted small">${nfmt(run.transferred)} transferred${
+        run.deleted ? ` · ${nfmt(run.deleted)} deleted` : ""}${
+        run.errors ? ` · ${nfmt(run.errors)} errors` : ""}
+        ${run.actor ? "· " + esc(run.actor) : ""}</div>
+    </div>`;
+  item.onclick = () => loadRun(run.id);
+  return item;
+}
+
+function renderRunDetail(run) {
+  runState.current = run;
+  const box = $("runDetail");
+  const dur = run.finished_at ? run.finished_at - run.started_at : run.elapsed_s;
+  const stats = [
+    ["transferred", nfmt(run.transferred)],
+    ["unchanged", nfmt(run.unchanged)],
+    ["deleted", nfmt(run.deleted)],
+    ["errors", nfmt(run.errors)],
+    ["moved", bytes(run.bytes)],
+    ["duration", secs(dur)],
+  ];
+  if (run.live) {
+    stats.push(["rate", run.speed_bps ? `${bytes(run.speed_bps)}/s` : "—"]);
+    stats.push(["eta", secs(run.eta_s)]);
+  }
+  // Indexing is a separate step chained onto the sync, and "12 files copied" is
+  // not the same fact as "9 new documents indexed" — both get asked about.
+  if (run.indexed_new != null) stats.push(["indexed", nfmt(run.indexed_new)]);
+  if (run.purged) stats.push(["dropped", nfmt(run.purged)]);
+
+  const changes = run.changes || [];
+  const errs = run.error_lines || [];
+  box.innerHTML = `
+    <div class="row between wrap">
+      <div><span class="tag ${RUN_STATUS[run.status] || "dupe"}">${esc(run.status)}</span>
+        <span class="muted small">${new Date(run.started_at * 1000).toLocaleString()}
+        ${run.actor ? "· started by " + esc(run.actor) : ""}</span></div>
+      ${run.live ? '<span class="muted small">updating live</span>' : ""}
+    </div>
+    ${run.message ? `<p class="muted small">${esc(run.message)}</p>` : ""}
+    ${run.error ? `<div class="notice err">${esc(run.error)}</div>` : ""}
+    <div class="stat-grid tight">${stats.map(([k, v]) =>
+      `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`).join("")}</div>
+    ${run.library_files != null
+      ? `<p class="muted small">Library holds ${nfmt(run.library_files)} matching file(s),
+         ${bytes(run.library_bytes)}.</p>` : ""}
+    ${run.live && (run.transferring || []).length ? `
+      <h3>In flight</h3>
+      <div class="bars">${run.transferring.map((t) => `
+        <div class="barrow">
+          <span class="doc-path" title="${esc(t.name)}">${esc(t.name.split("/").pop())}</span>
+          <span class="track"><span class="fill" style="width:${t.percentage}%"></span></span>
+          <span class="n">${t.percentage}%</span>
+        </div>`).join("")}</div>` : ""}
+    ${errs.length ? `
+      <h3>Errors (${errs.length})</h3>
+      <pre class="pre-scroll">${esc(errs.join("\n"))}</pre>` : ""}
+    <h3>Changed files ${changes.length ? `(${changes.length}${
+      changes.length >= 500 ? "+, capped" : ""})` : ""}</h3>
+    ${changes.length ? `
+      <div class="table-scroll"><table><thead><tr><th>What</th><th>Path</th></tr></thead>
+        <tbody>${changes.map((c) => `<tr>
+          <td><span class="tag ${c.op === "deleted" ? "bad" : "dupe"}">${esc(c.op)}</span></td>
+          <td class="doc-path">${esc(c.path)}</td></tr>`).join("")}</tbody></table></div>`
+      : `<p class="muted small">${run.status === "running"
+          ? "Nothing moved yet."
+          : "Nothing changed — every file was already mirrored."}</p>`}`;
+}
+
+async function loadRun(runId) {
+  runState.runId = runId;
+  try {
+    const r = await api(`/api/sync/runs/${runId}`);
+    renderRunDetail(r.run);
+    for (const item of $("runList").children) item.classList.remove("on");
+    const idx = [...$("runList").children].findIndex((n) => n.dataset.run === runId);
+    if (idx >= 0) $("runList").children[idx].classList.add("on");
+  } catch (e) {
+    $("runDetail").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+  }
+}
+
+async function loadRunList({ select = null, listOnly = false } = {}) {
+  if (!runState.connId) return;
+  try {
+    const r = await api(`/api/sync/connections/${runState.connId}/runs`);
+    const box = $("runList");
+    box.innerHTML = "";
+    if (!r.runs.length) {
+      box.innerHTML = `<span class="muted small">this library has not synced yet</span>`;
+      $("runDetail").innerHTML =
+        `<p class="muted small">Press <strong>sync now</strong> on the connection to mirror it
+         for the first time. The detail of every run appears here afterwards.</p>`;
+      return;
+    }
+    for (const run of r.runs) {
+      const node = runRow(run, run.id === runState.runId);
+      node.dataset.run = run.id;
+      box.append(node);
+    }
+    // A caller may name the run to show — a run that has just finished, whose
+    // stored detail now differs from what is on screen. Otherwise default to
+    // whatever is running, else the most recent, which is what the person opening
+    // this is asking about in both cases.
+    // listOnly refreshes the navigation and leaves the pane alone — used when a
+    // live event is already driving it. Without that, this would helpfully load
+    // "the newest run" over the top of the running one the event is painting.
+    if (listOnly) return;
+    if (select) {
+      await loadRun(select);
+    } else if (!runState.runId || !r.runs.some((x) => x.id === runState.runId)) {
+      await loadRun(r.running_id || r.runs[0].id);
+    }
+  } catch (e) {
+    $("runDetail").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+  }
+}
+
+function openRunModal(conn) {
+  runState.connId = conn.id;
+  runState.runId = null;
+  runState.current = null;
+  runState.label = conn.label;
+  $("runTitle").textContent = `${conn.label} — sync detail`;
+  $("runList").innerHTML = "";
+  $("runDetail").innerHTML = `<span class="muted small">loading…</span>`;
+  $("runModal").classList.add("open");
+  loadRunList();
+}
+
+function closeRunModal() {
+  $("runModal").classList.remove("open");
+  runState.connId = null;
+  runState.runId = null;
+  runState.current = null;
+}
+
+$("runClose").onclick = closeRunModal;
+$("runModal").onclick = (e) => { if (e.target.id === "runModal") closeRunModal(); };
 
 let editingConnection = null;
 

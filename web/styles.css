@@ -421,6 +421,17 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 /* The connect form is taller than the picker; keep it inside the viewport. */
 #connectModal .modal-body { max-height: 92vh; overflow-y: auto; }
+/* Sync detail carries a file table, so it needs the width the forms do not. */
+.modal-body.wide { width: min(1000px, 94vw); max-height: 92vh; overflow-y: auto; }
+.run-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 820px) { .run-layout { grid-template-columns: 1fr; } }
+.run-history .rowlist { max-height: 60vh; overflow-y: auto; }
+.run-history .rowitem { cursor: pointer; }
+.run-history .rowitem:hover { border-color: var(--line-2); }
+.run-history .rowitem.on { border-color: var(--accent); background: var(--accent-soft); }
+.run-detail { min-width: 0; display: grid; gap: 10px; }
+.run-detail h3 { margin: 6px 0 0; }
+.run-detail .barrow { grid-template-columns: minmax(0, 1fr) 90px 44px; }
 .picker-list { max-height: 46vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
 .picker-list div { padding: 7px 11px; cursor: pointer; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--line); }
 .picker-list div:hover { background: var(--panel-2); color: var(--accent); }

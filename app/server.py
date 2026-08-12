@@ -830,6 +830,33 @@ async def edit_connection(
     return {"connection": conn}
 
 
+@app.get("/api/sync/connections/{conn_id}/runs")
+async def sync_run_list(conn_id: str, limit: int = 12, _: dict = Depends(auth.require_admin)):
+    """Recent runs for one connection, newest first, without the per-file lists."""
+    if sync.get(conn_id) is None:
+        raise HTTPException(404, "unknown connection")
+    running = next(
+        (j.id for j in JOBS.values() if getattr(j, "conn_id", None) == conn_id), None
+    )
+    return {"runs": db.sync_runs(conn_id, limit=limit), "running_id": running}
+
+
+@app.get("/api/sync/runs/{run_id}")
+async def sync_run_detail(run_id: str, _: dict = Depends(auth.require_admin)):
+    """One run in full: the counts, the paths it changed, and why it failed."""
+    run = db.sync_run(run_id)
+    if run is None:
+        raise HTTPException(404, "unknown run")
+    job = JOBS.get(run_id)
+    # Only while the row itself still says running. The job stays registered through
+    # the ingest chained onto the sync — minutes after _finish wrote a terminal
+    # status — and overlaying then would relabel a finished run as live, replace its
+    # final change list with the in-memory tail, and leave stale transfers in flight.
+    if job is not None and run.get("status") == "running":
+        run.update(job.live_snapshot())
+    return {"run": run}
+
+
 @app.post("/api/sync/connections/{conn_id}/test")
 async def test_connection(conn_id: str, admin: dict = Depends(auth.require_admin)):
     try:
