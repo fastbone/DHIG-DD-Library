@@ -848,10 +848,21 @@ def main() -> int:
     allowed = _tools.dispatch("read_document", {"doc_id": next(iter(inside))}, [sub])
     check("an in-scope document still reads normally",
           not allowed.get("error") and allowed.get("text"), str(allowed)[:160])
-    # Otherwise the scope is bypassable in three lines of Python.
-    reachable = _tools._corpus_map([sub])
-    check("run_python's corpus map honours the scope",
-          set(reachable) == inside, f"{len(reachable)} entries vs {len(inside)} in scope")
+    # Otherwise the scope is bypassable in three lines of Python. Driven through
+    # the tool rather than the helper: the helper honouring a scope it is never
+    # handed would prove nothing.
+    piped = _tools.dispatch(
+        "run_python",
+        {"code": "import dd, json; print(json.dumps(sorted(dd.all_docs())))",
+         "purpose": "list what the sandbox can reach"},
+        [sub],
+    )
+    try:
+        reachable = set(json.loads(piped.get("stdout") or "[]"))
+    except json.JSONDecodeError:
+        reachable = {"<unparseable>"}
+    check("run_python only sees in-scope documents",
+          reachable == inside, f"{sorted(reachable)} vs {sorted(inside)}")
 
     # The dedupe interaction that is easy to get backwards: identical bytes filed
     # in two folders are ONE content-addressed document, whose canonical abs_path
