@@ -132,15 +132,17 @@ Search complements the catalogue filter rather than replacing it: the Documents
 filter matches names, titles, parties and summaries — the *card* — while this
 matches the text inside the files.
 
-**Ask tab** — ask in whatever words you have; the question is scoped before it
+**Ask tab** — ask in whatever words you have; the question is refined before it
 is answered. See *Refining a question* below. Then streaming answers with the
 reasoning summary, the tool trace (every search, read and computation), and a
 citations panel. Clicking any citation opens the source document at that exact
 page. With verification on, each cited claim is re-checked against its cited
 span by a second model and badged `supported` / `partial` / `unsupported`.
 
-The **scope** chip beside *effort* limits one question to part of the library —
+The **scope** chip in the composer limits one question to part of the library —
 any number of folders, at any depth. See *Scoping a question to folders* below.
+The model and effort a run uses are chosen on the brief, where the refiner has
+just proposed them, rather than in the composer.
 
 **Deliverables tab** — Word, Excel, PowerPoint and Markdown documents the
 analyst generated, plus the question log: every question, its citations, its
