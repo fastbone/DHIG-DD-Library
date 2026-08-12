@@ -565,11 +565,18 @@ function onSyncJobDetail(ev) {
       message: ev.message,
     });
   } else {
-    // Finished: re-read *this* run explicitly. loadRunList keeps whatever is
-    // already selected, so without the forced selection the pane would sit on its
-    // last live frame — still labelled running, with no change list — which is
-    // exactly the answer someone watched the sync to get.
-    setTimeout(() => { loadRunList({ select: ev.job_id }); }, 400);
+    // Finished: re-read *this* run explicitly, because loadRunList keeps whatever
+    // is already selected and the pane would otherwise sit on its last live frame
+    // — still labelled running, with no change list — which is exactly the answer
+    // someone watched the sync to get.
+    //
+    // But only if it is still the run on screen when the timer fires. Four hundred
+    // milliseconds is long enough to click another run in the history, and
+    // overwriting that choice is the same hijack the live path refuses to do.
+    setTimeout(() => {
+      if (runState.runId === ev.job_id) loadRunList({ select: ev.job_id });
+      else loadRunList({ listOnly: true });   // its row still needs its final status
+    }, 400);
   }
 }
 function hideProgress(which) {

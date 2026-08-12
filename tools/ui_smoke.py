@@ -647,6 +647,28 @@ async def main() -> int:
             and "01_financial/model.xlsx" in done and "04_hr/headcount.csv" in done
         )
 
+        # Switching runs while a terminal reload is pending must win. The reload is
+        # scheduled 400ms out, which is plenty of time to click another row, and
+        # overwriting that choice is the same hijack the live path refuses.
+        await page.evaluate(
+            """(cx) => {
+                 // Terminal event schedules its reload...
+                 onJob({kind: "job", job_id: "sync-uilive", job_kind: "sync", conn_id: cx,
+                        status: "done", total: 4, done: 4, failed: 0, skipped: 2,
+                        deleted: 0, bytes_done: 1048576, message: "Synced"});
+                 // ...and the reader immediately picks a different run.
+                 loadRun("sync-uifail");
+               }""",
+            cx_id,
+        )
+        await page.wait_for_timeout(1200)
+        held = (await page.inner_text("#runDetail")).lower()
+        checks["sync detail: switching runs beats a pending finish reload"] = (
+            "aadsts7000215" in held and "01_financial/model.xlsx" not in held
+        )
+        await page.evaluate("() => loadRun('sync-uilive')")
+        await page.wait_for_timeout(600)
+
         # A live event must never inherit fields from a different run. Asserted on
         # the merge itself rather than through timing: the window it used to go
         # wrong in is a few hundred milliseconds wide, and a test that races it
