@@ -313,9 +313,12 @@ subtree.
 described to the model.** `search_corpus` and `list_documents` are filtered;
 `read_document` and `document_card` refuse an out-of-scope id in words ("that
 document is outside the folders selected for this question") so the model reports
-the limit instead of guessing at a gap; and `run_python` is handed a corpus map
-containing only in-scope documents, since otherwise the scope would be
-bypassable in three lines of Python. Describing a scope without enforcing it
+the limit instead of guessing at a gap; a card's near-duplicate family is filtered
+too, since that list is *other documents* and handing over their ids gives the
+model something to cite that it cannot open; `run_python` is handed a corpus map
+containing only in-scope documents, since otherwise the scope would be bypassable
+in three lines of Python; and verification will not open an out-of-scope citation,
+because that pass takes the doc_id in the answer on trust. Describing a scope without enforcing it
 would be worse than not having one: the model would cite documents it could not
 open and mis-state what it had looked at.
 
@@ -325,6 +328,12 @@ in scope if **any** of its filings is: documents are content-addressed, so
 identical bytes in two folders are one row whose canonical path is wherever it
 was seen first, and matching only that path would hide a document that genuinely
 sits in the folder the reader picked.
+
+A stored scope outlives the corpus it names: delete an extracted folder or
+re-point the app and its prefixes are no longer inside any known root, so the
+browser re-checks them against the roots whenever it loads the tree, drops what
+is gone, and says so — silently answering against more of the library than the
+reader chose would be the worst available outcome.
 
 A scope is sticky for the browser session, echoed on the answer itself, and
 recorded against the question in the Deliverables log — because a past
@@ -701,9 +710,9 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 188 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
+python3 tools/api_smoke.py            # 190 checks: auth, CSRF, keys, uploads, access, sync, storage, scope
 python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 102 checks: the browser front end, end to end
+python3 tools/ui_smoke.py             # 105 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 

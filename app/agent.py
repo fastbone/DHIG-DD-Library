@@ -322,7 +322,7 @@ async def ask(
         elif do_verify and citations:
             yield {"type": "phase", "phase": "verifying"}
             async for v in verify.verify_answer(
-                final_text, meter=meter, attribution=payer.as_kind("verifier")
+                final_text, meter=meter, attribution=payer.as_kind("verifier"), scope=scope
             ):
                 verdicts.append(v)
                 yield {"type": "verdict", **v}

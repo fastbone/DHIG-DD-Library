@@ -1314,6 +1314,37 @@ state.scope = (() => {
 let scopeDraft = [];
 let scopeFolders = [];
 let scopeEstimateTimer = null;
+let scopeEstimateIssued = 0;
+
+// A stored scope outlives the corpus it names. Delete an extracted folder, or
+// re-point the app, and the saved prefixes are no longer inside any known root —
+// at which point the server rejects them and *every* question 400s until someone
+// thinks to clear the chip by hand. So the restored scope is checked against the
+// roots the server will check it against, and anything gone is dropped.
+function pruneScope(roots) {
+  if (!state.scope.length || !Array.isArray(roots) || !roots.length) return;
+  const inside = (p) => roots.some((r) => {
+    const root = r.replace(/\/$/, "");
+    return p === root || p.startsWith(root + "/");
+  });
+  const kept = state.scope.filter(inside);
+  if (kept.length === state.scope.length) return;
+  const lost = state.scope.length - kept.length;
+  setScope(kept);
+  // Said out loud, never silently: the alternative is a question quietly
+  // answered against more of the library than the reader chose.
+  toast(
+    `${lost} folder${lost === 1 ? "" : "s"} in your saved scope no longer exist — ` +
+    (kept.length ? "scope narrowed to what is left." : "back to the whole corpus."),
+    true,
+  );
+}
+
+function setScope(paths) {
+  state.scope = paths;
+  sessionStorage.setItem(SCOPE_KEY, JSON.stringify(paths));
+  renderScopeChip();
+}
 
 function scopeCount(paths) {
   // Nested selections would double-count, and a parent already covers its
@@ -1343,12 +1374,17 @@ function scopeDraftPaths() {
 }
 
 async function updateScopeEstimate() {
+  // Debouncing only delays the starts; the replies still race. Ticking a third
+  // folder while the two-folder estimate is in flight must not leave the price of
+  // two folders under a selection of three.
+  const mine = ++scopeEstimateIssued;
   const paths = scopeDraftPaths();
   const box = $("scopeEstimate");
   box.textContent = "estimating…";
   try {
     const q = paths.length ? `?scope=${encodeURIComponent(JSON.stringify(paths))}` : "";
     const m = await api(`/api/manifest${q}`);
+    if (mine !== scopeEstimateIssued) return;
     const total = m.n_indexed_total ?? m.n_indexed;
     box.innerHTML = paths.length
       ? `${nfmt(m.n_indexed)} of ${nfmt(total)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
@@ -1356,6 +1392,7 @@ async function updateScopeEstimate() {
       : `whole corpus: ${nfmt(m.n_indexed)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
          ${money(m.cost_per_turn_usd)} per turn`;
   } catch (e) {
+    if (mine !== scopeEstimateIssued) return;
     box.textContent = e.message;
   }
 }
@@ -1400,6 +1437,8 @@ async function openScopeModal() {
   try {
     const r = await api("/api/corpus/folders");
     scopeFolders = r.folders || [];
+    pruneScope(r.roots);
+    scopeDraft = [...state.scope];
   } catch (e) {
     $("scopeTree").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
     return;
@@ -1420,9 +1459,7 @@ $("scopeClear").onclick = () => {
   updateScopeEstimate();
 };
 $("scopeApply").onclick = () => {
-  state.scope = scopeDraftPaths();
-  sessionStorage.setItem(SCOPE_KEY, JSON.stringify(state.scope));
-  renderScopeChip();
+  setScope(scopeDraftPaths());
   closeScopeModal();
 };
 renderScopeChip();
@@ -1490,7 +1527,19 @@ $("askForm").addEventListener("submit", async (e) => {
         scope: state.scope,
       }),
     });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) {
+      const detail = (await res.text()) || res.statusText;
+      // The corpus can be re-pointed or an extracted folder deleted between
+      // choosing a scope and asking. Recover here rather than leaving every
+      // question failing on a chip nobody suspects.
+      if (res.status === 400 && detail.includes("outside every known corpus root")) {
+        api("/api/corpus/folders")
+          .then((r) => { scopeFolders = r.folders || []; pruneScope(r.roots); })
+          .catch(() => {});
+        throw new Error(`${detail} — the scope has been re-checked; ask again.`);
+      }
+      throw new Error(detail);
+    }
 
     for await (const ev of sseStream(res)) {
       switch (ev.type) {
@@ -2260,7 +2309,7 @@ refreshStatus().then(() => {
 // counts to say how much of the library the next question can actually see.
 if (state.scope.length) {
   api("/api/corpus/folders")
-    .then((r) => { scopeFolders = r.folders || []; renderScopeChip(); })
+    .then((r) => { scopeFolders = r.folders || []; pruneScope(r.roots); renderScopeChip(); })
     .catch(() => {});
 }
 loadDocs();

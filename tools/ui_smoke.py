@@ -958,12 +958,70 @@ async def main() -> int:
         checks["scope: reopening the tree keeps the selection ticked"] = (
             await page.locator("#scopeTree input:checked").count() == 2
         )
+
+        # The estimate's replies race the same way the search box's do: ticking a
+        # third folder while the two-folder estimate is in flight must not leave
+        # the price of two under a selection of three.
+        # Only the first estimate is stalled; the one that follows it is answered
+        # live, so the fake reply necessarily lands second.
+        stalled = {"used": False}
+
+        async def stall_estimate(route):
+            if "scope=" in route.request.url and not stalled["used"]:
+                stalled["used"] = True
+                await asyncio.sleep(1.5)
+                await route.fulfill(
+                    status=200, content_type="application/json",
+                    body=json.dumps({"mode": "full", "chars": 1, "approx_tokens": 7777,
+                                     "n_indexed": 7777, "n_indexed_total": 7777,
+                                     "n_unindexed": 0, "scope": [], "rollup": {},
+                                     "cost_per_turn_usd": 0.0}),
+                )
+            else:
+                await route.continue_()
+
+        await page.route("**/api/manifest**", stall_estimate)
+        # Pinned by value, not by ":not(:checked)": locators re-resolve, and after
+        # the tick that selector points at a different box, so the uncheck would
+        # silently land on the wrong one — as a no-op, firing no second request.
+        spare = await page.locator(
+            "#scopeTree .scope-row input:not(:checked)").first.get_attribute("value")
+        third = page.locator(f'#scopeTree input[value="{spare}"]')
+        await third.check()                        # stalled request in flight
+        await page.wait_for_timeout(500)
+        await third.uncheck()                      # newer request, answered live
+        await page.wait_for_timeout(2000)
+        checks["scope: a stale estimate cannot overwrite a newer one"] = (
+            stalled["used"]
+            and await page.locator("#scopeTree input:checked").count() == 2
+            and "7,777" not in await page.inner_text("#scopeEstimate")
+        )
+        await page.unroute("**/api/manifest**", stall_estimate)
+
         await page.click("#scopeClear")
         await page.click("#scopeApply")
         await page.wait_for_timeout(200)
         checks["scope: clearing returns to the whole corpus"] = (
             "whole corpus" in await page.inner_text("#scopeChip")
         )
+
+        # A saved scope outlives the corpus it names — delete an extracted folder
+        # or re-point the app and the server rejects those prefixes, which without
+        # a prune leaves *every* question failing on a chip nobody suspects.
+        await page.evaluate(
+            """() => { setScope(["/nowhere/at/all", "/also/gone"]); }"""
+        )
+        checks["scope: a stale saved scope is restored before it is checked"] = (
+            "2 folders" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(800)
+        checks["scope: folders that no longer exist are dropped from a saved scope"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "no longer exist" in await page.inner_text("#toast")
+        )
+        await page.click("#scopeClose")
+        await page.wait_for_timeout(200)
 
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.

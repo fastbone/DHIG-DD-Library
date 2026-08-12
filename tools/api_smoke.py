@@ -774,6 +774,7 @@ def main() -> int:
     from app import manifest as _manifest
     from app import search as _search
     from app import tools as _tools
+    from app import verify as _verify
 
     # Cards, stamped directly: the manifest is assembled from carded documents and
     # carding them for real would spend money this test is not allowed to spend.
@@ -848,6 +849,43 @@ def main() -> int:
     allowed = _tools.dispatch("read_document", {"doc_id": next(iter(inside))}, [sub])
     check("an in-scope document still reads normally",
           not allowed.get("error") and allowed.get("text"), str(allowed)[:160])
+
+    # A card gated on its own id can still hand over its *version family* — other
+    # documents, with ids and titles the model can then cite but never open. Two
+    # near-duplicates are put in one group with only one of them in scope.
+    twins = sorted(inside)[:1] + sorted(everything - inside)[:1]
+    if len(twins) == 2:
+        for doc in twins:
+            _sdb.execute("UPDATE documents SET dupe_group=? WHERE id=?", ("scope-test", doc))
+        card = _tools.dispatch("document_card", {"doc_id": twins[0]}, [sub])
+        family = {d["doc_id"] for d in card.get("near_duplicates", [])}
+        unscoped = _tools.dispatch("document_card", {"doc_id": twins[0]})
+        check("a card's version family obeys the scope",
+              twins[1] not in family
+              and twins[1] in {d["doc_id"] for d in unscoped.get("near_duplicates", [])},
+              f"scoped={sorted(family)} unscoped="
+              f"{sorted(d['doc_id'] for d in unscoped.get('near_duplicates', []))}")
+        for doc in twins:
+            _sdb.execute("UPDATE documents SET dupe_group=NULL WHERE id=?", (doc,))
+    else:
+        check("a card's version family obeys the scope", False, "need two documents")
+
+    # Verification is a second pass over text the model wrote, so it takes the
+    # doc_id on trust. A citation outside the scope must not be opened there.
+    # Anchored on a unit that really exists, and asserted against the unscoped
+    # call: "returns nothing" proves nothing if the citation resolves to nothing
+    # either way.
+    unit = _sdb.one(
+        "SELECT doc_id, anchor FROM units WHERE doc_id IN "
+        f"({','.join('?' * len(everything - inside))}) LIMIT 1",
+        tuple(everything - inside),
+    )
+    cite = f"{unit['doc_id']}:{unit['anchor']}" if unit else ""
+    check("verification will not open an out-of-scope citation",
+          bool(cite) and _verify.span_for(cite, [sub])[1] == ""
+          and _verify.span_for(cite)[1] != "",
+          f"{cite}: scoped={_verify.span_for(cite, [sub])[1][:40]!r}"
+          if cite else "no out-of-scope unit to cite")
     # Otherwise the scope is bypassable in three lines of Python. Driven through
     # the tool rather than the helper: the helper honouring a scope it is never
     # handed would prove nothing.

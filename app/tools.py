@@ -282,7 +282,7 @@ def read_document(doc_id: str, anchor: str | None, char_start: int, max_chars: i
     }
 
 
-def document_card(doc_id: str) -> dict:
+def document_card(doc_id: str, scope=None) -> dict:
     doc = db.doc_dict(db.one("SELECT * FROM documents WHERE id=?", (doc_id,)))
     if doc is None:
         return {"error": f"unknown doc_id {doc_id}"}
@@ -294,14 +294,24 @@ def document_card(doc_id: str) -> dict:
             (doc_id,),
         )
     ]
+    # The version family is a list of *other documents*, so it has to obey the
+    # scope: handing over the id and title of a near-duplicate the reader excluded
+    # gives the model something to cite that it is not allowed to open, which is
+    # exactly the failure gating read_document is meant to prevent.
+    dupe_sql, dupe_params = search.scope_clause(scope)
     near = [
         {"doc_id": r["id"], "rel_path": r["rel_path"], "title": r["title"]}
         for r in db.rows(
             "SELECT id, rel_path, title FROM documents WHERE dupe_group IS NOT NULL"
-            " AND dupe_group=(SELECT dupe_group FROM documents WHERE id=?) AND id!=?",
-            (doc_id, doc_id),
+            " AND dupe_group=(SELECT dupe_group FROM documents WHERE id=?) AND id!=?"
+            + (f" AND {dupe_sql}" if dupe_sql else ""),
+            (doc_id, doc_id, *dupe_params),
         )
     ]
+    # Not scoped, deliberately: these are other filings of *this* document, which
+    # is in scope by the time we get here. They expose no further content and no
+    # other id, and they are how the reader learns the same file sits in two
+    # places — which is a finding, not a leak.
     also_at = [
         r["rel_path"]
         for r in db.rows(
@@ -369,7 +379,7 @@ def dispatch(name: str, payload: dict, scope=None) -> dict:
         doc_id = payload.get("doc_id", "")
         if not search.in_scope(doc_id, scope):
             return {"error": OUT_OF_SCOPE, "doc_id": doc_id}
-        return document_card(doc_id)
+        return document_card(doc_id, scope)
     if name == "run_python":
         return run_python(payload.get("code", ""), scope)
     if name == "create_deliverable":
