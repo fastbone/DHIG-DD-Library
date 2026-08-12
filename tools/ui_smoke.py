@@ -582,6 +582,67 @@ async def main() -> int:
             and "$5.40 of $4.00" in over["text"] and "-$" not in over["text"]
         )
 
+        # ── full-text search, in all three mounts ─────────────────────────
+        await page.click('button[data-tab="search"]')
+        await page.fill("#searchFullMount .search-q", "revenue")
+        await page.wait_for_timeout(900)
+        checks["search: the Search tab lists passage hits"] = (
+            await page.locator("#searchFullMount .search-hit").count() >= 1
+        )
+        note = await page.inner_text("#searchFullMount .search-note")
+        checks["search: hits are counted as passages and documents"] = (
+            "passage" in note and "document" in note
+        )
+        checks["search: the matched term is marked in the snippet"] = (
+            await page.locator("#searchFullMount .search-hit mark").count() >= 1
+        )
+        await page.screenshot(path="/tmp/search-tab.png", full_page=True)
+
+        # Clicking a hit must open the reader at that hit's anchor — the whole point
+        # of returning passages rather than documents.
+        anchor_tag = await page.inner_text("#searchFullMount .search-hit:first-child .tag")
+        await page.click("#searchFullMount .search-hit:first-child")
+        await page.wait_for_timeout(900)
+        checks["search: a hit opens the document drawer"] = (
+            await page.locator("#drawer.open").count() == 1
+            and len(await page.inner_text("#drawerText")) > 40
+        )
+        checks["search: the drawer opens at the hit's own anchor"] = (
+            await page.locator(f'#drawerAnchors [data-a="{anchor_tag}"].active').count() == 1
+        )
+        await page.click("#drawerClose")
+        await page.wait_for_timeout(200)
+
+        # Two characters minimum, and "nothing typed" must not read as "no matches".
+        await page.fill("#searchFullMount .search-q", "z")
+        await page.wait_for_timeout(600)
+        checks["search: a too-short query says so rather than reporting no matches"] = (
+            "two characters" in (await page.inner_text("#searchFullMount .search-hits")).lower()
+        )
+        await page.fill("#searchFullMount .search-q", "zzzqqqnothinghere")
+        await page.wait_for_timeout(700)
+        checks["search: no matches is distinct from nothing typed"] = (
+            "no passage matches" in (await page.inner_text("#searchFullMount")).lower()
+        )
+
+        # All three mounts are the same component; a mount that was never wired is
+        # the failure this catches.
+        for mount, tab in (("searchCorpusMount", "corpus"), ("searchAskMount", "ask")):
+            await page.click(f'button[data-tab="{tab}"]')
+            await page.fill(f"#{mount} .search-q", "revenue")
+            await page.wait_for_timeout(900)
+            checks[f"search: the {tab} mount returns hits too"] = (
+                await page.locator(f"#{mount} .search-hit").count() >= 1
+            )
+            # Compact mounts drop the filters; the full one keeps them.
+            checks[f"search: the {tab} mount is the compact form"] = (
+                await page.locator(f"#{mount} .search-ws").count() == 0
+            )
+        checks["search: the full mount keeps its filters"] = (
+            await page.locator("#searchFullMount .search-ws").count() == 1
+        )
+        await page.screenshot(path="/tmp/search-ask-mount.png", full_page=True)
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -633,7 +694,8 @@ async def main() -> int:
     print("screenshots: /tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
-          "/tmp/admin-budgets.png /tmp/help-sharepoint.png")
+          "/tmp/admin-budgets.png /tmp/search-tab.png "
+          "/tmp/search-ask-mount.png /tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

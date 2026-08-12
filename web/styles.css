@@ -177,6 +177,25 @@ textarea { width: 100%; resize: vertical; font-family: var(--sans); }
 }
 .fieldset-head .link { font-size: 12px; text-transform: none; letter-spacing: 0; }
 
+/* full-text search — a passage list, not a document list. Each hit is one page,
+   slide or sheet, so the snippet is the substance and the title is the address. */
+.search-q { flex: 1; min-width: 160px; }
+.search-note { margin: 8px 0 0; }
+.search-hits { display: grid; gap: 6px; margin-top: 8px; }
+.search-hit {
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px;
+  background: var(--panel-2); cursor: pointer;
+}
+.search-hit:hover { border-color: var(--accent); }
+.search-hit .t { font-weight: 540; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.search-hit .snip {
+  font-size: 12.5px; color: var(--ink-2); margin-top: 3px;
+  word-break: break-word; overflow-wrap: anywhere;
+}
+.search-hit mark { background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 2px; }
+/* The compact mounts sit in a narrow column; keep the list from dominating it. */
+.side-card .search-hits, #searchCorpusMount .search-hits { max-height: 300px; overflow-y: auto; }
+
 /* weekly budgets — a figure plus a bar, because "spent $18 of $25" is a number
    you read and a bar is a state you notice. */
 .budget-line {

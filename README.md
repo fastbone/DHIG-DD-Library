@@ -109,6 +109,22 @@ failure can report it. Clearing it is destructive and therefore admin-only; a
 clear honours the level filter, so *errors only* → *clear* drops the failures you
 have just reported and leaves the rest of the history intact.
 
+**Search tab** — the corpus's own full-text index, for people. BM25 over every
+extracted page, slide and sheet, returning **passages** rather than documents: one
+hit per page/slide/sheet with the matched terms highlighted, and a click opens the
+same reader a citation does, at that same anchor. Filter by workstream or file type.
+
+This index is not new — it is what the analyst's `search_corpus` tool has always
+run. What was missing is that only the model could reach it, so "which documents
+mention indemnity" cost a question: thirty seconds and ~$0.40 for a lookup that is
+instant and free. The same box is mounted in three places, because that is where
+the question gets asked: its own tab, above the Documents table on the Corpus tab,
+and beside the question box on the Ask tab as the cheap alternative to asking.
+
+Search complements the catalogue filter rather than replacing it: the Documents
+filter matches names, titles, parties and summaries — the *card* — while this
+matches the text inside the files.
+
 **Ask tab** — streaming answers with the reasoning summary, the tool trace
 (every search, read and computation), and a citations panel. Clicking any
 citation opens the source document at that exact page. With verification on,
