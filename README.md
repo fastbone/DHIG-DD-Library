@@ -205,8 +205,8 @@ plausible-looking option for a document that does not exist is worse than no
 option at all. The citations inside a question are clickable: you can open the
 source before deciding.
 
-**Every question has a default,** so *skip* is always a well-defined action
-rather than a hole, and *Skip all — use your judgement* still produces a runnable
+**Every question has a default,** always one of the choices actually on offer,
+so *skip* is a well-defined action rather than a hole, and *Skip all — use your judgement* still produces a runnable
 brief. Whatever was assumed instead of asked is recorded in the brief's
 assumptions, and the analyst states them as caveats.
 
@@ -919,7 +919,7 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 227 checks: auth, CSRF, keys, uploads, access, sync, storage, scope, refinement
+python3 tools/api_smoke.py            # 229 checks: auth, CSRF, keys, uploads, access, sync, storage, scope, refinement
 python3 tools/sync_smoke.py           # 84 checks: connected libraries, end to end
 python3 tools/ui_smoke.py             # 141 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note

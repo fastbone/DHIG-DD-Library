@@ -636,14 +636,21 @@ def _coerce(payload: dict, probed: dict) -> dict:
         kind = q.get("kind") if q.get("kind") in ("single", "multi", "free") else "single"
         if not options and kind != "free":
             kind = "free"
+        # The default has to be one of the choices actually on offer. Dropping an
+        # ungrounded option above and leaving the default naming it would make
+        # "skip" assume exactly the thing the drop removed — and the answer would
+        # carry it as a recorded assumption. A question with no options keeps the
+        # model's text, because there is nothing for it to match.
+        default = _clean(q.get("default"), 200)
+        if options and default not in {o["label"] for o in options}:
+            default = options[0]["label"]
         questions.append({
             "id": _clean(q.get("id"), 12) or f"q{i + 1}",
             "question": _clean(q.get("question"), 400),
             "why": _clean(q.get("why"), 400),
             "kind": kind,
             "options": options,
-            "default": _clean(q.get("default"), 200) or (options[0]["label"] if options else
-                                                         "your best judgement"),
+            "default": default or "your best judgement",
         })
 
     brief = {

@@ -1315,6 +1315,31 @@ def main() -> int:
     check("an option that never claimed a document is kept",
           "an answer in chat" in _labels, str(_labels))
 
+    # Dropping an ungrounded option and leaving the default naming it would make
+    # "skip" assume the very choice that was removed — and the answer would carry
+    # it as a recorded assumption.
+    _dropped_default = json.loads(json.dumps(raw_round))
+    _dropped_default["questions"] = [{
+        "id": "q1", "question": "Which period?", "why": "w", "kind": "single",
+        "default": "from the FY24 pack",          # the option that will be dropped
+        "options": [
+            {"label": "from the FY24 pack", "detail": "d", "evidence": ["deadbeefdeadbeef"]},
+            {"label": "whatever is audited", "detail": "d", "evidence": []},
+        ],
+    }]
+    _q = _refine._coerce(_dropped_default, empty_probe)["questions"][0]
+    check("a default naming a dropped option falls back to one still offered",
+          _q["default"] in {o["label"] for o in _q["options"]},
+          f"default {_q['default']!r} vs {[o['label'] for o in _q['options']]}")
+
+    # A question with no options at all keeps the model's wording: there is
+    # nothing for it to match, and "your best judgement" is not an improvement.
+    _free = json.loads(json.dumps(raw_round))
+    _free["questions"] = [{"id": "q1", "question": "Anything else?", "why": "w",
+                           "kind": "free", "default": "assume FY2024 only", "options": []}]
+    check("a free question keeps the default the model wrote",
+          _refine._coerce(_free, empty_probe)["questions"][0]["default"] == "assume FY2024 only")
+
     # The brief was written against the folders the session started with, so
     # those folders decide the run — not whatever the client posts alongside the
     # id. A chip moved between the brief appearing and Run would otherwise
