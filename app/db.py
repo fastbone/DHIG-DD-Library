@@ -6,7 +6,7 @@ Three things live here:
 * ``units`` + ``units_fts`` — the searchable atoms (a PDF page, a slide, a
   spreadsheet sheet), each with a citation anchor and a char range into the
   document's text mirror on disk.
-* ``jobs`` / ``qa_log`` / ``scope_rounds`` / ``artifacts`` — operational and
+* ``jobs`` / ``qa_log`` / ``refine_rounds`` / ``artifacts`` — operational and
   audit state.
 """
 
@@ -122,6 +122,16 @@ CREATE TABLE IF NOT EXISTS qa_log (
     created_at  REAL NOT NULL
 );
 
+-- Which folders one question was allowed to see. A separate table rather than a
+-- qa_log column because the schema is applied as one pass of CREATE TABLE IF NOT
+-- EXISTS with no migration step: a new column would never appear on an existing
+-- database. Absent row = the whole corpus, which is also every question asked
+-- before folder scoping existed.
+CREATE TABLE IF NOT EXISTS qa_scopes (
+    qa_id       TEXT PRIMARY KEY,
+    scope       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
@@ -140,11 +150,15 @@ CREATE TABLE IF NOT EXISTS artifacts (
 -- database that already exists. The link runs the same direction as
 -- artifacts.qa_id — written across every round of the session once the
 -- accepted brief is finally asked.
-CREATE TABLE IF NOT EXISTS scope_rounds (
+CREATE TABLE IF NOT EXISTS refine_rounds (
     id          TEXT PRIMARY KEY,
-    scope_id    TEXT NOT NULL,
+    refine_id   TEXT NOT NULL,
     round       INTEGER NOT NULL,
     question    TEXT NOT NULL,   -- the user's original question, unchanged
+    -- The folder scope the session was started with, as JSON. Fixed for the
+    -- whole session: a brief written against the whole library and then
+    -- answered inside one folder would cite documents the answer cannot open.
+    scope       TEXT,
     answers     TEXT,            -- JSON: the answers that produced this round
     payload     TEXT NOT NULL,   -- JSON: the coerced round object
     transcript  TEXT,            -- JSON: messages[] to rehydrate the next round
@@ -159,8 +173,8 @@ CREATE TABLE IF NOT EXISTS scope_rounds (
     qa_id       TEXT,            -- the answer this brief produced, once run
     created_at  REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_scope_session ON scope_rounds(scope_id, round);
-CREATE INDEX IF NOT EXISTS idx_scope_qa      ON scope_rounds(qa_id);
+CREATE INDEX IF NOT EXISTS idx_refine_session ON refine_rounds(refine_id, round);
+CREATE INDEX IF NOT EXISTS idx_refine_qa      ON refine_rounds(qa_id);
 
 -- --- accounts and access ------------------------------------------------
 
@@ -294,7 +308,7 @@ CREATE TABLE IF NOT EXISTS spend (
     ts       REAL NOT NULL,
     username TEXT,                    -- NULL when nothing initiated it (never blocked)
     budget   TEXT NOT NULL,           -- ask | index
-    kind     TEXT NOT NULL,           -- analyst | scoper | verifier | carder
+    kind     TEXT NOT NULL,           -- analyst | refiner | verifier | carder
     model    TEXT,
     cost_usd REAL NOT NULL,
     input_tokens       INTEGER DEFAULT 0,

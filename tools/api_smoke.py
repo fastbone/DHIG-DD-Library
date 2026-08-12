@@ -13,6 +13,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import sys
 import tempfile
 import threading
@@ -21,6 +22,7 @@ import zipfile
 from pathlib import Path
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -767,6 +769,208 @@ def main() -> int:
     code, body, _ = admin.get("/api/sync/connections")
     check("no connections remain", code == 200 and body["connections"] == [], str(body)[:160])
 
+    print("\n— folder-scoped questions —")
+    from app import db as _sdb
+    from app import manifest as _manifest
+    from app import search as _search
+    from app import tools as _tools
+    from app import verify as _verify
+
+    # Cards, stamped directly: the manifest is assembled from carded documents and
+    # carding them for real would spend money this test is not allowed to spend.
+    for r in _sdb.rows("SELECT id, filename FROM documents WHERE status='extracted'"):
+        _sdb.execute(
+            "UPDATE documents SET status='carded', title=?, doc_type='other',"
+            " workstream='financial', parties='[]', period_covered='', key_figures='[]',"
+            " summary='synthetic card for the api smoke test', languages='[\"en\"]',"
+            " card_flags='[]', carded_at=? WHERE id=?",
+            (r["filename"], time.time(), r["id"]),
+        )
+    _manifest.invalidate_manifest()
+
+    code, body, _ = admin.get("/api/corpus/folders")
+    folders = {f["path"]: f for f in body.get("folders", [])}
+    deal = next((p for p in folders if p.endswith("/deal")), None)
+    sub = next((p for p in folders if p.endswith("/deal/sub")), None)
+    check("the folder tree lists folders that hold indexed documents",
+          code == 200 and deal and sub, str(sorted(folders))[:200])
+    check("a parent folder's count includes its subtree",
+          bool(deal and sub) and folders[deal]["n_indexed"] > folders[sub]["n_indexed"],
+          f"{deal and folders[deal]['n_indexed']} vs {sub and folders[sub]['n_indexed']}")
+    # Rooted at the corpus roots, not at "/": every level of the host's directory
+    # layout above the data room is true, pickable and useless.
+    check("the tree does not offer the host's directories above the root",
+          "/" not in folders and "/tmp" not in folders, str(sorted(folders))[:120])
+    # Choosing what a question may see is part of asking one, so this is not admin.
+    scoper = Client()
+    admin.post("/api/users",
+               {"username": "refiner", "password": "scope-pass-7", "role": "analyst"})
+    _, scoper_login, _ = scoper.post("/api/login",
+                                     {"username": "refiner", "password": "scope-pass-7"})
+    scoper.csrf = (scoper_login.get("user") or {}).get("csrf")
+    code, body, _ = scoper.get("/api/corpus/folders")
+    check("an analyst can read the folder tree", code == 200 and body.get("folders"),
+          f"got {code}")
+    code, _, _ = anon.get("/api/corpus/folders")
+    check("the folder tree needs a session", code == 401, f"got {code}")
+
+    inside = {d["id"] for d in _search.list_documents(scope=[sub], limit=500)["documents"]}
+    everything = {d["id"] for d in _search.list_documents(limit=500)["documents"]}
+    check("a scoped list_documents excludes documents outside the scope",
+          inside and inside < everything, f"{len(inside)} of {len(everything)}")
+    hits = _search.search("findings", limit=50, scope=[sub])
+    check("a scoped search returns only in-scope passages",
+          all(h.get("doc_id") in inside for h in hits), str(hits)[:160])
+
+    # The mechanism the whole feature rests on: the map itself has to shrink, or
+    # the assistant still knows about — and cites — everything.
+    full_map = _manifest.build()
+    scoped_map = _manifest.build([sub])
+    check("the scoped corpus map is smaller than the full one",
+          scoped_map["chars"] < full_map["chars"] and scoped_map["n_indexed"] < full_map["n_indexed"],
+          f"{scoped_map['chars']}c/{scoped_map['n_indexed']}d vs "
+          f"{full_map['chars']}c/{full_map['n_indexed']}d")
+    head = scoped_map["text"].split("\n", 2)
+    check("the scoped map names the scope and the fraction it covers",
+          "scoped to sub" in head[0]
+          and f"{scoped_map['n_indexed']} of {full_map['n_indexed']}" in head[1],
+          " | ".join(head[:2])[:200])
+    check("the full map is unchanged by a scoped build next to it in the cache",
+          "scoped to" not in _manifest.build()["text"].split("\n", 1)[0],
+          _manifest.build()["text"].split("\n", 1)[0])
+
+    outsider = next(iter(everything - inside))
+    refused = _tools.dispatch("read_document", {"doc_id": outsider}, [sub])
+    check("reading an out-of-scope document is refused in words, not silence",
+          "outside the folders" in (refused.get("error") or ""), str(refused)[:160])
+    carded = _tools.dispatch("document_card", {"doc_id": outsider}, [sub])
+    check("an out-of-scope card is refused too",
+          "outside the folders" in (carded.get("error") or ""), str(carded)[:160])
+    allowed = _tools.dispatch("read_document", {"doc_id": next(iter(inside))}, [sub])
+    check("an in-scope document still reads normally",
+          not allowed.get("error") and allowed.get("text"), str(allowed)[:160])
+
+    # A card gated on its own id can still hand over its *version family* — other
+    # documents, with ids and titles the model can then cite but never open. Two
+    # near-duplicates are put in one group with only one of them in scope.
+    twins = sorted(inside)[:1] + sorted(everything - inside)[:1]
+    if len(twins) == 2:
+        for doc in twins:
+            _sdb.execute("UPDATE documents SET dupe_group=? WHERE id=?", ("scope-test", doc))
+        card = _tools.dispatch("document_card", {"doc_id": twins[0]}, [sub])
+        family = {d["doc_id"] for d in card.get("near_duplicates", [])}
+        unscoped = _tools.dispatch("document_card", {"doc_id": twins[0]})
+        check("a card's version family obeys the scope",
+              twins[1] not in family
+              and twins[1] in {d["doc_id"] for d in unscoped.get("near_duplicates", [])},
+              f"scoped={sorted(family)} unscoped="
+              f"{sorted(d['doc_id'] for d in unscoped.get('near_duplicates', []))}")
+        for doc in twins:
+            _sdb.execute("UPDATE documents SET dupe_group=NULL WHERE id=?", (doc,))
+    else:
+        check("a card's version family obeys the scope", False, "need two documents")
+
+    # Verification is a second pass over text the model wrote, so it takes the
+    # doc_id on trust. A citation outside the scope must not be opened there.
+    # Anchored on a unit that really exists, and asserted against the unscoped
+    # call: "returns nothing" proves nothing if the citation resolves to nothing
+    # either way.
+    unit = _sdb.one(
+        "SELECT doc_id, anchor FROM units WHERE doc_id IN "
+        f"({','.join('?' * len(everything - inside))}) LIMIT 1",
+        tuple(everything - inside),
+    )
+    cite = f"{unit['doc_id']}:{unit['anchor']}" if unit else ""
+    check("verification will not open an out-of-scope citation",
+          bool(cite) and _verify.span_for(cite, [sub])[1] == ""
+          and _verify.span_for(cite)[1] != "",
+          f"{cite}: scoped={_verify.span_for(cite, [sub])[1][:40]!r}"
+          if cite else "no out-of-scope unit to cite")
+    # Otherwise the scope is bypassable in three lines of Python. Driven through
+    # the tool rather than the helper: the helper honouring a scope it is never
+    # handed would prove nothing.
+    piped = _tools.dispatch(
+        "run_python",
+        {"code": "import dd, json; print(json.dumps(sorted(dd.all_docs())))",
+         "purpose": "list what the sandbox can reach"},
+        [sub],
+    )
+    try:
+        reachable = set(json.loads(piped.get("stdout") or "[]"))
+    except json.JSONDecodeError:
+        reachable = {"<unparseable>"}
+    check("run_python only sees in-scope documents",
+          reachable == inside, f"{sorted(reachable)} vs {sorted(inside)}")
+
+    # The dedupe interaction that is easy to get backwards: identical bytes filed
+    # in two folders are ONE content-addressed document, whose canonical abs_path
+    # is wherever it was seen first. Matching only that path would hide a document
+    # that genuinely sits in the folder the reader picked.
+    twin_dir = root / "second-room"
+    twin_dir.mkdir(parents=True, exist_ok=True)
+    twin_src = next(
+        p for p in _ingest.scan(Path(extract_dir)).files if p.name == "more.md"
+    )
+    (twin_dir / "copy.md").write_bytes(twin_src.read_bytes())
+    code, body, _ = admin.post("/api/ingest", {"path": str(twin_dir)})
+    wait_for_job(admin, lambda s: not s["jobs_running"], timeout=60)
+    twin = _sdb.one(
+        "SELECT doc_id FROM occurrences WHERE abs_path=?", (str(twin_dir / "copy.md"),)
+    )
+    filings = [
+        r["abs_path"]
+        for r in _sdb.rows("SELECT abs_path FROM occurrences WHERE doc_id=?",
+                           (twin["doc_id"] if twin else "",))
+    ]
+    # Asserted for both folders deliberately: exactly one of them is the
+    # non-canonical filing, and which one is an ingest-order detail.
+    check("a document filed both inside and outside a scope is in scope either way",
+          twin is not None
+          and _search.in_scope(twin["doc_id"], [str(twin_dir)])
+          and _search.in_scope(twin["doc_id"], [sub]),
+          f"filed at {filings}")
+    # Removed again: the storage section that follows asserts that purging drops
+    # *every* document once the extracted folder is deleted, and a copy living
+    # outside it would survive and make that count wrong.
+    shutil.rmtree(twin_dir, ignore_errors=True)
+
+    code, body, _ = admin.get(
+        "/api/manifest?scope=" + urllib.parse.quote(json.dumps([sub])))
+    check("the manifest route prices the scoped map for the picker",
+          code == 200 and body["n_indexed"] == scoped_map["n_indexed"]
+          and body["n_indexed_total"] == full_map["n_indexed"]
+          and body["cost_per_turn_usd"] >= 0, str(body)[:200])
+    code, body, _ = admin.get("/api/manifest?scope=" + urllib.parse.quote(json.dumps(["/etc"])))
+    check("a scope outside every known root is refused", code == 400, f"got {code}")
+    code, body, _ = admin.get("/api/manifest?scope=not-json")
+    check("a malformed scope is refused", code == 400, f"got {code}")
+
+    # An SSE body cannot carry a 400, so the scope has to be rejected before the
+    # stream opens rather than surfacing as a failed answer.
+    code, body, _ = admin.post(
+        "/api/ask", {"question": "what is revenue", "scope": ["/etc/passwd"]})
+    check("asking with a scope outside the known roots is refused before streaming",
+          code == 400 and "outside every known corpus root" in str(body),
+          f"got {code}: {str(body)[:120]}")
+
+    # The scope has to survive the answer: a past "not in the data room" is
+    # uninterpretable without knowing how much of the room was visible.
+    _sdb.execute(
+        "INSERT INTO qa_log(id, question, answer, citations, verdicts, tool_calls, usage,"
+        " model, duration_s, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("scopedqa0001", "anything in here?", "No.", "[]", "[]", "[]", "{}", "m", 1.0,
+         time.time()),
+    )
+    _sdb.execute("INSERT OR REPLACE INTO qa_scopes(qa_id, scope) VALUES(?,?)",
+                 ("scopedqa0001", json.dumps([sub])))
+    code, body, _ = admin.get("/api/qa-log?limit=5")
+    entry = next((e for e in body["entries"] if e["id"] == "scopedqa0001"), None)
+    check("the question log carries the scope the answer could see",
+          entry is not None and entry.get("scope") == [sub], str(entry)[:200])
+    older = next((e for e in body["entries"] if e["id"] != "scopedqa0001"), None)
+    check("a question asked without a scope reports an empty one, not an error",
+          older is None or older.get("scope") == [], str(older)[:120])
+
     print("\n— storage management —")
     code, body, _ = admin.get("/api/storage")
     check("storage usage reports areas and roots",
@@ -908,33 +1112,33 @@ def main() -> int:
 
     print("\n— question refinement —")
     from app import agent as _agent
-    from app import scope as _scope
+    from app import refine as _refine
     from app import tools as _apptools
 
-    # The whole cost argument for scoping is that it reuses the analyst's cached
+    # The whole cost argument for refinement is that it reuses the analyst's cached
     # prefix instead of forking it. That is a property of the request bytes, not
     # of any behaviour, so it is asserted directly — a well-meant "let's give the
-    # scoper its own tools" would otherwise pass every other test in this file
+    # refiner its own tools" would otherwise pass every other test in this file
     # while quietly making each round cost more than the answer it prefaces.
-    check("the scoper reuses the analyst's cached system prefix",
-          _scope.system_for_scope() == _agent.system_blocks()[0])
-    check("the scoper passes the tool array through unchanged",
-          _scope.tools_for_scope() is _apptools.TOOLS)
+    check("the refiner reuses the analyst's cached system prefix",
+          _refine.system_for_refine() == _agent.system_blocks()[0])
+    check("the refiner passes the tool array through unchanged",
+          _refine.tools_for_refine() is _apptools.TOOLS)
     _tool_names = {t["name"] for t in _apptools.TOOLS}
-    check("the scoper's tools are a subset of the analyst's",
-          _scope.SCOPE_TOOLS <= _tool_names, str(_scope.SCOPE_TOOLS - _tool_names))
-    check("the scoper cannot read documents, run code or write files",
-          not (_scope.SCOPE_TOOLS
+    check("the refiner's tools are a subset of the analyst's",
+          _refine.REFINE_TOOLS <= _tool_names, str(_refine.REFINE_TOOLS - _tool_names))
+    check("the refiner cannot read documents, run code or write files",
+          not (_refine.REFINE_TOOLS
                & {"read_document", "run_python", "create_deliverable"}))
 
     # Preconditions match /api/ask exactly, and the route is fenced by the
     # middleware's default rather than by remembering to fence it.
-    code, body, _ = anon.post("/api/scope", {"question": "What are the risks?"})
-    check("scoping needs a session", code == 401, f"got {code}")
+    code, body, _ = anon.post("/api/refine", {"question": "What are the risks?"})
+    check("refining needs a session", code == 401, f"got {code}")
     no_csrf = Client()
     no_csrf.cookie = admin.cookie          # a real session, no CSRF header
-    code, body, _ = no_csrf.post("/api/scope", {"question": "What are the risks?"})
-    check("scoping needs the CSRF header", code == 403, f"got {code}")
+    code, body, _ = no_csrf.post("/api/refine", {"question": "What are the risks?"})
+    check("refining needs the CSRF header", code == 403, f"got {code}")
 
     # Coverage: the model proposes, the probe caps. These are the guards that
     # keep the percentage honest, so they are checked without a server at all.
@@ -946,19 +1150,19 @@ def main() -> int:
                        "default": "", "options": [
                            {"label": f"o{i}", "detail": "d", "evidence": ["deadbeefdeadbeef"]}
                            for i in range(12)]}] * 9,
-        "brief": {"question": "refined", "scope": [], "out_of_scope": [],
+        "brief": {"question": "refined", "covers": [], "excludes": [],
                   "evidence_plan": [{"doc_id": "deadbeefdeadbeef", "rel_path": "x", "why": "y"}],
                   "deliverable": "prose", "assumptions": ["a"] * 20},
         "complexity": {"level": "nonsense", "drivers": [], "docs_to_read": 999,
                        "needs_computation": False, "recommended_effort": "turbo"},
         "gaps": [],
     }
-    zero = _scope._coerce(raw_round, empty_probe)
+    zero = _refine._coerce(raw_round, empty_probe)
     check("a confident score is capped when nothing retrieved",
           zero["coverage"]["score"] <= 15, str(zero["coverage"]["score"]))
     thin_probe = {"score": 24, "hits": 4, "docs": 2, "workstreams": ["financial"], "top": [],
                   "basis": ""}
-    thin = _scope._coerce(raw_round, thin_probe)
+    thin = _refine._coerce(raw_round, thin_probe)
     check("a two-document evidence base caps coverage well short of confident",
           thin["coverage"]["score"] <= 55, str(thin["coverage"]["score"]))
     check("the model may not run far ahead of what actually retrieved",
@@ -979,21 +1183,21 @@ def main() -> int:
     for bad in (900, -3):
         r = json.loads(json.dumps(raw_round))
         r["coverage"]["score"] = bad
-        got = _scope._coerce(r, {**empty_probe, "score": 80, "docs": 20})["coverage"]["score"]
+        got = _refine._coerce(r, {**empty_probe, "score": 80, "docs": 20})["coverage"]["score"]
         check(f"a score of {bad} is clamped into 0-100", 0 <= got <= 100, str(got))
 
     # The brief is instructions, not a claim: it must not turn up in the
     # citation panel of the answer it produced.
-    brief_text = _scope.render_brief(zero["brief"])
+    brief_text = _refine.render_brief(zero["brief"])
     check("the brief is tagged as scope for the analyst",
           brief_text.startswith("<research_brief>") and brief_text.endswith("</research_brief>"))
     check("the brief does not pollute the citation panel",
           _agent.parse_citations(brief_text) == [])
 
     # A thin corpus should not be answered with the most expensive model.
-    deep_covered = _scope.propose_model({"score": 88}, {"level": "deep",
+    deep_covered = _refine.propose_model({"score": 88}, {"level": "deep",
                                                        "recommended_effort": "max"})
-    deep_thin = _scope.propose_model({"score": 22}, {"level": "deep",
+    deep_thin = _refine.propose_model({"score": 22}, {"level": "deep",
                                                     "recommended_effort": "max"})
     check("a thin question is proposed a cheaper run than a well-covered one",
           deep_thin["model"] != deep_covered["model"],
@@ -1003,7 +1207,7 @@ def main() -> int:
     code, body, _ = admin.get("/api/status")
     check("status lists the models that may be selected",
           code == 200 and len(body["models"]["available"]) >= 4
-          and "scope_max_rounds" in body["models"], str(body.get("models"))[:160])
+          and "refine_max_rounds" in body["models"], str(body.get("models"))[:160])
     code, body, _ = dana.request("PATCH", "/api/settings/models",
                                  {"models": {"analyst": "claude-sonnet-5"}})
     check("an analyst cannot change the models", code == 403, f"got {code}")
@@ -1011,20 +1215,20 @@ def main() -> int:
                                   {"models": {"analyst": "gpt-nonexistent"}})
     check("an unpriced model is refused rather than silently mis-billed",
           code == 400 and "unknown" in str(body).lower(), f"got {code}: {str(body)[:160]}")
-    code, body, _ = admin.request("PATCH", "/api/settings/models", {"scope_max_rounds": 9})
+    code, body, _ = admin.request("PATCH", "/api/settings/models", {"refine_max_rounds": 9})
     check("the number of question rounds is bounded", code == 400, f"got {code}")
     code, body, _ = admin.request(
         "PATCH", "/api/settings/models",
-        {"models": {"analyst": "claude-sonnet-5", "scoper": ""}, "scoper_effort": "medium",
-         "scope_max_rounds": 3, "complexity_models": {"deep": "claude-opus-5"}})
+        {"models": {"analyst": "claude-sonnet-5", "refiner": ""}, "refiner_effort": "medium",
+         "refine_max_rounds": 3, "complexity_models": {"deep": "claude-opus-5"}})
     check("an admin can change the models", code == 200, f"got {code}: {str(body)[:160]}")
-    check("an unset scoper inherits the analyst, which is the cheap default",
-          body["scoper"] == "claude-sonnet-5" and body["scoper_configured"] == "",
+    check("an unset refiner inherits the analyst, which is the cheap default",
+          body["refiner"] == "claude-sonnet-5" and body["refiner_configured"] == "",
           str(body)[:200])
     check("the choice is visible to everyone who has to live with it",
-          admin.get("/api/status")[1]["models"]["scope_max_rounds"] == 3)
+          admin.get("/api/status")[1]["models"]["refine_max_rounds"] == 3)
     admin.request("PATCH", "/api/settings/models",
-                  {"models": {"analyst": "claude-opus-5"}, "scope_max_rounds": 2})
+                  {"models": {"analyst": "claude-opus-5"}, "refine_max_rounds": 2})
 
     # Round two resumes from the stored transcript, and a round can end three
     # ways: the model stopped, it used its last tool turn, or the budget stopped
@@ -1050,8 +1254,8 @@ def main() -> int:
         ],
     }
     for _ending, _messages in _endings.items():
-        _resumed = _scope._sealed(list(_messages))
-        _scope._resume(_resumed, "the user answered: FY2024")
+        _resumed = _refine._sealed(list(_messages))
+        _refine._resume(_resumed, "the user answered: FY2024")
         _roles = [m["role"] for m in _resumed]
         check(f"a round resumes cleanly when {_ending}",
               _roles[-1] == "user"
@@ -1059,10 +1263,10 @@ def main() -> int:
               and "FY2024" in str(_resumed[-1]["content"]),
               str(_roles))
 
-    # Stage B never sees the corpus map, so a document the scoper opened reaches
+    # Stage B never sees the corpus map, so a document the refiner opened reaches
     # it only through this digest. document_card spreads the `documents` row, so
     # its identifier is `id` — reading `doc_id` printed [None] and lost the one
-    # document the scoper had bothered to open.
+    # document the refiner had bothered to open.
     # Its own row rather than whatever ingest left behind: the storage section
     # above resets the index, and relying on a leftover document made this pass
     # vacuously against an empty id.
@@ -1081,20 +1285,20 @@ def main() -> int:
         (_known_doc_id, 0, "p1", "page", 0, 100),
     )
     _card = _apptools.dispatch("document_card", {"doc_id": _known_doc_id})
-    _digest = _scope._findings_digest(
+    _digest = _refine._findings_digest(
         [{"tool": "document_card", "input": {"doc_id": _known_doc_id}, "result": _card}],
         {"score": 0, "hits": 0, "docs": 0, "workstreams": [], "top": [], "basis": ""},
     )
-    check("the card the scoper opened is real before the digest is judged",
+    check("the card the refiner opened is real before the digest is judged",
           not _card.get("error") and bool(_card.get("anchors")), str(_card)[:160])
-    check("a document the scoper opened reaches the propose call by id",
+    check("a document the refiner opened reaches the propose call by id",
           _known_doc_id in _digest and "None" not in _digest, _digest[:200])
     _bdb.execute("DELETE FROM units WHERE doc_id=?", (_known_doc_id,))
     _bdb.execute("DELETE FROM documents WHERE id=?", (_known_doc_id,))
 
     # A missing session is a 404, not someone else's brief.
-    code, _, _ = admin.get("/api/scope/deadbeefdead")
-    check("an unknown scoping session is not found", code == 404, f"got {code}")
+    code, _, _ = admin.get("/api/refine/deadbeefdead")
+    check("an unknown refinement session is not found", code == 404, f"got {code}")
 
     print("\n— setup guide —")
     # Served by the app rather than linked out: it is read while setting up a

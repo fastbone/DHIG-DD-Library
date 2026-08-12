@@ -85,8 +85,8 @@ def parse_citations(text: str) -> list[dict]:
     return list(seen.values())
 
 
-def system_blocks() -> tuple[list[dict], dict]:
-    m = manifest.build()
+def system_blocks(scope=None) -> tuple[list[dict], dict]:
+    m = manifest.build(scope)
     return (
         [
             {"type": "text", "text": INSTRUCTIONS},
@@ -131,7 +131,8 @@ async def ask(
     effort: str | None = None,
     model: str | None = None,
     actor: str | None = None,
-    scope_id: str | None = None,
+    scope: list[str] | None = None,
+    refine_id: str | None = None,
 ) -> AsyncIterator[dict]:
     started = time.time()
     qa_id = uuid.uuid4().hex[:12]
@@ -147,23 +148,37 @@ async def ask(
                "budget": await asyncio.to_thread(budget.status, actor)}
         return
 
-    system, m = system_blocks()
+    scope = [p for p in (scope or []) if p]
+    system, m = system_blocks(scope)
 
+    folders = ", ".join(p.rstrip("/").rsplit("/", 1)[-1] for p in scope)
     yield {
         "type": "status",
         "message": f"corpus map: {m['n_indexed']} documents, ~{m['approx_tokens']:,} tokens"
-        f" ({m['mode']} mode)",
+        f" ({m['mode']} mode)" + (f" · scoped to {folders}" if scope else ""),
         "qa_id": qa_id,
+        "scope": scope,
         "manifest": {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed")},
     }
 
     if m["n_indexed"] == 0:
         yield {
             "type": "error",
-            "message": "No documents are indexed yet. Point the app at a corpus, run Ingest, "
-            "then run the Sweep.",
+            "message": (
+                f"No indexed documents in {folders}. Widen the scope, or run the Sweep "
+                "if the folders were only just ingested."
+                if scope
+                else "No documents are indexed yet. Point the app at a corpus, run Ingest, "
+                "then run the Sweep."
+            ),
         }
         return
+
+    if scope:
+        db.execute(
+            "INSERT OR REPLACE INTO qa_scopes(qa_id, scope) VALUES(?,?)",
+            (qa_id, json.dumps(scope)),
+        )
 
     messages: list[dict] = list(history or [])
     messages.append({"role": "user", "content": question})
@@ -271,7 +286,7 @@ async def ask(
                             artifacts.append(out)
                             yield {"type": "artifact", **out}
                     else:
-                        out = await asyncio.to_thread(tools.dispatch, tu.name, payload)
+                        out = await asyncio.to_thread(tools.dispatch, tu.name, payload, scope)
                 except Exception as exc:  # noqa: BLE001
                     out = {"error": f"{type(exc).__name__}: {exc}"}
                 is_error = bool(isinstance(out, dict) and out.get("error"))
@@ -310,7 +325,7 @@ async def ask(
         elif do_verify and citations:
             yield {"type": "phase", "phase": "verifying"}
             async for v in verify.verify_answer(
-                final_text, meter=meter, attribution=payer.as_kind("verifier")
+                final_text, meter=meter, attribution=payer.as_kind("verifier"), scope=scope
             ):
                 verdicts.append(v)
                 yield {"type": "verdict", **v}
@@ -326,13 +341,12 @@ async def ask(
                 time.time(),
             ),
         )
-        if scope_id:
-            # Imported here rather than at module scope: scope.py builds its
-            # requests out of this module's cached prefix, so a top-level import
-            # would be a cycle.
-            from . import scope
+        if refine_id:
+            # Imported inside the function: refine.py builds its requests out of
+            # this module's cached prefix, so a top-level import would be a cycle.
+            from . import refine
 
-            await asyncio.to_thread(scope.link_answer, scope_id, qa_id)
+            await asyncio.to_thread(refine.link_answer, refine_id, qa_id, actor)
         broker.log(
             f"Answered in {duration:.0f}s · {len(tool_trace)} tool calls · "
             f"{len(citations)} citations · ${usage['cost_usd']:.3f}",
@@ -341,9 +355,10 @@ async def ask(
         yield {
             "type": "done",
             "qa_id": qa_id,
-            "scope_id": scope_id,
+            "refine_id": refine_id,
             "model": model,
             "answer": final_text,
+            "scope": scope,
             "citations": citations,
             "verdicts": verdicts,
             "artifacts": artifacts,

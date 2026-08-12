@@ -59,19 +59,19 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # The four model roles, each (env var, default). Analyst does the reasoning;
-# scoper refines the question before the analyst is paid to answer it; carder
+# refiner sharpens the question before the analyst is paid to answer it; carder
 # does the bulk indexing pass; verifier re-reads cited spans. See README for the
 # cost rationale. An empty default means "fall back to the analyst's model".
 MODEL_ROLES: dict[str, tuple[str, str]] = {
     "analyst": ("DD_ANALYST_MODEL", "claude-opus-5"),
-    "scoper": ("DD_SCOPER_MODEL", ""),
+    "refiner": ("DD_REFINER_MODEL", ""),
     "carder": ("DD_CARDER_MODEL", "claude-haiku-4-5"),
     "verifier": ("DD_VERIFIER_MODEL", "claude-haiku-4-5"),
 }
 
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
-# What the scoper's complexity read maps onto when it proposes a model for the
+# What the refiner's complexity read maps onto when it proposes a model for the
 # run. Only a proposal: the brief shows it preselected and the user can change
 # it before approving.
 COMPLEXITY_MODELS: dict[str, str] = {
@@ -314,17 +314,17 @@ class Settings:
         return self._model("analyst")
 
     @property
-    def scoper_model(self) -> str:
-        """The model that scopes a question before the analyst answers it.
+    def refiner_model(self) -> str:
+        """The model that refines a question before the analyst answers it.
 
         Unset means "the analyst's model", and that is the default deliberately.
-        The scoper reuses the analyst's cached prefix (tools → instructions →
+        The refiner reuses the analyst's cached prefix (tools → instructions →
         corpus map), so it *reads* that map at 0.1x instead of writing its own
         at 2x, and it leaves the cache warm for the run that follows. Prompt
         caches are per-model, so pointing this at a cheaper model forks the
         cache and on a large corpus costs more per session, not less.
         """
-        return self._model("scoper") or self.analyst_model
+        return self._model("refiner") or self.analyst_model
 
     @property
     def carder_model(self) -> str:
@@ -339,14 +339,14 @@ class Settings:
         return self._choice("DD_ANALYST_EFFORT", "analyst_effort", EFFORTS, "high")
 
     @property
-    def scoper_effort(self) -> str:
-        """Scoping is narrow and bounded, and the user is waiting on it."""
-        return self._choice("DD_SCOPER_EFFORT", "scoper_effort", EFFORTS, "low")
+    def refiner_effort(self) -> str:
+        """Refining is narrow and bounded, and the user is waiting on it."""
+        return self._choice("DD_REFINER_EFFORT", "refiner_effort", EFFORTS, "low")
 
     @property
-    def scope_max_rounds(self) -> int:
+    def refine_max_rounds(self) -> int:
         """Rounds of clarifying questions before the brief is forced out."""
-        raw = os.environ.get("DD_SCOPE_MAX_ROUNDS") or self._state().get("scope_max_rounds")
+        raw = os.environ.get("DD_REFINE_MAX_ROUNDS") or self._state().get("refine_max_rounds")
         try:
             return max(1, min(4, int(raw)))
         except (TypeError, ValueError):
@@ -373,8 +373,8 @@ class Settings:
         *,
         models: dict | None = None,
         analyst_effort: str | None = None,
-        scoper_effort: str | None = None,
-        scope_max_rounds: int | None = None,
+        refiner_effort: str | None = None,
+        refine_max_rounds: int | None = None,
         complexity_models: dict | None = None,
     ) -> None:
         """Persist admin model choices. Callers validate ids against pricing."""
@@ -387,10 +387,10 @@ class Settings:
             patch["models"] = merged
         if analyst_effort is not None:
             patch["analyst_effort"] = analyst_effort
-        if scoper_effort is not None:
-            patch["scoper_effort"] = scoper_effort
-        if scope_max_rounds is not None:
-            patch["scope_max_rounds"] = int(scope_max_rounds)
+        if refiner_effort is not None:
+            patch["refiner_effort"] = refiner_effort
+        if refine_max_rounds is not None:
+            patch["refine_max_rounds"] = int(refine_max_rounds)
         if complexity_models is not None:
             merged = dict(self._state().get("complexity_models") or {})
             for level, value in complexity_models.items():

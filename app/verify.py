@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from . import credentials, db, extract, pricing
+from . import credentials, db, extract, pricing, search
 from .config import settings
 
 CITATION_RE = re.compile(r"\[\[([0-9a-f]{6,32}):([^\]\s]{1,120})\]\]")
@@ -65,8 +65,15 @@ def extract_claims(answer: str) -> list[dict]:
     return claims
 
 
-def span_for(citation: str) -> tuple[str, str]:
+def span_for(citation: str, scope=None) -> tuple[str, str]:
     doc_id, _, anchor = citation.partition(":")
+    # A scoped question must not be verified against a document it was not allowed
+    # to read. The model should not be able to cite one at all, but verification is
+    # a second pass over text the model produced: it takes the doc_id on trust, and
+    # a hallucinated id that happens to exist outside the scope would otherwise be
+    # opened and paid for here.
+    if not search.in_scope(doc_id, scope):
+        return citation, ""
     row = db.one("SELECT char_start, char_end FROM units WHERE doc_id=? AND anchor=?",
                  (doc_id, anchor))
     doc = db.one("SELECT title, rel_path FROM documents WHERE id=?", (doc_id,))
@@ -83,11 +90,12 @@ async def _check(
     claim: dict,
     meter: pricing.Meter | None,
     attribution: pricing.Attribution | None = None,
+    scope=None,
 ) -> dict:
     parts = []
     resolved = 0
     for c in claim["citations"][:4]:
-        label, text = span_for(c)
+        label, text = span_for(c, scope)
         if text:
             resolved += 1
         parts.append(f"--- source {c} ({label}) ---\n{text or '[citation does not resolve]'}")
@@ -117,6 +125,7 @@ async def verify_answer(
     *,
     meter: pricing.Meter | None = None,
     attribution: pricing.Attribution | None = None,
+    scope=None,
 ) -> AsyncIterator[dict]:
     claims = extract_claims(answer)
     if not claims:
@@ -127,7 +136,7 @@ async def verify_answer(
     async def one(claim: dict) -> dict:
         async with sem:
             try:
-                return await _check(client, claim, meter, attribution)
+                return await _check(client, claim, meter, attribution, scope)
             except Exception as exc:  # noqa: BLE001
                 return {**claim, "verdict": "unclear", "note": f"{type(exc).__name__}: {exc}"}
 

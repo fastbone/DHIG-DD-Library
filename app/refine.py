@@ -1,8 +1,8 @@
-"""The scoping loop — turning a general question into a research brief.
+"""The refining loop — turning a general question into a research brief.
 
 A vague question run through the analyst costs a full expensive answer to
 discover it was the wrong question. So every question is scoped first: the
-scoper reads the corpus, asks a few clarifying questions whose options name real
+refiner reads the corpus, asks a few clarifying questions whose options name real
 documents, rewrites the question into a brief the user can edit, and judges how
 much of what the question needs the data room actually contains.
 
@@ -16,7 +16,7 @@ Context layout (matters for cost — this is the whole design):
 
 Nothing here may change the bytes of that prefix. The read-only tool subset is
 therefore enforced at dispatch, not by handing the model a different tool array,
-and the scoping directive rides in the first user turn — after the breakpoint.
+and the refining directive rides in the first user turn — after the breakpoint.
 """
 
 from __future__ import annotations
@@ -34,12 +34,12 @@ from .config import settings
 from .events import broker
 
 # One round is at most this many tool turns. Scoping that reads more than a
-# handful of search results has stopped scoping and started answering.
-SCOPE_MAX_TURNS = 4
+# handful of search results has stopped refining and started answering.
+REFINE_MAX_TURNS = 4
 
 # Read-only, and none of them writes a file or runs code. Enforced at dispatch:
 # editing tools.TOOLS would fork the prompt cache this module exists to reuse.
-SCOPE_TOOLS = frozenset({"document_card", "list_documents", "search_corpus"})
+REFINE_TOOLS = frozenset({"document_card", "list_documents", "search_corpus"})
 
 MAX_QUESTIONS = 4
 MAX_OPTIONS = 5
@@ -48,7 +48,7 @@ MAX_ASSUMPTIONS = 8
 MAX_MISSING = 6
 
 # Stage A tool results are stored so the next round can rehydrate. The analyst
-# clips at 200k because it is reading documents; the scoper only ever holds
+# clips at 200k because it is reading documents; the refiner only ever holds
 # search hits and catalogue pages.
 TRANSCRIPT_CLIP = 40_000
 
@@ -128,8 +128,8 @@ _BRIEF = {
             "description": "The rewritten question: precise, self-contained, in the user's "
             "terms rather than yours.",
         },
-        "scope": {"type": "array", "items": {"type": "string"}},
-        "out_of_scope": {"type": "array", "items": {"type": "string"}},
+        "covers": {"type": "array", "items": {"type": "string"}},
+        "excludes": {"type": "array", "items": {"type": "string"}},
         "evidence_plan": {
             "type": "array",
             "items": {
@@ -155,7 +155,7 @@ _BRIEF = {
             "analyst will state these as caveats.",
         },
     },
-    "required": ["question", "scope", "out_of_scope", "evidence_plan", "deliverable",
+    "required": ["question", "covers", "excludes", "evidence_plan", "deliverable",
                  "assumptions"],
     "additionalProperties": False,
 }
@@ -256,7 +256,7 @@ ROUND_SCHEMA = {
 
 # --- prompts -------------------------------------------------------------
 
-DIRECTIVE = """You are scoping a due diligence question before an expensive analyst run.
+DIRECTIVE = """You are refining a due diligence question before an expensive analyst run.
 You are NOT answering it. Do not read documents; do not compute anything.
 
 ## What makes a good clarifying question
@@ -286,7 +286,7 @@ actually here. Run two or three narrow searches, or list_documents on the workst
 matter, and then stop — do not read documents and do not answer. When you have enough to
 ask good questions, say so in one line."""
 
-PROPOSE_SYSTEM = """You are scoping a due diligence question before an expensive analyst run.
+PROPOSE_SYSTEM = """You are refining a due diligence question before an expensive analyst run.
 You are given the user's question, what searching the data room turned up, and any answers
 the user has already given. Return the round as JSON.
 
@@ -298,19 +298,23 @@ brief becomes the analyst's instructions.""" + "\n\n" + DIRECTIVE
 # --- the free probe ------------------------------------------------------
 
 
-def probe(question: str) -> dict:
+def probe(question: str, scope=None) -> dict:
     """Mechanical answerability signal. No API call — BM25 plus the rollup.
 
     Deliberately blunt. Its job is not to be precise, it is to bound what the
     model may claim about coverage: a question whose words retrieve nothing
     cannot be well covered, however confident the model sounds.
+
+    Takes the same folder `scope` as the answer will: coverage has to be a claim
+    about the corpus the run may actually read, or a question narrowed to one
+    folder would be scored against documents it will never see.
     """
-    m = manifest.build()
+    m = manifest.build(scope)
     if not m["n_indexed"]:
         return {"score": 0, "hits": 0, "docs": 0, "workstreams": [], "top": [],
                 "basis": "nothing is indexed yet"}
 
-    hits = [h for h in search.search(question, limit=30) if not h.get("error")]
+    hits = [h for h in search.search(question, limit=30, scope=scope) if not h.get("error")]
     docs = {h["doc_id"] for h in hits}
     workstreams = sorted({h["workstream"] for h in hits if h.get("workstream")})
 
@@ -355,18 +359,20 @@ def band(score: int) -> str:
 # the analyst's, which is the property the whole cost model rests on.
 
 
-def system_for_scope() -> list[dict]:
-    return agent.system_blocks()[0]
+def system_for_refine(scope=None) -> list[dict]:
+    return agent.system_blocks(scope)[0]
 
 
-def tools_for_scope() -> list[dict]:
+def tools_for_refine() -> list[dict]:
     return tools.TOOLS
 
 
 # --- stage A: look -------------------------------------------------------
 
 
-async def _look(messages: list[dict], *, out: dict, meter, payer, actor) -> AsyncIterator[dict]:
+async def _look(
+    messages: list[dict], *, out: dict, meter, payer, actor, scope=None
+) -> AsyncIterator[dict]:
     """Bounded tool loop on the analyst's cached prefix.
 
     Yields UI events. Appends the assistant/tool turns to ``out['transcript']``
@@ -375,16 +381,16 @@ async def _look(messages: list[dict], *, out: dict, meter, payer, actor) -> Asyn
     stream, and a seam a smoke test can replace wholesale.
     """
     client = out["client"]
-    model = settings.scoper_model
+    model = settings.refiner_model
 
-    for _ in range(SCOPE_MAX_TURNS):
+    for _ in range(REFINE_MAX_TURNS):
         async with client.messages.stream(
             model=model,
             max_tokens=8_000,
-            system=system_for_scope(),
-            tools=tools_for_scope(),
+            system=system_for_refine(scope),
+            tools=tools_for_refine(),
             thinking={"type": "adaptive", "display": "summarized"},
-            output_config={"effort": settings.scoper_effort},
+            output_config={"effort": settings.refiner_effort},
             messages=messages,
         ) as stream:
             async for event in stream:
@@ -437,14 +443,14 @@ async def _look(messages: list[dict], *, out: dict, meter, payer, actor) -> Asyn
                 "label": payload.get("purpose") or payload.get("query")
                 or payload.get("doc_id", ""),
             }
-            if tu.name not in SCOPE_TOOLS:
+            if tu.name not in REFINE_TOOLS:
                 result = {
-                    "error": f"{tu.name} is not available while scoping. Use search_corpus or "
+                    "error": f"{tu.name} is not available while refining. Use search_corpus or "
                              f"list_documents to ground your questions, then stop."
                 }
             else:
                 try:
-                    result = await asyncio.to_thread(tools.dispatch, tu.name, payload)
+                    result = await asyncio.to_thread(tools.dispatch, tu.name, payload, scope)
                 except Exception as exc:  # noqa: BLE001
                     result = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -505,7 +511,7 @@ def _findings_digest(findings: list[dict], probed: dict) -> str:
             )
         # document_card spreads the `documents` row, so its identifier arrives
         # as `id` — reading `doc_id` here printed [None] and cost the propose
-        # call the one document the scoper had bothered to open.
+        # call the one document the refiner had bothered to open.
         card_id = result.get("id") or result.get("doc_id")
         if card_id and result.get("anchors") and str(card_id) not in seen:
             seen.add(str(card_id))
@@ -551,7 +557,7 @@ async def _propose(
             "record any remaining uncertainty under brief.assumptions."
         )
 
-    model = settings.scoper_model
+    model = settings.refiner_model
     resp = await client.messages.create(
         model=model,
         max_tokens=8_000,
@@ -633,9 +639,9 @@ def _coerce(payload: dict, probed: dict) -> dict:
 
     brief = {
         "question": _clean(brief_in.get("question"), 4000),
-        "scope": [_clean(s, 300) for s in (brief_in.get("scope") or [])[:8] if _clean(s)],
-        "out_of_scope": [_clean(s, 300) for s in (brief_in.get("out_of_scope") or [])[:8]
-                         if _clean(s)],
+        "covers": [_clean(s, 300) for s in (brief_in.get("covers") or [])[:8] if _clean(s)],
+        "excludes": [_clean(s, 300) for s in (brief_in.get("excludes") or [])[:8]
+                     if _clean(s)],
         "evidence_plan": [
             {"doc_id": _clean(e.get("doc_id"), 40),
              "rel_path": _clean(e.get("rel_path"), 300),
@@ -712,7 +718,7 @@ def _stub_round(question: str, probed: dict) -> dict:
             "coverage": {"score": probed.get("score", 0), "reasons": [], "missing": [],
                          "answer_shape": ""},
             "questions": [],
-            "brief": {"question": question, "scope": [], "out_of_scope": [],
+            "brief": {"question": question, "covers": [], "excludes": [],
                       "evidence_plan": [], "deliverable": "prose",
                       "assumptions": ["Scoping failed; nothing was narrowed."]},
             "complexity": {"level": "moderate", "drivers": [], "docs_to_read": 0,
@@ -733,19 +739,19 @@ def render_brief(brief: dict) -> str:
     cite: it is instructions, and it must not turn up in the citation panel.
     """
     lines = ["<research_brief>", f"QUESTION: {brief.get('question', '')}"]
-    if brief.get("scope"):
+    if brief.get("covers"):
         lines.append("IN SCOPE:")
-        lines += [f"  - {s}" for s in brief["scope"]]
-    if brief.get("out_of_scope"):
+        lines += [f"  - {s}" for s in brief["covers"]]
+    if brief.get("excludes"):
         lines.append("OUT OF SCOPE:")
-        lines += [f"  - {s}" for s in brief["out_of_scope"]]
+        lines += [f"  - {s}" for s in brief["excludes"]]
     if brief.get("evidence_plan"):
         lines.append("START FROM:")
         lines += [f"  - {e['doc_id']} {e['rel_path']} — {e['why']}" for e in brief["evidence_plan"]]
     if brief.get("deliverable"):
         lines.append(f"DELIVERABLE: {brief['deliverable']}")
     if brief.get("assumptions"):
-        lines.append("ASSUMPTIONS (recorded during scoping, unverified):")
+        lines.append("ASSUMPTIONS (recorded during refining, unverified):")
         lines += [f"  - {a}" for a in brief["assumptions"]]
     lines.append("</research_brief>")
     return "\n".join(lines)
@@ -769,9 +775,9 @@ def propose_model(coverage: dict, complexity: dict) -> dict:
     return {"model": model, "effort": effort, "note": note}
 
 
-def estimate_cost(model: str, complexity: dict) -> float:
+def estimate_cost(model: str, complexity: dict, scope=None) -> float:
     """Rough cost of the run, for the brief. An estimate, not a quote."""
-    m = manifest.build()
+    m = manifest.build(scope)
     price_in, price_out = pricing.PRICES.get(model, (5.0, 25.0))
     turns = max(2, min(30, complexity.get("docs_to_read") or 4))
     map_cost = m["approx_tokens"] * price_in * pricing.CACHE_READ_MULTIPLIER * turns
@@ -782,10 +788,10 @@ def estimate_cost(model: str, complexity: dict) -> float:
 # --- persistence ---------------------------------------------------------
 
 
-def rounds(scope_id: str) -> list[dict]:
+def rounds(refine_id: str) -> list[dict]:
     out = []
     for r in db.rows(
-        "SELECT * FROM scope_rounds WHERE scope_id=? ORDER BY round", (scope_id,)
+        "SELECT * FROM refine_rounds WHERE refine_id=? ORDER BY round", (refine_id,)
     ):
         d = dict(r)
         for key in ("answers", "payload", "transcript", "usage"):
@@ -797,34 +803,41 @@ def rounds(scope_id: str) -> list[dict]:
     return out
 
 
-def load(scope_id: str, actor: str | None = None) -> dict | None:
+def load(refine_id: str, actor: str | None = None) -> dict | None:
     """The session as the UI needs it, or None when it is not this user's."""
-    found = rounds(scope_id)
+    found = rounds(refine_id)
     if not found:
         return None
     if actor and found[0].get("actor") and found[0]["actor"] != actor:
         return None
     last = found[-1]
     payload = last.get("payload") or {}
+    try:
+        scope = json.loads(found[0].get("scope") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        scope = []
     proposal = propose_model(payload.get("coverage") or {}, payload.get("complexity") or {})
     return {
-        "scope_id": scope_id,
+        "refine_id": refine_id,
         "question": last["question"],
+        "scope": scope,
         "round": last["round"],
-        "final": last["round"] >= settings.scope_max_rounds,
+        "final": last["round"] >= settings.refine_max_rounds,
         "ready": bool(last["ready"]),
         "answered": [r.get("answers") for r in found],
         **payload,
         "brief_text": render_brief(payload.get("brief") or {}),
         "proposal": {
             **proposal,
-            "estimated_cost_usd": estimate_cost(proposal["model"], payload.get("complexity") or {}),
+            "estimated_cost_usd": estimate_cost(
+                proposal["model"], payload.get("complexity") or {}, scope
+            ),
         },
     }
 
 
 def save_round(
-    scope_id: str,
+    refine_id: str,
     *,
     round_no: int,
     question: str,
@@ -833,26 +846,38 @@ def save_round(
     transcript: list,
     usage: dict,
     actor: str | None,
+    scope: list[str] | None = None,
 ) -> None:
     db.execute(
-        "INSERT INTO scope_rounds(id, scope_id, round, question, answers, payload, transcript,"
-        " ready, coverage, usage, model, effort, actor, created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO refine_rounds(id, refine_id, round, question, scope, answers, payload,"
+        " transcript, ready, coverage, usage, model, effort, actor, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            uuid.uuid4().hex[:12], scope_id, round_no, question,
+            uuid.uuid4().hex[:12], refine_id, round_no, question,
+            json.dumps(scope or []),
             json.dumps(answers or [], default=str), json.dumps(payload, default=str),
             json.dumps(_sealed(transcript), default=str),
             1 if payload.get("ready") else 0,
             (payload.get("coverage") or {}).get("score"),
-            json.dumps(usage), settings.scoper_model, settings.scoper_effort,
+            json.dumps(usage), settings.refiner_model, settings.refiner_effort,
             actor, time.time(),
         ),
     )
 
 
-def link_answer(scope_id: str, qa_id: str) -> None:
-    """Tie every round of a session to the answer its brief produced."""
-    db.execute("UPDATE scope_rounds SET qa_id=? WHERE scope_id=?", (qa_id, scope_id))
+def link_answer(refine_id: str, qa_id: str, actor: str | None = None) -> None:
+    """Tie every round of a session to the answer its brief produced.
+
+    The id arrives on the ask body, so it is whatever the client sent. Without
+    the actor check one account could stamp another account's refinement rows
+    with its own answer — not a data leak, but a corrupted audit trail, and the
+    audit trail is most of the point of storing these at all.
+    """
+    db.execute(
+        "UPDATE refine_rounds SET qa_id=? WHERE refine_id=?"
+        " AND (actor IS ? OR actor = ?)",
+        (qa_id, refine_id, actor, actor),
+    )
 
 
 # --- the loop ------------------------------------------------------------
@@ -914,28 +939,39 @@ def _render_answers(prior_questions: list[dict], answers: list[dict] | None) -> 
 async def run(
     question: str,
     *,
-    scope_id: str | None = None,
+    refine_id: str | None = None,
     answers: list[dict] | None = None,
     actor: str | None = None,
+    scope: list[str] | None = None,
 ) -> AsyncIterator[dict]:
     """One refinement round. Yields the same event vocabulary as agent.ask."""
     started = time.time()
     meter = pricing.Meter()
 
-    prior = rounds(scope_id) if scope_id else []
-    if scope_id and not prior:
-        yield {"type": "error", "message": "That scoping session has expired. Ask again."}
+    prior = rounds(refine_id) if refine_id else []
+    if refine_id and not prior:
+        yield {"type": "error", "message": "That refining session has expired. Ask again."}
         return
     if prior and prior[0].get("actor") and actor and prior[0]["actor"] != actor:
-        yield {"type": "error", "message": "That scoping session belongs to another account."}
+        yield {"type": "error", "message": "That refining session belongs to another account."}
         return
 
-    scope_id = scope_id or uuid.uuid4().hex[:12]
+    refine_id = refine_id or uuid.uuid4().hex[:12]
     round_no = (prior[-1]["round"] + 1) if prior else 1
     # The original question is the one the session started with; later rounds
     # only ever carry answers.
     question = prior[0]["question"] if prior else question
-    payer = pricing.Attribution(actor, "ask", "scoper", scope_id)
+    # The folders are chosen once, when the session starts. Later rounds and the
+    # run that follows inherit them: a brief written against the whole library
+    # and then answered inside one folder would cite documents the answer is not
+    # allowed to open.
+    if prior:
+        try:
+            scope = json.loads(prior[0].get("scope") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            scope = []
+    scope = [p for p in (scope or []) if p]
+    payer = pricing.Attribution(actor, "ask", "refiner", refine_id)
 
     try:
         await asyncio.to_thread(budget.require, actor, "ask")
@@ -944,19 +980,25 @@ async def run(
                "budget": await asyncio.to_thread(budget.status, actor)}
         return
 
-    m = manifest.build()
+    m = manifest.build(scope)
+    folders = ", ".join(p.rstrip("/").rsplit("/", 1)[-1] for p in scope)
     if m["n_indexed"] == 0:
         yield {
             "type": "error",
-            "message": "No documents are indexed yet. Point the app at a corpus, run Ingest, "
-                       "then run the Sweep.",
+            "message": (
+                f"No indexed documents in {folders}. Widen the folders, or run the Sweep "
+                "if they were only just ingested."
+                if scope
+                else "No documents are indexed yet. Point the app at a corpus, run Ingest, "
+                "then run the Sweep."
+            ),
         }
         return
 
-    probed = await asyncio.to_thread(probe, question)
+    probed = await asyncio.to_thread(probe, question, scope)
     yield {
-        "type": "scope_probe",
-        "scope_id": scope_id,
+        "type": "refine_probe",
+        "refine_id": refine_id,
         "round": round_no,
         "score": probed["score"],
         "band": band(probed["score"]),
@@ -966,11 +1008,12 @@ async def run(
     yield {
         "type": "status",
         "message": f"corpus map: {m['n_indexed']} documents, ~{m['approx_tokens']:,} tokens"
-                   f" ({m['mode']} mode)",
-        "scope_id": scope_id,
+                   f" ({m['mode']} mode)" + (f" · scoped to {folders}" if scope else ""),
+        "refine_id": refine_id,
+        "scope": scope,
     }
 
-    last_round = round_no >= settings.scope_max_rounds
+    last_round = round_no >= settings.refine_max_rounds
     client = credentials.get_client()
     out = {"client": client, "findings": [], "transcript": []}
 
@@ -993,11 +1036,13 @@ async def run(
                         "list_documents on the relevant workstream before asking anything.")
             messages = [{
                 "role": "user",
-                "content": f"<scoping_task>\n{DIRECTIVE}\n\n{LOOK_TASK}{hint}\n</scoping_task>"
+                "content": f"<refining_task>\n{DIRECTIVE}\n\n{LOOK_TASK}{hint}\n</refining_task>"
                            f"\n\nUSER QUESTION:\n{question}",
             }]
 
-        async for event in _look(messages, out=out, meter=meter, payer=payer, actor=actor):
+        async for event in _look(
+            messages, out=out, meter=meter, payer=payer, actor=actor, scope=scope
+        ):
             if event.get("type") == "error":
                 yield event
                 return
@@ -1013,8 +1058,8 @@ async def run(
             )
             payload = _coerce(raw, probed)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            broker.log(f"scope: unparseable round, retrying once ({exc})", level="warn",
-                       source="scope")
+            broker.log(f"refine: unparseable round, retrying once ({exc})", level="warn",
+                       source="refine")
             try:
                 raw = await _propose(
                     client=client, question=question, findings_text=findings_text,
@@ -1032,17 +1077,18 @@ async def run(
             payload["brief"]["question"] = question
 
         await asyncio.to_thread(
-            save_round, scope_id, round_no=round_no, question=question, answers=answers,
+            save_round, refine_id, round_no=round_no, question=question, answers=answers,
+            scope=scope,
             payload=payload, transcript=messages, usage=meter.snapshot(), actor=actor,
         )
 
         # Coverage first: a user looking at "22% — thin" should be able to walk
         # away before investing in four answers.
-        yield {"type": "scope_coverage", "scope_id": scope_id, "round": round_no,
+        yield {"type": "refine_coverage", "refine_id": refine_id, "round": round_no,
                "provisional": False, **payload["coverage"]}
         yield {
-            "type": "scope_round",
-            "scope_id": scope_id,
+            "type": "refine_round",
+            "refine_id": refine_id,
             "round": round_no,
             "final": last_round,
             "ready": payload["ready"],
@@ -1051,32 +1097,32 @@ async def run(
             "n_questions": len(payload["questions"]),
         }
         for q in payload["questions"]:
-            yield {"type": "scope_question", "scope_id": scope_id, **q}
+            yield {"type": "refine_question", "refine_id": refine_id, **q}
 
         proposal = propose_model(payload["coverage"], payload["complexity"])
         yield {
-            "type": "scope_brief",
-            "scope_id": scope_id,
+            "type": "refine_brief",
+            "refine_id": refine_id,
             "round": round_no,
             "brief": payload["brief"],
             "brief_text": render_brief(payload["brief"]),
             "complexity": payload["complexity"],
             "proposal": {**proposal,
-                         "estimated_cost_usd": estimate_cost(proposal["model"],
-                                                             payload["complexity"])},
+                         "estimated_cost_usd": estimate_cost(
+                             proposal["model"], payload["complexity"], scope)},
         }
 
         usage = meter.snapshot()
         duration = time.time() - started
         broker.log(
-            f"Scoped a question in {duration:.0f}s · round {round_no} · "
+            f"Refined a question in {duration:.0f}s · round {round_no} · "
             f"{len(payload['questions'])} questions · coverage "
             f"{payload['coverage']['score']}% · ${usage['cost_usd']:.3f}",
             level="info",
         )
         yield {
-            "type": "scope_done",
-            "scope_id": scope_id,
+            "type": "refine_done",
+            "refine_id": refine_id,
             "round": round_no,
             "ready": payload["ready"],
             "needs_answers": bool(payload["questions"]),
@@ -1086,9 +1132,9 @@ async def run(
         }
     except Exception as exc:  # noqa: BLE001
         broker.log(
-            f"scope failed: {type(exc).__name__}: {exc}",
+            f"refine failed: {type(exc).__name__}: {exc}",
             level="error",
-            source="scope",
+            source="refine",
             context={"exc_type": type(exc).__name__, "traceback": traceback.format_exc(limit=12)},
         )
         yield {"type": "error", "message": f"{type(exc).__name__}: {exc}"}

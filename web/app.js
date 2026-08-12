@@ -1311,7 +1311,7 @@ for (const s of $("suggestions").children) {
 
 $("newThread").onclick = () => {
   state.history = [];
-  resetScope();
+  resetRefine();
   $("thread").innerHTML = `<div class="empty"><h2>New thread</h2><p class="muted">Previous turns cleared.</p></div>`;
   $("trace").innerHTML = ""; $("citations").innerHTML = ""; $("runMeta").textContent = "idle";
 };
@@ -1320,9 +1320,223 @@ $("question").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") $("askForm").requestSubmit();
 });
 
+/* ── question scope: which folders the assistant may see ──────────────── */
+// Sticky for the browser session, not the account: a scope belongs to the piece
+// of work in front of you, and inheriting yesterday's on a fresh sign-in would
+// silently narrow a question nobody meant to narrow.
+const SCOPE_KEY = "dd.scope";
+state.scope = (() => {
+  try { return JSON.parse(sessionStorage.getItem(SCOPE_KEY) || "[]"); } catch { return []; }
+})();
+let scopeDraft = [];
+let scopeFolders = [];
+let scopeEstimateTimer = null;
+let scopeEstimateIssued = 0;
+
+// A stored scope outlives the corpus it names. Delete an extracted folder, or
+// re-point the app, and the saved prefixes are no longer inside any known root —
+// at which point the server rejects them and *every* question 400s until someone
+// thinks to clear the chip by hand. So the restored scope is checked against the
+// roots the server will check it against, and anything gone is dropped.
+// Returns *what happened*, not a count. Two rounds of review went on this
+// function because a single number cannot distinguish outcomes that read
+// differently to the reader — "narrowed" and "cleared" send a retry against very
+// different amounts of the library, and "nothing to drop" and "there are no roots
+// at all" are opposite facts. One state, one sentence, one source of truth for
+// both the toast and the message on a refused question.
+//   not_scoped | unknown | no_roots | unchanged | narrowed | cleared
+function pruneScope(roots) {
+  if (!state.scope.length) return { kind: "not_scoped" };
+  // The caller could not read the list; it must not be treated as "no roots".
+  if (!Array.isArray(roots)) return { kind: "unknown" };
+  const before = state.scope.length;
+  // Said out loud in every case that changes the scope, never silently: the
+  // alternative is a question quietly answered against more of the library than
+  // the reader chose.
+  if (!roots.length) {
+    setScope([]);
+    toast("No corpus folders are configured any more — back to the whole corpus.", true);
+    return { kind: "no_roots", lost: before };
+  }
+  const inside = (p) => roots.some((r) => {
+    const root = r.replace(/\/$/, "");
+    return p === root || p.startsWith(root + "/");
+  });
+  const kept = state.scope.filter(inside);
+  if (kept.length === before) return { kind: "unchanged" };
+  const lost = before - kept.length;
+  setScope(kept);
+  toast(
+    `${lost} folder${lost === 1 ? "" : "s"} in your saved scope no longer exist — ` +
+    (kept.length ? "scope narrowed to what is left." : "back to the whole corpus."),
+    true,
+  );
+  return kept.length ? { kind: "narrowed", lost, kept: kept.length } : { kind: "cleared", lost };
+}
+
+function setScope(paths) {
+  state.scope = paths;
+  sessionStorage.setItem(SCOPE_KEY, JSON.stringify(paths));
+  renderScopeChip();
+}
+
+// Re-check the saved scope after the server has refused it, and return what to
+// tell the reader — one sentence per outcome, each of them true. Where the scope
+// widened, the sentence says so: a reader who retries needs to know the answer
+// will now come from more of the library than they picked.
+const SCOPE_RECHECK_NOTE = {
+  narrowed: (r) =>
+    `the scope has been narrowed to the ${r.kept} folder${r.kept === 1 ? "" : "s"}`
+    + " that still exist; ask again.",
+  cleared: () =>
+    "none of those folders exist any more, so the scope is now the whole corpus —"
+    + " ask again only if that is what you want.",
+  no_roots: () =>
+    "the app no longer knows of any corpus folder, so the scope has been cleared"
+    + " and the whole library is in play.",
+  unchanged: () =>
+    "the folder list still offers those folders, so this looks like a server-side"
+    + " change; clear the scope chip to ask against the whole corpus.",
+  not_scoped: () => "the scope is already empty; ask again.",
+  unknown: () =>
+    "the folder list could not be re-read, so the scope is unchanged; clear the"
+    + " scope chip to ask against the whole corpus.",
+};
+
+async function recheckScope() {
+  let roots;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+    roots = r.roots;
+  } catch {
+    roots = undefined;   // → "unknown": could not look, rather than "no roots"
+  }
+  const outcome = pruneScope(roots);
+  return (SCOPE_RECHECK_NOTE[outcome.kind] || SCOPE_RECHECK_NOTE.unknown)(outcome);
+}
+
+function scopeCount(paths) {
+  // Nested selections would double-count, and a parent already covers its
+  // children, so count only the outermost picks.
+  const outer = paths.filter((p) => !paths.some((q) => q !== p && p.startsWith(q.replace(/\/$/, "") + "/")));
+  return outer.reduce(
+    (n, p) => n + (scopeFolders.find((f) => f.path === p)?.n_indexed || 0), 0);
+}
+
+function renderScopeChip() {
+  const chip = $("scopeChip");
+  if (!chip) return;
+  const n = state.scope.length;
+  chip.classList.toggle("on", n > 0);
+  if (!n) {
+    chip.textContent = "scope: whole corpus";
+    chip.title = "Limit this question to part of the library";
+    return;
+  }
+  const docs = scopeCount(state.scope);
+  chip.textContent = `scope: ${n} folder${n === 1 ? "" : "s"}${docs ? ` · ${nfmt(docs)} docs` : ""}`;
+  chip.title = state.scope.join("\n");
+}
+
+function scopeDraftPaths() {
+  return [...document.querySelectorAll("#scopeTree input:checked")].map((i) => i.value);
+}
+
+async function updateScopeEstimate() {
+  // Debouncing only delays the starts; the replies still race. Ticking a third
+  // folder while the two-folder estimate is in flight must not leave the price of
+  // two folders under a selection of three.
+  const mine = ++scopeEstimateIssued;
+  const paths = scopeDraftPaths();
+  const box = $("scopeEstimate");
+  box.textContent = "estimating…";
+  try {
+    const q = paths.length ? `?scope=${encodeURIComponent(JSON.stringify(paths))}` : "";
+    const m = await api(`/api/manifest${q}`);
+    if (mine !== scopeEstimateIssued) return;
+    const total = m.n_indexed_total ?? m.n_indexed;
+    box.innerHTML = paths.length
+      ? `${nfmt(m.n_indexed)} of ${nfmt(total)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`
+      : `whole corpus: ${nfmt(m.n_indexed)} documents · map ~${nfmt(m.approx_tokens)} tokens ·
+         ${money(m.cost_per_turn_usd)} per turn`;
+  } catch (e) {
+    if (mine !== scopeEstimateIssued) return;
+    box.textContent = e.message;
+  }
+}
+
+function renderScopeTree() {
+  const tree = $("scopeTree");
+  if (!scopeFolders.length) {
+    tree.innerHTML = `<span class="muted small">No indexed folders yet.</span>`;
+    return;
+  }
+  tree.innerHTML = "";
+  let currentRoot = null;
+  for (const f of scopeFolders) {
+    if (f.root !== currentRoot) {
+      currentRoot = f.root;
+      if (f.depth > 0) tree.append(el("div", "scope-root muted small", currentRoot));
+    }
+    const row = el("label", "scope-row");
+    row.style.paddingLeft = `${f.depth * 18}px`;
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.value = f.path;
+    cb.checked = scopeDraft.includes(f.path);
+    cb.onchange = () => {
+      clearTimeout(scopeEstimateTimer);
+      scopeEstimateTimer = setTimeout(updateScopeEstimate, 250);
+    };
+    row.append(cb);
+    row.append(el("span", "n", f.name || f.path));
+    row.append(el("span", "tag dupe", `${nfmt(f.n_indexed)} indexed`));
+    if (f.n_documents > f.n_indexed) {
+      row.append(el("span", "tag", `${nfmt(f.n_documents - f.n_indexed)} not indexed`));
+    }
+    tree.append(row);
+  }
+}
+
+async function openScopeModal() {
+  scopeDraft = [...state.scope];
+  $("scopeModal").classList.add("open");
+  $("scopeTree").innerHTML = `<span class="muted small">loading…</span>`;
+  try {
+    const r = await api("/api/corpus/folders");
+    scopeFolders = r.folders || [];
+    pruneScope(r.roots);
+    scopeDraft = [...state.scope];
+  } catch (e) {
+    $("scopeTree").innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+    return;
+  }
+  renderScopeTree();
+  updateScopeEstimate();
+}
+
+function closeScopeModal() {
+  $("scopeModal").classList.remove("open");
+}
+
+$("scopeChip").onclick = openScopeModal;
+$("scopeClose").onclick = closeScopeModal;
+$("scopeModal").onclick = (e) => { if (e.target.id === "scopeModal") closeScopeModal(); };
+$("scopeClear").onclick = () => {
+  for (const cb of document.querySelectorAll("#scopeTree input")) cb.checked = false;
+  updateScopeEstimate();
+};
+$("scopeApply").onclick = () => {
+  setScope(scopeDraftPaths());
+  closeScopeModal();
+};
+renderScopeChip();
+
 $("askForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  startScoping();
+  startRefining();
 });
 
 /* Events every stream emits the same way. Shared so the scope stream and the
@@ -1377,34 +1591,37 @@ function handleCommonEvent(ev, ctx) {
 }
 
 /* ── scoping ─────────────────────────────────────────────────────────── */
-/* Every question is scoped before it is answered: the model reads the corpus,
+/* Every question is refined before it is answered: the model reads the corpus,
    asks a few questions whose options name documents that actually exist, and
-   hands back a brief the user can edit. Its own object rather than a field on
-   `state`, because its lifecycle is not the thread's — but `state.running`
-   stays the single lock, so a scope stream and an answer stream can never both
-   be writing the trace rail. */
-const scope = {
-  phase: "idle",          // idle | scoping | awaiting | brief | running
+   hands back a brief the user can edit. Note the two senses of "scope" in this
+   file are different things: `state.scope` is the folders a question may see,
+   and this is the refinement dialogue that sharpens the question itself.
+
+   Its own object rather than a field on `state`, because its lifecycle is not
+   the thread's — but `state.running` stays the single lock, so a refinement
+   stream and an answer stream can never both be writing the trace rail. */
+const refine = {
+  phase: "idle",          // idle | refining | awaiting | brief | running
   id: "", round: 0, final: false, original: "",
   questions: [], brief: null, proposal: null, coverage: null,
   card: null, briefCard: null,
 };
 
-function resetScope() {
-  Object.assign(scope, {
+function resetRefine() {
+  Object.assign(refine, {
     phase: "idle", id: "", round: 0, final: false, original: "",
     questions: [], brief: null, proposal: null, coverage: null,
     card: null, briefCard: null,
   });
-  try { sessionStorage.removeItem("dd-scope-id"); } catch { /* private mode */ }
+  try { sessionStorage.removeItem("dd-refine-id"); } catch { /* private mode */ }
 }
 
-function setScopePhase(next) {
-  scope.phase = next;
-  const busy = next === "scoping" || next === "running";
+function setRefinePhase(next) {
+  refine.phase = next;
+  const busy = next === "refining" || next === "running";
   $("askBtn").disabled = busy;
   $("askBtn").textContent =
-    next === "scoping" ? "Scoping…" : next === "running" ? "Working…" : "Ask";
+    next === "refining" ? "Refining…" : next === "running" ? "Working…" : "Ask";
 }
 
 /* Coverage is a claim about evidence, not a promise about the answer — so it is
@@ -1466,7 +1683,7 @@ function questionFieldset(q, index) {
     const label = el("label", "suggestion");
     const input = document.createElement("input");
     input.type = type;
-    input.name = `${q.id}-${scope.round}`;
+    input.name = `${q.id}-${refine.round}`;
     input.value = o.label;
     const key = el("span", "tag key", String(i + 1));
     key.setAttribute("aria-hidden", "true");
@@ -1484,7 +1701,7 @@ function questionFieldset(q, index) {
   const other = el("label", "suggestion other");
   const otherInput = document.createElement("input");
   otherInput.type = type;
-  otherInput.name = `${q.id}-${scope.round}`;
+  otherInput.name = `${q.id}-${refine.round}`;
   otherInput.dataset.other = "1";
   const otherKey = el("span", "tag key", String((q.options || []).length + 1));
   otherKey.setAttribute("aria-hidden", "true");
@@ -1519,21 +1736,21 @@ function syncOptions(fs) {
     l.classList.toggle("on", qs("input", l).checked);
   }
   fs.classList.toggle("skipped", fs.dataset.skipped === "1");
-  updateScopeMeta();
+  updateRefineMeta();
 }
 
-function updateScopeMeta() {
-  if (!scope.card) return;
-  const groups = [...scope.card.querySelectorAll(".qgroup")];
+function updateRefineMeta() {
+  if (!refine.card) return;
+  const groups = [...refine.card.querySelectorAll(".qgroup")];
   const done = groups.filter((fs) =>
     fs.dataset.skipped === "1" || qs("input:checked", fs)).length;
-  const meta = qs(".scopemeta", scope.card);
+  const meta = qs(".refinemeta", refine.card);
   if (meta) meta.textContent = `${done} of ${groups.length} answered · ⌘⏎ to continue`;
 }
 
 function collectAnswers() {
   const out = [];
-  for (const fs of scope.card.querySelectorAll(".qgroup")) {
+  for (const fs of refine.card.querySelectorAll(".qgroup")) {
     if (fs.dataset.skipped === "1") { out.push({ id: fs.dataset.qid, value: "", skipped: true }); continue; }
     const picked = [...fs.querySelectorAll("input:checked")]
       .map((i) => (i.dataset.other === "1" ? (qs(".othertext", fs).value || "").trim() : i.value))
@@ -1546,23 +1763,23 @@ function collectAnswers() {
 /* Number keys pick an option in the group you are in (or the first unanswered
    one), Enter moves on, ⌘⏎ submits — the same binding as the composer. Typing
    in "something else" is left alone. */
-function onScopeKeydown(e) {
+function onRefineKeydown(e) {
   const t = e.target;
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     e.preventDefault();
-    return scope.card.requestSubmit();
+    return refine.card.requestSubmit();
   }
   if (t.tagName === "TEXTAREA" || (t.tagName === "INPUT" && t.type === "text")) return;
   if (e.key === "Enter" && t.type !== "submit") {
     e.preventDefault();
-    const next = [...scope.card.querySelectorAll(".qgroup")]
+    const next = [...refine.card.querySelectorAll(".qgroup")]
       .find((fs) => fs.dataset.skipped !== "1" && !qs("input:checked", fs));
-    if (next) qs("input", next).focus(); else scope.card.requestSubmit();
+    if (next) qs("input", next).focus(); else refine.card.requestSubmit();
     return;
   }
   if (!/^[1-9]$/.test(e.key) || e.metaKey || e.ctrlKey || e.altKey) return;
   const group = t.closest?.(".qgroup")
-    || [...scope.card.querySelectorAll(".qgroup")]
+    || [...refine.card.querySelectorAll(".qgroup")]
       .find((fs) => fs.dataset.skipped !== "1" && !qs("input:checked", fs));
   if (!group) return;
   const inputs = [...group.querySelectorAll(".suggestion input:not(.othertext)")];
@@ -1574,41 +1791,62 @@ function onScopeKeydown(e) {
   syncOptions(group);
 }
 
-async function startScoping() {
+async function startRefining() {
   if (state.running) return;
   const question = $("question").value.trim();
   if (!question) return;
   if (!state.status?.stats?.by_status?.carded) {
     return toast("Nothing is indexed yet — run Ingest then Indexing first.", true);
   }
-  resetScope();
-  scope.original = question;
+  resetRefine();
+  refine.original = question;
   $("question").value = "";
   const thread = $("thread");
   if (qs(".empty", thread)) thread.innerHTML = "";
   $("trace").innerHTML = "";
   $("citations").innerHTML = "";
   thread.append(msgBlock("you", esc(question).replace(/\n/g, "<br>"), "user"));
-  await scopeStream({ question });
+  await refineStream({ question });
 }
 
-async function submitScopeRound() {
-  if (state.running || !scope.card) return;
+async function submitRefineRound() {
+  if (state.running || !refine.card) return;
   const answers = collectAnswers();
-  for (const i of scope.card.querySelectorAll("input, button")) i.disabled = true;
-  await scopeStream({ question: scope.original, scope_id: scope.id, answers });
+  for (const i of refine.card.querySelectorAll("input, button")) i.disabled = true;
+  await refineStream({ question: refine.original, refine_id: refine.id, answers });
 }
 
-async function scopeStream(body) {
+/* A refused request, turned into the sentence the reader gets.
+
+   The corpus can be re-pointed or an extracted folder deleted between choosing
+   a scope and asking, and both the refinement round and the answer post those
+   prefixes — refinement first, since it now goes ahead of every question. So
+   the recovery lives in one place rather than in whichever request happened to
+   run first.
+
+   The re-check is awaited, and the message says what actually happened:
+   reporting a re-check that is still in flight, or that failed, would send the
+   reader back into the same refusal believing it was fixed. Awaiting also
+   closes the retry window — `state.running` is still set, so nothing can post
+   the stale prefixes while it resolves. */
+async function askError(res) {
+  const detail = (await res.text()) || res.statusText;
+  if (res.status === 400 && detail.includes("outside every known corpus root")) {
+    return `${detail} — ${await recheckScope()}`;
+  }
+  return detail;
+}
+
+async function refineStream(body) {
   state.running = true;
-  setScopePhase("scoping");
-  scope.round += 1;
-  scope.questions = [];
+  setRefinePhase("refining");
+  refine.round += 1;
+  refine.questions = [];
 
   const thread = $("thread");
   const card = document.createElement("form");
-  card.className = "msg scope";
-  const head = el("div", "who", `scoping · round ${scope.round}`);
+  card.className = "msg refine";
+  const head = el("div", "who", `refining · round ${refine.round}`);
   const think = el("div", "think hidden");
   think.append(el("div", "who", "reasoning"));
   const thinkBody = el("div", "b");
@@ -1618,50 +1856,50 @@ async function scopeStream(body) {
   qbox.setAttribute("aria-busy", "true");
   const notices = el("div", "notices");
   card.append(head, think, qbox, notices);
-  card.addEventListener("submit", (e) => { e.preventDefault(); submitScopeRound(); });
-  card.addEventListener("keydown", onScopeKeydown);
-  // Only the live round answers to #scopeCard; earlier rounds stay in the thread
+  card.addEventListener("submit", (e) => { e.preventDefault(); submitRefineRound(); });
+  card.addEventListener("keydown", onRefineKeydown);
+  // Only the live round answers to #refineCard; earlier rounds stay in the thread
   // as the record of how the question got here.
-  for (const old of thread.querySelectorAll("#scopeCard")) old.removeAttribute("id");
-  card.id = "scopeCard";
+  for (const old of thread.querySelectorAll("#refineCard")) old.removeAttribute("id");
+  card.id = "refineCard";
   // A new round supersedes the brief that came with the last one. Leaving that
   // card on screen leaves a live Run button whose textarea belongs to the old
-  // brief while `scope.brief` has already moved on — one click and the analyst
+  // brief while `refine.brief` has already moved on — one click and the analyst
   // gets the old question wrapped in the new round's scope and assumptions.
-  scope.briefCard?.remove();
-  scope.briefCard = null;
+  refine.briefCard?.remove();
+  refine.briefCard = null;
   thread.append(card);
   thread.scrollTop = thread.scrollHeight;
-  scope.card = card;
+  refine.card = card;
 
   const ctx = { notices, think, thinkBody };
   const t0 = Date.now();
   const tick = setInterval(() => {
     if (!state.running) return clearInterval(tick);
     const cur = $("runMeta").dataset.base || "";
-    $("runMeta").innerHTML = `<span class="spin">◐</span> ${((Date.now() - t0) / 1000).toFixed(0)}s scoping ${cur}`;
+    $("runMeta").innerHTML = `<span class="spin">◐</span> ${((Date.now() - t0) / 1000).toFixed(0)}s refining ${cur}`;
   }, 500);
 
   let failed = false;
   try {
-    const res = await fetch("/api/scope", {
+    const res = await fetch("/api/refine", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, scope: state.scope }),
     });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) throw new Error(await askError(res));
 
     for await (const ev of sseStream(res)) {
       if (ev.type === "error") failed = true;
       if (handleCommonEvent(ev, ctx)) continue;
       switch (ev.type) {
-        case "scope_probe":
-          scope.id = ev.scope_id;
-          try { sessionStorage.setItem("dd-scope-id", ev.scope_id); } catch { /* private mode */ }
+        case "refine_probe":
+          refine.id = ev.refine_id;
+          try { sessionStorage.setItem("dd-refine-id", ev.refine_id); } catch { /* private mode */ }
           head.append(coverageEl(ev, true));
           break;
-        case "scope_coverage": {
-          scope.coverage = ev;
+        case "refine_coverage": {
+          refine.coverage = ev;
           qs(".coverage", head)?.replaceWith(coverageEl(ev, false));
           if (ev.score < 70 && (ev.missing || []).length) {
             qbox.append(el("div", "muted small", "What the data room does not appear to have:"));
@@ -1675,36 +1913,36 @@ async function scopeStream(body) {
           }
           break;
         }
-        case "scope_round":
-          scope.final = !!ev.final;
+        case "refine_round":
+          refine.final = !!ev.final;
           if (ev.assessment) {
             const a = el("div", "assessment");
             a.innerHTML = renderMarkdown(ev.assessment);
             qbox.prepend(a);
           }
           break;
-        case "scope_question":
-          scope.questions.push(ev);
-          qbox.append(questionFieldset(ev, scope.questions.length - 1));
+        case "refine_question":
+          refine.questions.push(ev);
+          qbox.append(questionFieldset(ev, refine.questions.length - 1));
           break;
-        case "scope_brief":
-          scope.brief = ev.brief;
-          scope.proposal = ev.proposal;
-          scope.complexity = ev.complexity;
+        case "refine_brief":
+          refine.brief = ev.brief;
+          refine.proposal = ev.proposal;
+          refine.complexity = ev.complexity;
           break;
-        case "scope_done":
+        case "refine_done":
           qbox.setAttribute("aria-busy", "false");
           if (ev.needs_answers) {
-            card.append(scopeFooter());
-            updateScopeMeta();
+            card.append(refineFooter());
+            updateRefineMeta();
             qs(".qgroup input", card)?.focus();
           } else {
-            head.textContent = `scoping · round ${scope.round} · ready`;
-            if (scope.coverage) head.append(coverageEl(scope.coverage, false));
+            head.textContent = `refining · round ${refine.round} · ready`;
+            if (refine.coverage) head.append(coverageEl(refine.coverage, false));
             renderBrief();
           }
           refreshStatus();
-          $("runMeta").innerHTML = `scoped in ${ev.duration_s}s · ${money(ev.usage.cost_usd)}`;
+          $("runMeta").innerHTML = `refined in ${ev.duration_s}s · ${money(ev.usage.cost_usd)}`;
           $("runMeta").dataset.base = "";
           break;
       }
@@ -1717,34 +1955,34 @@ async function scopeStream(body) {
     clearInterval(tick);
     state.running = false;
     qbox.setAttribute("aria-busy", "false");
-    setScopePhase(failed ? "idle" : scope.questions.length ? "awaiting" : "brief");
-    if (failed) resetScope();
+    setRefinePhase(failed ? "idle" : refine.questions.length ? "awaiting" : "brief");
+    if (failed) resetRefine();
   }
 }
 
-function scopeFooter() {
-  const foot = el("div", "row between wrap gap scopefoot");
-  foot.append(el("span", "muted small scopemeta", ""));
+function refineFooter() {
+  const foot = el("div", "row between wrap gap refinefoot");
+  foot.append(el("span", "muted small refinemeta", ""));
   const right = el("div", "row gap");
   const skipAll = el("button", "ghost", "Skip all — use your judgement");
   skipAll.type = "button";
-  skipAll.id = "scopeSkipAll";
+  skipAll.id = "refineSkipAll";
   skipAll.onclick = () => {
-    for (const fs of scope.card.querySelectorAll(".qgroup")) {
+    for (const fs of refine.card.querySelectorAll(".qgroup")) {
       for (const i of fs.querySelectorAll("input")) i.checked = false;
       qs(".othertext", fs).value = "";
       fs.dataset.skipped = "1";
       syncOptions(fs);
     }
-    scope.card.requestSubmit();
+    refine.card.requestSubmit();
   };
   const draft = el("button", "ghost", "Run the draft as it stands");
   draft.type = "button";
-  draft.id = "scopeDraft";
+  draft.id = "refineDraft";
   draft.onclick = () => renderBrief();
   const go = el("button", "primary", "Continue");
   go.type = "submit";
-  go.id = "scopeSubmit";
+  go.id = "refineSubmit";
   right.append(skipAll, draft, go);
   foot.append(right);
   return foot;
@@ -1753,12 +1991,12 @@ function scopeFooter() {
 /* The brief is the plan: shown before anything expensive runs, and editable,
    because the user knows things about the deal the corpus does not. */
 function renderBrief() {
-  if (!scope.brief) return;
-  scope.briefCard?.remove();
+  if (!refine.brief) return;
+  refine.briefCard?.remove();
   const card = document.createElement("form");
   card.className = "msg brief";
   card.id = "briefCard";
-  const thin = (scope.coverage?.score ?? 100) < 40;
+  const thin = (refine.coverage?.score ?? 100) < 40;
 
   const head = el("div", "who", "research brief · you can edit this");
   const body = el("div", "body");
@@ -1768,7 +2006,7 @@ function renderBrief() {
   const ta = document.createElement("textarea");
   ta.id = "briefText";
   ta.rows = 5;
-  ta.value = scope.brief.question || scope.original;
+  ta.value = refine.brief.question || refine.original;
   const edited = el("div", "muted small hidden", "edited — it will run exactly as written");
   edited.id = "briefEditedNote";
   ta.addEventListener("input", () => edited.classList.remove("hidden"));
@@ -1785,9 +2023,9 @@ function renderBrief() {
   // guessed at something it had actually been told.
   const lists = el("div", "brieflists");
   for (const [title, items, id] of [
-    ["In scope", scope.brief.scope || [], "briefScope"],
-    ["Excluded", scope.brief.out_of_scope || [], "briefExcluded"],
-    ["Assumed", scope.brief.assumptions || [], "briefAssumed"],
+    ["Covers", refine.brief.covers || [], "briefCovers"],
+    ["Excludes", refine.brief.excludes || [], "briefExcludes"],
+    ["Assumed", refine.brief.assumptions || [], "briefAssumed"],
   ]) {
     const col = el("div");
     col.append(el("h4", null, title));
@@ -1804,19 +2042,19 @@ function renderBrief() {
   }
   body.append(lists);
 
-  if ((scope.brief.evidence_plan || []).length) {
+  if ((refine.brief.evidence_plan || []).length) {
     body.append(el("h4", null, "Starts from"));
     const focus = el("div", "drawer-anchors");
     focus.id = "briefFocus";
-    focus.innerHTML = scope.brief.evidence_plan
+    focus.innerHTML = refine.brief.evidence_plan
       .map((e) => `${citeChip(e.doc_id)} <span class="muted small">${esc(e.rel_path)}</span>`)
       .join(" ");
     body.append(focus);
   }
 
-  if ((scope.coverage?.missing || []).length && !thin) {
+  if ((refine.coverage?.missing || []).length && !thin) {
     body.append(el("h4", null, "Not in the data room"));
-    body.append(missingList(scope.coverage.missing));
+    body.append(missingList(refine.coverage.missing));
   }
 
   const opts = el("div", "runopts");
@@ -1829,7 +2067,7 @@ function renderBrief() {
     o.textContent = `${m.id} · $${m.input_usd}/$${m.output_usd} per Mtok`;
     modelSel.append(o);
   }
-  modelSel.value = scope.proposal?.model || state.status?.models?.analyst || "";
+  modelSel.value = refine.proposal?.model || state.status?.models?.analyst || "";
   const effortSel = document.createElement("select");
   effortSel.id = "briefEffort";
   effortSel.title = "Reasoning effort";
@@ -1839,32 +2077,32 @@ function renderBrief() {
     o.textContent = `effort: ${level}`;
     effortSel.append(o);
   }
-  effortSel.value = scope.proposal?.effort || state.status?.models?.effort || "high";
+  effortSel.value = refine.proposal?.effort || state.status?.models?.effort || "high";
   opts.append(modelSel, effortSel);
   opts.append(el("span", "muted small",
-    `proposed: ${scope.proposal?.note || "—"} · about ${money(scope.proposal?.estimated_cost_usd)}`));
+    `proposed: ${refine.proposal?.note || "—"} · about ${money(refine.proposal?.estimated_cost_usd)}`));
   body.append(opts);
 
   const notices = el("div", "notices");
   if (thin) {
     notices.insertAdjacentHTML("beforeend",
-      `<div class="notice warn">Coverage is ${scope.coverage.score}% — `
-      + `${esc(scope.coverage.band)}. Running this is unlikely to produce a cited answer.</div>`);
+      `<div class="notice warn">Coverage is ${refine.coverage.score}% — `
+      + `${esc(refine.coverage.band)}. Running this is unlikely to produce a cited answer.</div>`);
   }
 
   const foot = el("div", "row between wrap gap");
   foot.append(el("span", "muted small",
-    scope.complexity ? `${scope.complexity.level} · ~${scope.complexity.docs_to_read} documents to read` : ""));
+    refine.complexity ? `${refine.complexity.level} · ~${refine.complexity.docs_to_read} documents to read` : ""));
   const right = el("div", "row gap");
   const original = el("button", "ghost", "Run original instead");
   original.type = "button";
   original.id = "briefOriginal";
-  original.onclick = () => runFromBrief(scope.original);
-  if (!scope.final) {
+  original.onclick = () => runFromBrief(refine.original);
+  if (!refine.final) {
     const more = el("button", "ghost", "Refine further");
     more.type = "button";
     more.id = "briefMore";
-    more.onclick = () => scopeStream({ question: scope.original, scope_id: scope.id, answers: [] });
+    more.onclick = () => refineStream({ question: refine.original, refine_id: refine.id, answers: [] });
     right.append(more);
   }
   const go = el("button", "primary", thin ? "Run anyway" : "Run with this");
@@ -1877,28 +2115,28 @@ function renderBrief() {
   card.addEventListener("submit", (e) => { e.preventDefault(); runFromBrief(); });
   $("thread").append(card);
   $("thread").scrollTop = $("thread").scrollHeight;
-  scope.briefCard = card;
-  setScopePhase("brief");
+  refine.briefCard = card;
+  setRefinePhase("brief");
   ta.focus();
   ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
 function runFromBrief(originalOnly) {
   const edited = ($("briefText")?.value || "").trim();
-  const question = originalOnly || edited || scope.original;
+  const question = originalOnly || edited || refine.original;
   // The tagged envelope tells the analyst this is scope, not a claim to cite.
   // Running the original skips it entirely — there is no brief to send.
   const sent = originalOnly
     ? question
-    : renderBriefText({ ...scope.brief, question });
-  for (const c of [scope.card, scope.briefCard]) {
+    : renderBriefText({ ...refine.brief, question });
+  for (const c of [refine.card, refine.briefCard]) {
     for (const i of c?.querySelectorAll("input, button, select, textarea") || []) i.disabled = true;
   }
   runAsk(sent, {
     echo: question,
     model: $("briefModel")?.value || null,
     effort: $("briefEffort")?.value || null,
-    scopeId: scope.id,
+    refineId: refine.id,
   });
 }
 
@@ -1911,8 +2149,8 @@ function renderBriefText(brief) {
     lines.push(title);
     for (const i of items) lines.push("  - " + fmt(i));
   };
-  block("IN SCOPE:", brief.scope, (s) => s);
-  block("OUT OF SCOPE:", brief.out_of_scope, (s) => s);
+  block("IN SCOPE:", brief.covers, (s) => s);
+  block("OUT OF SCOPE:", brief.excludes, (s) => s);
   block("START FROM:", brief.evidence_plan, (e) => `${e.doc_id} ${e.rel_path} — ${e.why}`);
   if (brief.deliverable) lines.push(`DELIVERABLE: ${brief.deliverable}`);
   block("ASSUMPTIONS (recorded during scoping, unverified):", brief.assumptions, (a) => a);
@@ -1920,53 +2158,53 @@ function renderBriefText(brief) {
   return lines.join("\n");
 }
 
-function storedScopeId() {
-  try { return sessionStorage.getItem("dd-scope-id"); } catch { return null; }
+function storedRefineId() {
+  try { return sessionStorage.getItem("dd-refine-id"); } catch { return null; }
 }
 
-async function restoreScope() {
-  const id = storedScopeId();
-  if (!id || scope.id || state.running) return;
+async function restoreRefine() {
+  const id = storedRefineId();
+  if (!id || refine.id || state.running) return;
   let s = null;
-  try { s = await api(`/api/scope/${encodeURIComponent(id)}`); } catch { /* gone */ }
+  try { s = await api(`/api/refine/${encodeURIComponent(id)}`); } catch { /* gone */ }
   // Fetching the session is a round trip, and the user can start asking during
   // it. Landing a restored round on top of a live one would replace it with a
   // stale session, so anything that started while we were away wins — including
   // the failure path, which must not clear an id that is no longer the one we
   // went to fetch.
-  if (scope.id || state.running || storedScopeId() !== id) return;
-  if (!s) return resetScope();
-  scope.id = s.scope_id;
-  scope.original = s.question;
-  scope.round = s.round;
-  scope.final = !!s.final;
-  scope.brief = s.brief;
-  scope.proposal = s.proposal;
-  scope.complexity = s.complexity;
-  scope.coverage = s.coverage;
-  scope.questions = s.questions || [];
+  if (refine.id || state.running || storedRefineId() !== id) return;
+  if (!s) return resetRefine();
+  refine.id = s.refine_id;
+  refine.original = s.question;
+  refine.round = s.round;
+  refine.final = !!s.final;
+  refine.brief = s.brief;
+  refine.proposal = s.proposal;
+  refine.complexity = s.complexity;
+  refine.coverage = s.coverage;
+  refine.questions = s.questions || [];
 
   const thread = $("thread");
   if (qs(".empty", thread)) thread.innerHTML = "";
   thread.append(msgBlock("you", esc(s.question).replace(/\n/g, "<br>"), "user"));
 
   const card = document.createElement("form");
-  card.className = "msg scope";
-  card.id = "scopeCard";
-  const head = el("div", "who", `scoping · round ${s.round} · restored`);
+  card.className = "msg refine";
+  card.id = "refineCard";
+  const head = el("div", "who", `refining · round ${s.round} · restored`);
   if (s.coverage) head.append(coverageEl(s.coverage, false));
   const qbox = el("div", "body");
   card.append(head, qbox, el("div", "notices"));
-  card.addEventListener("submit", (e) => { e.preventDefault(); submitScopeRound(); });
-  card.addEventListener("keydown", onScopeKeydown);
+  card.addEventListener("submit", (e) => { e.preventDefault(); submitRefineRound(); });
+  card.addEventListener("keydown", onRefineKeydown);
   thread.append(card);
-  scope.card = card;
-  scope.questions.forEach((q, i) => qbox.append(questionFieldset(q, i)));
+  refine.card = card;
+  refine.questions.forEach((q, i) => qbox.append(questionFieldset(q, i)));
 
-  if (scope.questions.length) {
-    card.append(scopeFooter());
-    updateScopeMeta();
-    setScopePhase("awaiting");
+  if (refine.questions.length) {
+    card.append(refineFooter());
+    updateRefineMeta();
+    setRefinePhase("awaiting");
   } else {
     renderBrief();
   }
@@ -1975,7 +2213,7 @@ async function restoreScope() {
 async function runAsk(question, opts = {}) {
   if (state.running) return;
   state.running = true;
-  setScopePhase("running");
+  setRefinePhase("running");
   const thread = $("thread");
   if (qs(".empty", thread)) thread.innerHTML = "";
   $("trace").innerHTML = "";
@@ -1995,6 +2233,16 @@ async function runAsk(question, opts = {}) {
   // wiped by the next token — which is the opposite of the point.
   const notices = el("div", "notices");
   assistant.append(notices);
+  // Stated on the answer itself, not only on the chip: scrolled back to weeks
+  // later, "not in the data room" has to carry what the room was at the time.
+  if (state.scope.length) {
+    const names = state.scope.map((p) => p.replace(/\/$/, "").split("/").pop());
+    assistant.insertBefore(
+      el("div", "scope-note muted small",
+         `Scoped to ${names.join(", ")} — documents elsewhere were not readable.`),
+      think,
+    );
+  }
   thread.append(assistant);
   thread.scrollTop = thread.scrollHeight;
 
@@ -2015,10 +2263,11 @@ async function runAsk(question, opts = {}) {
         verify: $("verifyToggle").checked,
         effort: opts.effort || null,
         model: opts.model || null,
-        scope_id: opts.scopeId || null,
+        scope: state.scope,
+        refine_id: opts.refineId || null,
       }),
     });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) throw new Error(await askError(res));
 
     const ctx = { notices, think, thinkBody, body };
     for await (const ev of sseStream(res)) {
@@ -2065,8 +2314,8 @@ async function runAsk(question, opts = {}) {
     clearInterval(tick);
     state.running = false;
     // One question, one scoping session: the next Ask starts a fresh one.
-    resetScope();
-    setScopePhase("idle");
+    resetRefine();
+    setRefinePhase("idle");
     refreshStatus();
   }
 }
@@ -2193,9 +2442,16 @@ async function loadQaLog() {
     for (const e of r.entries) {
       const bad = (e.verdicts || []).filter((v) => v.verdict === "unsupported" || v.verdict === "partial").length;
       const n = el("div", "qa-entry");
+      // The scope belongs on the log line: an answer that found nothing means
+      // something different depending on how much of the library it could open.
+      const scope = e.scope || [];
+      const scopeTag = scope.length
+        ? `<span class="tag" title="${esc(scope.join("\n"))}">scoped: ${
+            esc(scope.map((p) => p.replace(/\/$/, "").split("/").pop()).join(", ").slice(0, 60))}</span> · `
+        : "";
       n.innerHTML = `<div class="q">${esc(e.question.slice(0, 190))}</div>
         <div class="muted small">${new Date(e.created_at * 1000).toLocaleString()} ·
-        ${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
+        ${scopeTag}${(e.citations || []).length} citations · ${bad ? `<span class="tag flag">${bad} weak</span>` : "all checked citations held"} ·
         ${money(e.usage?.cost_usd)} · ${Number(e.duration_s || 0).toFixed(0)}s</div>`;
       const detail = el("div", "body hidden");
       detail.innerHTML = renderMarkdown(e.answer || "");
@@ -2217,7 +2473,7 @@ async function loadAdmin() {
 /* ── models ──────────────────────────────────────────────────────────── */
 const MODEL_ROLE_NOTES = {
   analyst: "answers the question",
-  scoper: "refines the question first — leave on the analyst's model unless you have a "
+  refiner: "sharpens the question first — leave on the analyst's model unless you have a "
     + "reason: it reuses the analyst's cached corpus map, and a different model has its "
     + "own cache to pay for",
   carder: "summarises every document during indexing",
@@ -2251,14 +2507,14 @@ function renderModels() {
     `corpus map ~${compact(map.approx_tokens || 0)} tokens · ${m.available.length} priced models`;
 
   $("modelRoles").innerHTML = "";
-  for (const role of ["analyst", "scoper", "carder", "verifier"]) {
+  for (const role of ["analyst", "refiner", "carder", "verifier"]) {
     const pinned = m.env_pinned?.[role];
     const wrap = el("div", "field");
     wrap.append(el("label", null, role));
     const sel = modelSelect(
       `model-${role}`,
-      role === "scoper" ? m.scoper_configured : m[role],
-      role === "scoper" ? { blankLabel: `same as the analyst (${m.analyst})` } : {},
+      role === "refiner" ? m.refiner_configured : m[role],
+      role === "refiner" ? { blankLabel: `same as the analyst (${m.analyst})` } : {},
     );
     sel.disabled = !!pinned;
     wrap.append(sel);
@@ -2267,12 +2523,12 @@ function renderModels() {
     $("modelRoles").append(wrap);
   }
 
-  for (const [id, value] of [["analystEffort", m.effort], ["scoperEffort", m.scoper_effort]]) {
+  for (const [id, value] of [["analystEffort", m.effort], ["refinerEffort", m.refiner_effort]]) {
     $(id).innerHTML = ["low", "medium", "high", "xhigh", "max"]
       .map((e) => `<option value="${e}"${e === value ? " selected" : ""}>${e}</option>`).join("");
   }
-  $("scopeRounds").innerHTML = [1, 2, 3, 4]
-    .map((n) => `<option value="${n}"${n === m.scope_max_rounds ? " selected" : ""}>${n}</option>`)
+  $("refineRounds").innerHTML = [1, 2, 3, 4]
+    .map((n) => `<option value="${n}"${n === m.refine_max_rounds ? " selected" : ""}>${n}</option>`)
     .join("");
 
   $("complexityModels").innerHTML = "";
@@ -2286,7 +2542,7 @@ function renderModels() {
 
 $("saveModelsBtn").onclick = async () => {
   const models = {};
-  for (const role of ["analyst", "scoper", "carder", "verifier"]) {
+  for (const role of ["analyst", "refiner", "carder", "verifier"]) {
     const sel = $(`model-${role}`);
     if (sel && !sel.disabled) models[role] = sel.value;
   }
@@ -2298,8 +2554,8 @@ $("saveModelsBtn").onclick = async () => {
       body: {
         models, complexity_models,
         analyst_effort: $("analystEffort").value,
-        scoper_effort: $("scoperEffort").value,
-        scope_max_rounds: Number($("scopeRounds").value),
+        refiner_effort: $("refinerEffort").value,
+        refine_max_rounds: Number($("refineRounds").value),
       },
     });
     $("modelsSaved").textContent = `saved at ${new Date().toLocaleTimeString()}`;
@@ -2839,8 +3095,15 @@ refreshStatus().then(() => {
   searchMounts.full = searchPanel("searchFullMount");
   searchMounts.corpus = searchPanel("searchCorpusMount", { compact: true });
   searchMounts.ask = searchPanel("searchAskMount", { compact: true });
-  return restoreScope();
+  return restoreRefine();
 });
+// A scope restored from the session has paths but no counts; the chip needs the
+// counts to say how much of the library the next question can actually see.
+if (state.scope.length) {
+  api("/api/corpus/folders")
+    .then((r) => { scopeFolders = r.folders || []; pruneScope(r.roots); renderScopeChip(); })
+    .catch(() => {});
+}
 loadDocs();
 loadArchives();
 loadConnections();

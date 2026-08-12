@@ -344,11 +344,11 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .cite:hover { filter: brightness(.95); text-decoration: underline; }
 
-/* scoping — a proposed answer is the same object as a suggested question, so it
+/* question refinement — a proposed answer is the same object as a suggested question, so it
    wears the same clothes; only the container geometry changes. Everything is
-   scoped under .options / .msg.scope / .msg.brief so the empty state's four
+   scoped under .options / .msg.refine / .msg.brief so the empty state's four
    canned suggestions do not reflow. */
-.msg.scope > .body, .msg.brief > .body {
+.msg.refine > .body, .msg.brief > .body {
   border-left: 2px solid var(--line-2); padding-left: 11px; white-space: normal;
 }
 .qgroup { border: 0; margin: 0 0 16px; padding: 0; min-width: 0; }
@@ -366,7 +366,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .options .suggestion .othertext { flex: 1 1 160px; padding: 3px 8px; font-size: 12px; }
 .tag.key { font-family: var(--mono); min-width: 18px; text-align: center; padding: 1px 4px; }
 .skip { font-size: 12px; }
-.scopefoot { margin-top: 12px; }
+.refinefoot { margin-top: 12px; }
 /* Coverage: a number, a band and a bar — never colour alone. */
 .coverage {
   display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap;
@@ -550,3 +550,21 @@ body.centered { display: grid; place-items: center; min-height: 100vh; padding: 
 .usage-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
 .audit-table td { font-size: 12px; }
 .audit-table tbody tr { cursor: default; }
+
+/* question scope: the folder picker and its chip */
+button.ghost.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.scope-tree {
+  max-height: 46vh; overflow-y: auto; margin: 10px 0 12px; padding: 6px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+}
+.scope-root {
+  font-family: var(--mono); font-size: 11px; padding: 6px 4px 2px;
+  overflow-wrap: anywhere;
+}
+.scope-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
+  cursor: pointer; font-size: 13px;
+}
+.scope-row:hover { background: var(--accent-soft); }
+.scope-row .n { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.scope-note { margin: 0 0 6px; }

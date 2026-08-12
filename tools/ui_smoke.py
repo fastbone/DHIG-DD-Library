@@ -36,7 +36,7 @@ os.environ.setdefault("DD_SECRET_KEY", "ui-smoke-secret-not-for-production")
 os.environ["DD_ADMIN_USER"] = SMOKE_USER = "smoke-admin"
 os.environ["DD_ADMIN_PASSWORD"] = SMOKE_PASSWORD = "ui-smoke-password"
 
-from app import agent, auth, db, docgen, ingest, manifest, scope, search  # noqa: E402
+from app import agent, auth, db, docgen, ingest, manifest, refine, search  # noqa: E402
 
 PORT = int(os.environ.get("DD_SMOKE_PORT", "8099"))
 
@@ -83,21 +83,21 @@ async def prepare_index() -> None:
         )
     manifest.invalidate_manifest()
 
-    # A finished scoping session on disk, so GET /api/scope/{id} answers for
+    # A finished refinement session on disk, so GET /api/refine/{id} answers for
     # real: the restore path is the one place the browser reads a session back
     # rather than being handed it on the stream.
     db.execute(
-        "INSERT OR REPLACE INTO scope_rounds(id, scope_id, round, question, answers, payload,"
-        " transcript, ready, coverage, usage, model, effort, actor, created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("smokeround01", "smokescope01", 1, "What was FY2024 revenue?", "[]",
+        "INSERT OR REPLACE INTO refine_rounds(id, refine_id, round, question, scope, answers,"
+        " payload, transcript, ready, coverage, usage, model, effort, actor, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("smokeround01", "smokerefine01", 1, "What was FY2024 revenue?", "[]", "[]",
          json.dumps({
              "ready": True, "assessment": "Restored from the server.",
              "coverage": {"score": 84, "band": "well covered", "reasons": [], "missing": [],
                           "answer_shape": "a cited figure", "probe": {"basis": "restored"}},
              "questions": [],
-             "brief": {"question": "Restored: summarise FY2024 revenue.", "scope": [],
-                       "out_of_scope": [], "evidence_plan": [], "deliverable": "prose",
+             "brief": {"question": "Restored: summarise FY2024 revenue.", "covers": [],
+                       "excludes": [], "evidence_plan": [], "deliverable": "prose",
                        "assumptions": []},
              "complexity": {"level": "moderate", "drivers": [], "docs_to_read": 4,
                             "needs_computation": False, "recommended_effort": "high"},
@@ -132,8 +132,8 @@ def pick_citations() -> list[str]:
     return seen[:2] or ["deadbeefdeadbeef:p1", "deadbeefdeadbeef:p2"]
 
 
-def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None, **_kw):
-    """A scripted scoping session: one round of questions, then a brief.
+def canned_refine(question: str, cits: list[str], *, refine_id=None, answers=None, **_kw):
+    """A scripted refinement session: one round of questions, then a brief.
 
     Mirrors app/scope.py's event order exactly — coverage lands before the
     questions, because a user looking at a thin corpus should be able to walk
@@ -145,13 +145,13 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
     thin = "pension" in question.lower()
 
     async def gen():
-        sid = scope_id or "smokescope01"
-        yield {"type": "scope_probe", "scope_id": sid, "round": 1 if not scope_id else 2,
+        sid = refine_id or "smokerefine01"
+        yield {"type": "refine_probe", "refine_id": sid, "round": 1 if not refine_id else 2,
                "score": 18 if thin else 41, "band": "thin — the data room probably cannot answer this"
                if thin else "partial — expect gaps", "basis": "9 keyword hits across 3 documents",
                "provisional": True}
         yield {"type": "status", "message": "corpus map: 8 documents, ~224 tokens (full mode)",
-               "scope_id": sid}
+               "refine_id": sid}
         for chunk in ["Looking for what the data room actually holds on this. ",
                       "Two narrow searches should be enough to ask good questions."]:
             yield {"type": "thinking_delta", "text": chunk}
@@ -164,10 +164,10 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
         yield {"type": "usage", "cost_usd": 0.006, "cumulative": {"cost_usd": 0.006},
                "cache_read": 224, "cache_write": 0, "input": 900, "output": 210}
 
-        if scope_id:  # the answered round: converge
+        if refine_id:  # the answered round: converge
             # A thin corpus stays thin however well the question is scoped —
             # sharpening the wording cannot conjure documents that are not there.
-            yield {"type": "scope_coverage", "scope_id": sid, "round": 2, "provisional": False,
+            yield {"type": "refine_coverage", "refine_id": sid, "round": 2, "provisional": False,
                    "score": 15 if thin else 84,
                    "band": "thin — the data room probably cannot answer this" if thin
                    else "well covered",
@@ -178,23 +178,23 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                    "answer_shape": "not answerable from this data room" if thin
                    else "a cited figure",
                    "probe": {"basis": "22 keyword hits across 6 documents"}}
-            yield {"type": "scope_round", "scope_id": sid, "round": 2, "final": True, "ready": True,
+            yield {"type": "refine_round", "refine_id": sid, "round": 2, "final": True, "ready": True,
                    "assessment": f"The audited accounts carry the figures [[{a}]]. Nothing is open.",
                    "gaps": [], "n_questions": 0}
-            yield {"type": "scope_brief", "scope_id": sid, "round": 2,
-                   "brief": SCOPE_BRIEF(a, doc_a),
+            yield {"type": "refine_brief", "refine_id": sid, "round": 2,
+                   "brief": REFINE_BRIEF(a, doc_a),
                    "brief_text": "<research_brief>…</research_brief>",
                    "complexity": {"level": "moderate", "drivers": ["two sources to reconcile"],
                                   "docs_to_read": 5, "needs_computation": True,
                                   "recommended_effort": "high"},
                    "proposal": {"model": "claude-sonnet-5", "effort": "high",
                                 "note": "moderate question", "estimated_cost_usd": 0.14}}
-            yield {"type": "scope_done", "scope_id": sid, "round": 2, "ready": True,
+            yield {"type": "refine_done", "refine_id": sid, "round": 2, "ready": True,
                    "needs_answers": False, "usage": {"cost_usd": 0.011}, "duration_s": 3.1,
                    "budget": {}}
             return
 
-        yield {"type": "scope_coverage", "scope_id": sid, "round": 1, "provisional": False,
+        yield {"type": "refine_coverage", "refine_id": sid, "round": 1, "provisional": False,
                "score": 15 if thin else 46,
                "band": "thin — the data room probably cannot answer this" if thin
                else "partial — expect gaps",
@@ -204,11 +204,11 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                             "searched": "audit report 2025, FY25 auditor"}],
                "answer_shape": "a directional read, not a number",
                "probe": {"basis": "9 keyword hits across 3 documents"}}
-        yield {"type": "scope_round", "scope_id": sid, "round": 1, "final": False, "ready": False,
+        yield {"type": "refine_round", "refine_id": sid, "round": 1, "final": False, "ready": False,
                "assessment": f"The data room has audited accounts through FY2024 [[{a}]] and a "
                              f"management deck that restates EBITDA [[{b}]].",
                "gaps": ["No FY2025 audit"], "n_questions": 3}
-        yield {"type": "scope_question", "scope_id": sid, "id": "q1",
+        yield {"type": "refine_question", "refine_id": sid, "id": "q1",
                "question": "Which period should this cover?",
                "why": f"The audited accounts stop at FY2024 [[{a}]]; the deck carries a forecast [[{b}]].",
                "kind": "single", "default": "FY2022–FY2024, audited only",
@@ -218,7 +218,7 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                    {"label": "Include the FY2025–27 forecast", "detail": "adds the board deck",
                     "evidence": [b]},
                ]}
-        yield {"type": "scope_question", "scope_id": sid, "id": "q2",
+        yield {"type": "refine_question", "refine_id": sid, "id": "q2",
                "question": "Which workstreams matter here?",
                "why": "Answering across all of them costs more and says less.",
                "kind": "multi", "default": "financial",
@@ -227,7 +227,7 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                    {"label": "commercial", "detail": "2 documents", "evidence": [b]},
                    {"label": "legal", "detail": "1 document", "evidence": []},
                ]}
-        yield {"type": "scope_question", "scope_id": sid, "id": "q3",
+        yield {"type": "refine_question", "refine_id": sid, "id": "q3",
                "question": "What should the output be?",
                "why": "A memo and a chat answer are different amounts of work.",
                "kind": "single", "default": "an answer in chat",
@@ -236,8 +236,8 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                    {"label": "a Word memo", "detail": "built with create_deliverable",
                     "evidence": []},
                ]}
-        yield {"type": "scope_brief", "scope_id": sid, "round": 1,
-               "brief": SCOPE_BRIEF(a, doc_a),
+        yield {"type": "refine_brief", "refine_id": sid, "round": 1,
+               "brief": REFINE_BRIEF(a, doc_a),
                "brief_text": "<research_brief>…</research_brief>",
                "complexity": {"level": "deep", "drivers": ["broad question"], "docs_to_read": 9,
                               "needs_computation": True, "recommended_effort": "high"},
@@ -246,19 +246,19 @@ def canned_scope(question: str, cits: list[str], *, scope_id=None, answers=None,
                             "note": "deep question, but coverage is thin — proposing a cheaper run"
                             if thin else "deep question",
                             "estimated_cost_usd": 0.31}}
-        yield {"type": "scope_done", "scope_id": sid, "round": 1, "ready": False,
+        yield {"type": "refine_done", "refine_id": sid, "round": 1, "ready": False,
                "needs_answers": True, "usage": {"cost_usd": 0.009}, "duration_s": 2.4,
                "budget": {}}
 
     return gen()
 
 
-def SCOPE_BRIEF(citation: str, doc_id: str) -> dict:
+def REFINE_BRIEF(citation: str, doc_id: str) -> dict:
     return {
         "question": "For FY2022–FY2024, summarise revenue and EBITDA from the audited accounts "
                     "and reconcile them against the management deck.",
-        "scope": [f"Audited figures only [[{citation}]]"],
-        "out_of_scope": ["The FY2025–27 forecast"],
+        "covers": [f"Audited figures only [[{citation}]]"],
+        "excludes": ["The FY2025–27 forecast"],
         "evidence_plan": [{"doc_id": doc_id, "rel_path": "financial/audited_accounts.pdf",
                            "why": "the only audited source"}],
         "deliverable": "prose",
@@ -347,12 +347,26 @@ async def main() -> int:
     cits = pick_citations()
     print("using citations:", cits)
 
-    # What the analyst was actually asked, so the brief-editing checks can prove
-    # the edited text is what ran rather than the model's original wording.
-    asked: list[str] = []
-    agent.ask = lambda question, **kw: (  # type: ignore[assignment]
-        asked.append(question), canned(question, cits))[1]
-    scope.run = lambda question, **kw: canned_scope(question, cits, **kw)  # type: ignore[assignment]
+    # Every call the route made, recorded where it lands. Two different claims
+    # rest on this: that the folder scope the chip shows is the one that was
+    # posted, and that the text the analyst ran is the brief as edited rather
+    # than the model's original wording. A UI that looks right while sending
+    # something else is the failure both are guarding against.
+    asked: list[dict] = []
+
+    def _ask(question, **kw):
+        asked.append({"question": question, **kw})
+        return canned(question, cits)
+
+    agent.ask = _ask  # type: ignore[assignment]
+
+    refined: list[dict] = []
+
+    def _refine(question, **kw):
+        refined.append({"question": question, **kw})
+        return canned_refine(question, cits, **kw)
+
+    refine.run = _refine  # type: ignore[assignment]
 
     import uvicorn
 
@@ -376,8 +390,19 @@ async def main() -> int:
         )
         page = await browser.new_page(viewport={"width": 1500, "height": 1000})
         page.on("pageerror", lambda e: problems.append(f"pageerror: {e}"))
-        page.on("console", lambda m: problems.append(f"console.error: {m.text}")
-                if m.type == "error" else None)
+        # Some checks below refuse requests on purpose, and the browser logs every
+        # non-2xx as a console error. Those are the subject of the check, not a
+        # defect, so they are muted for exactly as long as they are expected.
+        expect_http = {"on": False}
+
+        def on_console(m):
+            if m.type != "error":
+                return
+            if expect_http["on"] and "Failed to load resource" in m.text:
+                return
+            problems.append(f"console.error: {m.text}")
+
+        page.on("console", on_console)
 
         # Sign in through the real login form.
         await page.goto(f"http://127.0.0.1:{PORT}/", wait_until="networkidle")
@@ -393,11 +418,11 @@ async def main() -> int:
         await page.click("#askBtn")
 
         # --- scoping: questions, then the brief, then the run ----------------
-        scope_checks: dict[str, bool] = {}
+        refine_checks: dict[str, bool] = {}
         try:
-            await page.wait_for_selector("#scopeCard .qgroup:nth-of-type(3)", timeout=20_000)
+            await page.wait_for_selector("#refineCard .qgroup:nth-of-type(3)", timeout=20_000)
         except Exception as exc:  # noqa: BLE001
-            await page.screenshot(path="/tmp/ask-scope-timeout.png", full_page=True)
+            await page.screenshot(path="/tmp/ask-refine-timeout.png", full_page=True)
             print("TIMED OUT waiting for the clarifying questions:", exc)
             print("  thread  :", (await page.inner_text("#thread"))[:400])
             print("  console :", problems or "none")
@@ -405,59 +430,59 @@ async def main() -> int:
             return 1
         await page.wait_for_timeout(300)
 
-        scope_checks["scope: a round of questions is asked before anything expensive runs"] = (
-            await page.locator("#scopeCard .qgroup").count() == 3)
-        scope_checks["scope: the questions are grounded in real documents"] = (
-            await page.locator("#scopeCard .qwhy .cite").count() >= 2)
-        scope_checks["scope: coverage is shown as a number and a band, not a colour"] = (
-            "%" in await page.inner_text("#scopeCard .coverage")
-            and "expect gaps" in await page.inner_text("#scopeCard .coverage"))
-        scope_checks["scope: what the data room lacks is listed"] = (
-            "audited FY2025 accounts" in await page.inner_text("#scopeCard"))
-        scope_checks["scope: the live round is not busy once the questions land"] = (
-            await page.get_attribute("#scopeCard .body", "aria-busy") == "false")
-        await page.screenshot(path="/tmp/ask-scope.png", full_page=True)
+        refine_checks["refine: a round of questions is asked before anything expensive runs"] = (
+            await page.locator("#refineCard .qgroup").count() == 3)
+        refine_checks["refine: the questions are grounded in real documents"] = (
+            await page.locator("#refineCard .qwhy .cite").count() >= 2)
+        refine_checks["refine: coverage is shown as a number and a band, not a colour"] = (
+            "%" in await page.inner_text("#refineCard .coverage")
+            and "expect gaps" in await page.inner_text("#refineCard .coverage"))
+        refine_checks["refine: what the data room lacks is listed"] = (
+            "audited FY2025 accounts" in await page.inner_text("#refineCard"))
+        refine_checks["refine: the live round is not busy once the questions land"] = (
+            await page.get_attribute("#refineCard .body", "aria-busy") == "false")
+        await page.screenshot(path="/tmp/ask-refine.png", full_page=True)
 
         # a citation inside a clarifying question opens the reader
-        await page.locator("#scopeCard .qwhy .cite").first.click()
+        await page.locator("#refineCard .qwhy .cite").first.click()
         await page.wait_for_timeout(700)
-        scope_checks["scope: a citation in a question opens the reader"] = (
+        refine_checks["refine: a citation in a question opens the reader"] = (
             await page.locator("#drawer.open").count() == 1)
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(300)
 
         # number keys pick options; multi-select takes more than one
-        await page.locator('#scopeCard .qgroup[data-qid="q1"] input').first.focus()
+        await page.locator('#refineCard .qgroup[data-qid="q1"] input').first.focus()
         await page.keyboard.press("2")
-        scope_checks["scope: a number key picks an option"] = (
-            await page.locator('#scopeCard .qgroup[data-qid="q1"] .suggestion.on').count() == 1)
-        await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion').nth(0).click()
-        await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion').nth(1).click()
-        scope_checks["scope: multi-select accepts more than one answer"] = (
-            await page.locator('#scopeCard .qgroup[data-qid="q2"] .suggestion.on').count() == 2)
-        await page.fill('#scopeCard .qgroup[data-qid="q3"] .othertext', "a findings table")
-        scope_checks["scope: other accepts free text"] = (
-            await page.locator('#scopeCard .qgroup[data-qid="q3"] .suggestion.other.on').count() == 1)
-        scope_checks["scope: progress is counted"] = (
-            "3 of 3 answered" in await page.inner_text("#scopeCard .scopemeta"))
+        refine_checks["refine: a number key picks an option"] = (
+            await page.locator('#refineCard .qgroup[data-qid="q1"] .suggestion.on').count() == 1)
+        await page.locator('#refineCard .qgroup[data-qid="q2"] .suggestion').nth(0).click()
+        await page.locator('#refineCard .qgroup[data-qid="q2"] .suggestion').nth(1).click()
+        refine_checks["refine: multi-select accepts more than one answer"] = (
+            await page.locator('#refineCard .qgroup[data-qid="q2"] .suggestion.on').count() == 2)
+        await page.fill('#refineCard .qgroup[data-qid="q3"] .othertext', "a findings table")
+        refine_checks["refine: other accepts free text"] = (
+            await page.locator('#refineCard .qgroup[data-qid="q3"] .suggestion.other.on').count() == 1)
+        refine_checks["refine: progress is counted"] = (
+            "3 of 3 answered" in await page.inner_text("#refineCard .refinemeta"))
 
         # The draft is runnable at any point, so a brief card can already be on
         # screen when the next round starts. It has to go: its Run button would
         # send the old textarea wrapped in the new round's scope and assumptions.
-        await page.click("#scopeDraft")
+        await page.click("#refineDraft")
         await page.wait_for_selector("#briefCard", timeout=20_000)
-        scope_checks["scope: the draft is runnable before the questions are answered"] = (
+        refine_checks["refine: the draft is runnable before the questions are answered"] = (
             await page.locator("#thread .msg.brief").count() == 1)
 
-        await page.click("#scopeSubmit")
+        await page.click("#refineSubmit")
         # Asserted while the next round is still in flight, which is the whole
         # window: renderBrief drops the old card too, so checking after the new
         # brief lands would pass whether or not the round cleared it. The round's
         # card is appended synchronously, so two of them means we are inside it.
         await page.wait_for_function(
-            "() => document.querySelectorAll('#thread .msg.scope').length === 2",
+            "() => document.querySelectorAll('#thread .msg.refine').length === 2",
             timeout=20_000)
-        scope_checks["brief: a new round clears the stale brief before it lands"] = (
+        refine_checks["brief: a new round clears the stale brief before it lands"] = (
             await page.locator("#thread .msg.brief").count() == 0)
 
         try:
@@ -469,32 +494,32 @@ async def main() -> int:
             return 1
         await page.wait_for_timeout(300)
 
-        scope_checks["brief: the rewritten question is editable"] = (
+        refine_checks["brief: the rewritten question is editable"] = (
             len(await page.input_value("#briefText")) > 40
             and await page.get_attribute("#briefText", "readonly") is None)
-        scope_checks["brief: exactly one brief is live once the round settles"] = (
+        refine_checks["brief: exactly one brief is live once the round settles"] = (
             await page.locator("#thread .msg.brief").count() == 1)
         # Three separate promises: what it will cover, what it will leave out,
         # and what was taken on faith. Folding scope into "Assumed" told the
         # reader the run had guessed at something it had been told.
-        scope_checks["brief: scope, exclusions and assumptions are listed apart"] = (
-            await page.locator("#briefScope li").count() >= 1
-            and await page.locator("#briefExcluded li").count() >= 1
+        refine_checks["brief: scope, exclusions and assumptions are listed apart"] = (
+            await page.locator("#briefCovers li").count() >= 1
+            and await page.locator("#briefExcludes li").count() >= 1
             and await page.locator("#briefAssumed li").count() >= 1
             and "pre-restructuring" in await page.inner_text("#briefAssumed")
-            and "pre-restructuring" not in await page.inner_text("#briefScope"))
-        scope_checks["brief: the documents it starts from are clickable"] = (
+            and "pre-restructuring" not in await page.inner_text("#briefCovers"))
+        refine_checks["brief: the documents it starts from are clickable"] = (
             await page.locator("#briefFocus .cite").count() >= 1)
-        scope_checks["brief: a model and an effort are proposed"] = (
+        refine_checks["brief: a model and an effort are proposed"] = (
             await page.input_value("#briefModel") == "claude-sonnet-5"
             and await page.input_value("#briefEffort") == "high")
-        scope_checks["brief: coverage is recomputed for the narrowed question"] = (
-            "84%" in await page.inner_text("#scopeCard .coverage"))
+        refine_checks["brief: coverage is recomputed for the narrowed question"] = (
+            "84%" in await page.inner_text("#refineCard .coverage"))
         await page.screenshot(path="/tmp/ask-brief.png", full_page=True)
 
         edited = "EDITED: reconcile FY2024 revenue between the audited accounts and the deck."
         await page.fill("#briefText", edited)
-        scope_checks["brief: an edit is flagged as such"] = (
+        refine_checks["brief: an edit is flagged as such"] = (
             await page.locator("#briefEditedNote:not(.hidden)").count() == 1)
         await page.click("#briefRun")
 
@@ -515,12 +540,12 @@ async def main() -> int:
         await page.wait_for_timeout(600)
 
         checks = {
-            **scope_checks,
+            **refine_checks,
             "brief: the run uses the edited text, not the model's wording":
-                bool(asked) and edited in asked[-1],
+                bool(asked) and edited in asked[-1]["question"],
             "brief: the analyst is handed the brief as scope, not as a claim to cite":
-                bool(asked) and asked[-1].startswith("<research_brief>"),
-            "scope: the scoping dialogue never enters the analyst's history":
+                bool(asked) and asked[-1]["question"].startswith("<research_brief>"),
+            "refine: the refinement dialogue never enters the analyst's history":
                 await page.evaluate(
                     "() => state.history.length === 2 "
                     "&& !JSON.stringify(state.history).includes('Which period')"),
@@ -531,7 +556,7 @@ async def main() -> int:
                 await page.locator("#adminTabBtn:not(.hidden)").count() == 1,
             "answer rendered": await page.locator(".msg.assistant .body table").count() == 1,
             "citation chips": await page.locator(".msg.assistant .cite").count() >= 3,
-            # Scoped to the answer: the scoping card has a reasoning panel too.
+            # Scoped to the answer: the refinement card has a reasoning panel too.
             "thinking shown":
                 "Checking the corpus map" in await page.inner_text(".msg.assistant .think"),
             "trace ok step": await page.locator(".tstep.ok").count() >= 2,
@@ -567,11 +592,11 @@ async def main() -> int:
         await page.click("#newThread")
         await page.fill("#question", "What is the pension scheme's funding ratio?")
         await page.click("#askBtn")
-        await page.wait_for_selector("#scopeCard .qgroup", timeout=20_000)
+        await page.wait_for_selector("#refineCard .qgroup", timeout=20_000)
         await page.wait_for_timeout(400)
         checks["thin coverage is called out rather than quietly run"] = (
-            await page.locator("#scopeCard .notices .notice.warn").count() == 1)
-        await page.click("#scopeSkipAll")
+            await page.locator("#refineCard .notices .notice.warn").count() == 1)
+        await page.click("#refineSkipAll")
         await page.wait_for_selector("#briefCard", timeout=20_000)
         await page.wait_for_timeout(300)
         checks["skipping every question still produces a runnable brief"] = (
@@ -584,24 +609,24 @@ async def main() -> int:
             "() => document.getElementById('runMeta').textContent.includes('done in')",
             timeout=30_000)
         checks["run original instead sends the question as typed"] = (
-            asked[-1] == "What is the pension scheme's funding ratio?")
+            asked[-1]["question"] == "What is the pension scheme's funding ratio?")
 
         await page.click("#newThread")
-        checks["new thread clears the scoping session"] = (
-            await page.locator("#scopeCard").count() == 0
-            and await page.evaluate("() => sessionStorage.getItem('dd-scope-id') === null"))
+        checks["new thread clears the refinement session"] = (
+            await page.locator("#refineCard").count() == 0
+            and await page.evaluate("() => sessionStorage.getItem('dd-refine-id') === null"))
 
         # A stored session is read back from the server, not from the browser —
         # the questions and the brief quote a confidential data room, so the tab
         # holds only the id.
-        checks["a stored scoping session restores from the server"] = (
+        checks["a stored refinement session restores from the server"] = (
             await page.evaluate(
                 """async () => {
-                  sessionStorage.setItem('dd-scope-id', 'smokescope01');
-                  await restoreScope();
+                  sessionStorage.setItem('dd-refine-id', 'smokerefine01');
+                  await restoreRefine();
                   const ok = !!document.getElementById('briefCard')
                     && document.getElementById('briefText').value.startsWith('Restored:');
-                  scope.id = ''; sessionStorage.removeItem('dd-scope-id');
+                  refine.id = ''; sessionStorage.removeItem('dd-refine-id');
                   return ok;
                 }"""))
         await page.click("#newThread")
@@ -613,16 +638,16 @@ async def main() -> int:
         checks["a restore in flight loses to a question started meanwhile"] = (
             await page.evaluate(
                 """async () => {
-                  sessionStorage.setItem('dd-scope-id', 'smokescope01');
+                  sessionStorage.setItem('dd-refine-id', 'smokerefine01');
                   const before = document.querySelectorAll('#thread .msg.brief').length;
-                  const pending = restoreScope();
+                  const pending = restoreRefine();
                   state.running = true;          // the user hit Ask mid-flight
                   await pending;
                   state.running = false;
                   const after = document.querySelectorAll('#thread .msg.brief').length;
-                  const kept = sessionStorage.getItem('dd-scope-id');
-                  sessionStorage.removeItem('dd-scope-id');
-                  return after === before && kept === 'smokescope01';
+                  const kept = sessionStorage.getItem('dd-refine-id');
+                  sessionStorage.removeItem('dd-refine-id');
+                  return after === before && kept === 'smokerefine01';
                 }"""))
         await page.click("#newThread")
 
@@ -1231,6 +1256,254 @@ async def main() -> int:
         )
         await page.screenshot(path="/tmp/search-ask-mount.png", full_page=True)
 
+        # ── scoping a question to folders ─────────────────────────────────
+        checks["scope: the first question was asked against the whole corpus"] = (
+            bool(asked) and asked[0].get("scope") == []
+        )
+        await page.click('button[data-tab="ask"]')
+        checks["scope: the chip starts at the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(700)
+        rows = page.locator("#scopeTree .scope-row")
+        checks["scope: the chip opens a tree of folders that hold documents"] = (
+            await page.locator("#scopeModal.open").count() == 1 and await rows.count() >= 2
+        )
+        # The estimate is the reason to scope at all — the map is the standing
+        # per-turn cost, so its size has to be visible at the moment of choosing.
+        whole_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: the unscoped estimate states the map size and its cost per turn"] = (
+            "whole corpus" in whole_estimate and "tokens" in whole_estimate
+            and "per turn" in whole_estimate
+        )
+
+        # Pick the leaf folders, not the root: a scope that covers everything is
+        # indistinguishable from no scope and would prove nothing.
+        leaves = await page.evaluate(
+            """() => [...document.querySelectorAll('#scopeTree .scope-row')]
+                 .map((r, i) => ({i, depth: parseInt(r.style.paddingLeft) || 0,
+                                  path: r.querySelector('input').value}))
+                 .filter((r) => r.depth > 0).slice(0, 2)"""
+        )
+        for leaf in leaves:
+            await rows.nth(leaf["i"]).locator("input").check()
+        await page.wait_for_timeout(900)
+        scoped_estimate = await page.inner_text("#scopeEstimate")
+        checks["scope: ticking folders re-estimates against the selection"] = (
+            len(leaves) == 2 and " of " in scoped_estimate
+            and scoped_estimate != whole_estimate
+        )
+        await page.screenshot(path="/tmp/ask-scope.png", full_page=True)
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(300)
+        chip = await page.inner_text("#scopeChip")
+        checks["scope: the chip reports the selection and its document count"] = (
+            "2 folders" in chip and "docs" in chip
+            and await page.locator("#scopeModal.open").count() == 0
+        )
+
+        # Every question is refined before it is answered, so the folder scope has
+        # to survive that hop: it is chosen on the composer, carried through the
+        # refinement round, and posted with the run the brief produces.
+        await page.fill("#question", "Is there anything about payroll in here?")
+        await page.click("#askBtn")
+        await page.wait_for_selector("#refineCard .qgroup", timeout=20_000)
+        checks["scope: the refinement round is told which folders were chosen"] = (
+            bool(refined) and refined[-1].get("scope") == [leaf["path"] for leaf in leaves]
+        )
+        await page.click("#refineSkipAll")
+        await page.wait_for_selector("#briefCard", timeout=20_000)
+        await page.click("#briefRun")
+        await page.wait_for_function(
+            "() => document.getElementById('runMeta').textContent.includes('done in')",
+            timeout=30_000,
+        )
+        await page.wait_for_timeout(400)
+        checks["scope: a scoped question posts the folder prefixes"] = (
+            len(asked) >= 2
+            and asked[-1].get("scope") == [leaf["path"] for leaf in leaves]
+        )
+        # Scrolled back to weeks later, "not in the data room" has to carry what
+        # the room was at the time.
+        checks["scope: the answer says what it was allowed to see"] = (
+            "Scoped to" in await page.locator(".msg.assistant").last.inner_text()
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(600)
+        checks["scope: reopening the tree keeps the selection ticked"] = (
+            await page.locator("#scopeTree input:checked").count() == 2
+        )
+
+        # The estimate's replies race the same way the search box's do: ticking a
+        # third folder while the two-folder estimate is in flight must not leave
+        # the price of two under a selection of three.
+        # Only the first estimate is stalled; the one that follows it is answered
+        # live, so the fake reply necessarily lands second.
+        stalled = {"used": False}
+
+        async def stall_estimate(route):
+            if "scope=" in route.request.url and not stalled["used"]:
+                stalled["used"] = True
+                await asyncio.sleep(1.5)
+                await route.fulfill(
+                    status=200, content_type="application/json",
+                    body=json.dumps({"mode": "full", "chars": 1, "approx_tokens": 7777,
+                                     "n_indexed": 7777, "n_indexed_total": 7777,
+                                     "n_unindexed": 0, "scope": [], "rollup": {},
+                                     "cost_per_turn_usd": 0.0}),
+                )
+            else:
+                await route.continue_()
+
+        await page.route("**/api/manifest**", stall_estimate)
+        # Pinned by value, not by ":not(:checked)": locators re-resolve, and after
+        # the tick that selector points at a different box, so the uncheck would
+        # silently land on the wrong one — as a no-op, firing no second request.
+        spare = await page.locator(
+            "#scopeTree .scope-row input:not(:checked)").first.get_attribute("value")
+        third = page.locator(f'#scopeTree input[value="{spare}"]')
+        await third.check()                        # stalled request in flight
+        await page.wait_for_timeout(500)
+        await third.uncheck()                      # newer request, answered live
+        await page.wait_for_timeout(2000)
+        checks["scope: a stale estimate cannot overwrite a newer one"] = (
+            stalled["used"]
+            and await page.locator("#scopeTree input:checked").count() == 2
+            and "7,777" not in await page.inner_text("#scopeEstimate")
+        )
+        await page.unroute("**/api/manifest**", stall_estimate)
+
+        await page.click("#scopeClear")
+        await page.click("#scopeApply")
+        await page.wait_for_timeout(200)
+        checks["scope: clearing returns to the whole corpus"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+        )
+
+        # A saved scope outlives the corpus it names — delete an extracted folder
+        # or re-point the app and the server rejects those prefixes, which without
+        # a prune leaves *every* question failing on a chip nobody suspects.
+        await page.evaluate(
+            """() => { setScope(["/nowhere/at/all", "/also/gone"]); }"""
+        )
+        checks["scope: a stale saved scope is restored before it is checked"] = (
+            "2 folders" in await page.inner_text("#scopeChip")
+        )
+        await page.click("#scopeChip")
+        await page.wait_for_timeout(800)
+        checks["scope: folders that no longer exist are dropped from a saved scope"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "no longer exist" in await page.inner_text("#toast")
+        )
+        await page.click("#scopeClose")
+        await page.wait_for_timeout(200)
+
+        # The corpus can also change between choosing a scope and asking, so the
+        # refusal itself has to recover. What it must never do is report a
+        # re-check that has not happened: the reader would ask again into the same
+        # refusal believing it was fixed. Folders is broken here on purpose.
+        async def break_folders(route):
+            await route.fulfill(status=500, content_type="application/json",
+                                body='{"error": "no"}')
+
+        expect_http["on"] = True
+        await page.route("**/api/corpus/folders", break_folders)
+        await page.evaluate("""() => { setScope(["/nowhere/at/all"]); }""")
+        await page.fill("#question", "anything?")
+        await page.click("#askBtn")
+        await page.wait_for_timeout(1200)
+        notice = await page.locator(".msg.assistant, .msg.refine").last.inner_text()
+        checks["scope: a refused scope is not reported as re-checked when it was not"] = (
+            "could not be re-read" in notice and "narrowed" not in notice
+            # …and the chip still says what it still is.
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", break_folders)
+
+        # Now with the folder list reachable but slow: the message may only appear
+        # once the re-check has finished, or a quick retry posts the stale prefixes
+        # again. The chip must already be clear by the time the reader is told.
+        async def slow_folders(route):
+            await asyncio.sleep(1.2)
+            await route.continue_()
+
+        await page.route("**/api/corpus/folders", slow_folders)
+        await page.fill("#question", "anything at all?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant, .msg.refine');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        # Every folder in that scope was dead, so the retry would run against the
+        # *whole* library — the message has to say that rather than "narrowed",
+        # which would understate what the next answer can see.
+        widened = await page.locator(".msg.assistant, .msg.refine").last.inner_text()
+        checks["scope: the reader is told only after the scope has actually changed"] = (
+            "whole corpus" in await page.inner_text("#scopeChip")
+            and "the scope is now the whole corpus" in widened
+            and "narrowed" not in widened
+        )
+        await page.unroute("**/api/corpus/folders", slow_folders)
+
+        # A scope that is partly dead is narrowed, not cleared, and must say so:
+        # "narrowed" and "cleared" leave the next answer looking at very different
+        # amounts of the library, so one message cannot serve both.
+        live = await page.evaluate(
+            """() => scopeFolders.find((f) => f.depth > 0)?.path || null"""
+        )
+        await page.evaluate(
+            """(live) => { setScope([live, "/gone/for/good"]); }""", live
+        )
+        await page.fill("#question", "and now?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant, .msg.refine');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        partial = await page.locator(".msg.assistant, .msg.refine").last.inner_text()
+        checks["scope: a partly dead scope is narrowed, not silently widened"] = (
+            bool(live)
+            and "narrowed to the 1 folder" in partial
+            and "whole corpus" not in partial
+            and "1 folder" in await page.inner_text("#scopeChip")
+        )
+
+        # And with no corpus roots left at all, "those folders are still offered"
+        # is simply false — every ask would keep failing on a chip the reader was
+        # told was fine.
+        async def no_roots(route):
+            await route.fulfill(status=200, content_type="application/json",
+                                body=json.dumps({"folders": [], "roots": []}))
+
+        await page.route("**/api/corpus/folders", no_roots)
+        # The narrowing above left a live folder, which the server accepts — so
+        # give it a dead one again, or there is no refusal to recover from.
+        await page.evaluate("""() => { setScope(["/nothing/here/either"]); }""")
+        await page.fill("#question", "last try?")
+        await page.click("#askBtn")
+        await page.wait_for_function(
+            """() => {
+                 const m = document.querySelectorAll('.msg.assistant, .msg.refine');
+                 return m.length && m[m.length - 1].innerText.includes('known corpus root');
+               }""",
+            timeout=15_000,
+        )
+        rootless = await page.locator(".msg.assistant, .msg.refine").last.inner_text()
+        checks["scope: losing every corpus root is not reported as folders still offered"] = (
+            "no longer knows of any corpus folder" in rootless
+            and "still offers" not in rootless
+            and "whole corpus" in await page.inner_text("#scopeChip")
+        )
+        await page.unroute("**/api/corpus/folders", no_roots)
+        expect_http["on"] = False
+
         # Last, because it navigates away from the app. Same page deliberately: the
         # guide sits behind the session cookie, and a fresh context would not have it.
         resp = await page.goto(f"http://127.0.0.1:{PORT}/help/sharepoint")
@@ -1279,12 +1552,13 @@ async def main() -> int:
         await browser.close()
 
     print("\nJS problems:", problems or "none")
-    print("screenshots: /tmp/ask-scope.png /tmp/ask-brief.png /tmp/ask-thin.png "
+    print("screenshots: /tmp/ask-refine.png /tmp/ask-brief.png /tmp/ask-thin.png "
           "/tmp/ask-answer.png /tmp/ask-drawer.png /tmp/admin.png "
           "/tmp/admin-key.png /tmp/admin-access.png /tmp/corpus-upload.png "
           "/tmp/corpus-connect.png /tmp/corpus-sync.png /tmp/sweep-log.png "
           "/tmp/admin-budgets.png /tmp/sync-detail.png /tmp/sync-detail-live.png "
-          "/tmp/search-tab.png /tmp/search-ask-mount.png /tmp/help-sharepoint.png")
+          "/tmp/search-tab.png /tmp/search-ask-mount.png /tmp/ask-refine.png "
+          "/tmp/help-sharepoint.png")
     return 1 if problems else 0
 
 

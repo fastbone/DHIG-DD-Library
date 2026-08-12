@@ -10,13 +10,15 @@ without ever loading the library.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import time
 import uuid
 
 from anthropic import AsyncAnthropic
 
-from . import budget, credentials, db, extract, pricing
+from . import budget, credentials, db, extract, pricing, search
 from .config import WORKSTREAMS, settings
 from .events import broker
 
@@ -253,12 +255,23 @@ class SweepJob:
 
 # --- manifest assembly ---------------------------------------------------
 
-_cache: dict | None = None
+_cache: dict[str, dict] = {}
+
+
+def scope_key(scope) -> str:
+    """A stable cache key for a scope. Order and duplicates must not matter."""
+    prefixes = sorted({p.rstrip("/") for p in (scope or []) if p})
+    if not prefixes:
+        return ""
+    return hashlib.sha256("\n".join(prefixes).encode()).hexdigest()[:16]
 
 
 def invalidate_manifest() -> None:
-    global _cache
-    _cache = None
+    """Drop every cached map — scoped ones included.
+
+    A sweep can card a document in any folder, so no scoped map survives it.
+    """
+    _cache.clear()
 
 
 def _card_line(d: dict, with_summary: bool) -> str:
@@ -282,29 +295,48 @@ def _card_line(d: dict, with_summary: bool) -> str:
     return line
 
 
-def build() -> dict:
-    """Assemble the corpus map. Cached until the next sweep completes."""
-    global _cache
-    if _cache is not None:
-        return _cache
+def build(scope=None) -> dict:
+    """Assemble the corpus map. Cached per scope until the next sweep completes.
+
+    With a `scope` — a list of absolute folder prefixes — the map covers only
+    documents filed under those folders. This is what actually narrows the
+    assistant's knowledge: the map is what makes it aware of a document at all,
+    so a scope that filtered only the search tool would leave it citing files it
+    cannot open.
+    """
+    key = scope_key(scope)
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+
+    scope_sql, scope_params = search.scope_clause(scope)
+    scoped = f" AND {scope_sql}" if scope_sql else ""
 
     carded = [
         dict(r)
         for r in db.rows(
             "SELECT id, rel_path, workstream, doc_type, title, parties, period_covered,"
             " key_figures, summary, card_flags, n_units FROM documents"
-            " WHERE status='carded'"
-            " ORDER BY workstream, doc_type, rel_path"
+            f" WHERE status='carded'{scoped}"
+            " ORDER BY workstream, doc_type, rel_path",
+            scope_params,
         )
     ]
     unindexed = [
         dict(r)
         for r in db.rows(
             "SELECT id, rel_path, family, n_units, status FROM documents"
-            " WHERE status IN ('extracted','card_failed','extract_failed')"
-            " ORDER BY rel_path LIMIT 400"
+            f" WHERE status IN ('extracted','card_failed','extract_failed'){scoped}"
+            " ORDER BY rel_path LIMIT 400",
+            scope_params,
         )
     ]
+    total_carded = (
+        db.scalar("SELECT COUNT(*) FROM documents WHERE status='carded'")
+        if scope_sql
+        else len(carded)
+    )
+    folders = [os.path.basename(p.rstrip("/")) or p for p in (scope or []) if p]
 
     rollup: dict[str, dict[str, int]] = {}
     for d in carded:
@@ -313,12 +345,24 @@ def build() -> dict:
 
     def render(mode: str) -> str:
         out: list[str] = []
-        out.append("# CORPUS MAP")
+        out.append("# CORPUS MAP" + (f" — scoped to {', '.join(folders)}" if folders else ""))
         out.append(
-            f"{len(carded)} indexed documents"
+            f"{len(carded)}"
+            # The fraction matters: without it the model cannot tell "absent from the
+            # data room" from "absent from the folders this reader selected", and it
+            # would report the narrower fact as the broader one.
+            + (f" of {total_carded}" if folders else "")
+            + " indexed documents"
             + (f", {len(unindexed)} extracted but not yet indexed" if unindexed else "")
             + ". Every id below is addressable with read_document / search_corpus."
         )
+        if folders:
+            out.append(
+                "This question is scoped to the folders named above. Every tool is"
+                " restricted to them — documents elsewhere in the library cannot be read,"
+                " searched or listed. If the answer is not here, say it is not in the"
+                " selected folders rather than that it is not in the data room."
+            )
         out.append("")
         out.append("## Coverage by workstream")
         for ws in sorted(rollup):
@@ -349,14 +393,17 @@ def build() -> dict:
     for mode in ("full", "compact", "rollup"):
         text = render(mode)
         if len(text) <= settings.manifest_char_budget or mode == "rollup":
-            _cache = {
+            built = {
                 "text": text,
                 "mode": mode,
                 "chars": len(text),
                 "approx_tokens": len(text) // 4,
                 "n_indexed": len(carded),
                 "n_unindexed": len(unindexed),
+                "n_indexed_total": total_carded,
+                "scope": [p for p in (scope or []) if p],
                 "rollup": rollup,
             }
-            return _cache
+            _cache[key] = built
+            return built
     raise AssertionError("unreachable")

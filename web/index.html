@@ -259,6 +259,7 @@
           <div class="composer-bar">
             <div class="row gap wrap">
               <label class="check"><input type="checkbox" id="verifyToggle" checked> verify citations</label>
+              <button type="button" class="ghost" id="scopeChip" title="Limit this question to part of the library">scope: whole corpus</button>
               <button type="button" class="ghost" id="newThread">new thread</button>
             </div>
             <button type="submit" class="primary" id="askBtn">Ask</button>
@@ -325,7 +326,7 @@
       <div class="card">
         <div class="card-head"><h2>Models</h2><span class="muted small" id="modelsNote"></span></div>
         <p class="muted small">
-          The analyst reasons; the scoper refines a question before the analyst is paid to
+          The analyst reasons; the refiner sharpens a question before the analyst is paid to
           answer it; the carder indexes; the verifier re-reads cited spans. A role pinned by an
           environment variable cannot be changed here.
         </p>
@@ -336,17 +337,17 @@
             <select id="analystEffort"></select>
           </label>
           <label class="field" style="margin:0">
-            <span>scoper effort</span>
-            <select id="scoperEffort"></select>
+            <span>refiner effort</span>
+            <select id="refinerEffort"></select>
           </label>
           <label class="field" style="margin:0">
             <span>question rounds</span>
-            <select id="scopeRounds"></select>
+            <select id="refineRounds"></select>
           </label>
         </div>
         <div class="fieldset-head"><span>proposed model by complexity</span></div>
         <p class="muted small">
-          What the scoper preselects on the brief once it has judged how hard the question is.
+          What the refiner preselects on the brief once it has judged how hard the question is.
           The user can always change it before approving.
         </p>
         <div class="grid-2" id="complexityModels"></div>
@@ -477,6 +478,29 @@
         <div id="runList" class="rowlist"></div>
       </div>
       <div class="run-detail" id="runDetail"></div>
+    </div>
+  </div>
+</div>
+
+<div id="scopeModal" class="modal">
+  <div class="modal-body">
+    <div class="row between">
+      <h3>Folders this question may see</h3>
+      <button class="ghost" id="scopeClose">close</button>
+    </div>
+    <p class="muted small">
+      The assistant carries a one-line card for every indexed document in its context.
+      Narrowing it to the folders that matter sharpens the answer, cuts the standing
+      cost of each turn, and lets it say “not in the folders you selected” instead of
+      “not in the data room”. Counts are indexed documents.
+    </p>
+    <div id="scopeTree" class="scope-tree"></div>
+    <div class="row between wrap">
+      <div id="scopeEstimate" class="muted small"></div>
+      <div class="row gap">
+        <button type="button" class="ghost" id="scopeClear">whole corpus</button>
+        <button type="button" class="primary" id="scopeApply">Use these folders</button>
+      </div>
     </div>
   </div>
 </div>

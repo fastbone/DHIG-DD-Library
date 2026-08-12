@@ -37,7 +37,7 @@ from . import (
     ingest,
     manifest,
     pricing,
-    scope,
+    refine,
     search,
     security,
     storage,
@@ -439,8 +439,8 @@ def _checked_model(value: str | None, field: str) -> str | None:
 class ModelsBody(BaseModel):
     models: dict[str, str] | None = None            # role -> model id ("" = inherit)
     analyst_effort: str | None = None
-    scoper_effort: str | None = None
-    scope_max_rounds: int | None = None
+    refiner_effort: str | None = None
+    refine_max_rounds: int | None = None
     complexity_models: dict[str, str] | None = None
 
 
@@ -449,26 +449,26 @@ async def patch_models(body: ModelsBody, admin: dict = Depends(auth.require_admi
     for role, value in (body.models or {}).items():
         if role not in MODEL_ROLES:
             raise HTTPException(400, f"unknown model role {role!r}")
-        # An empty scoper means "inherit the analyst", which is the default and
+        # An empty refiner means "inherit the analyst", which is the default and
         # the cheap choice; the other roles need a real id.
-        if not (value or "").strip() and role != "scoper":
+        if not (value or "").strip() and role != "refiner":
             raise HTTPException(400, f"{role} model cannot be blank")
         _checked_model(value, f"{role} model")
     for level, value in (body.complexity_models or {}).items():
         if level not in COMPLEXITY_MODELS:
             raise HTTPException(400, f"unknown complexity level {level!r}")
         _checked_model(value, f"{level} model")
-    for field in ("analyst_effort", "scoper_effort"):
+    for field in ("analyst_effort", "refiner_effort"):
         value = getattr(body, field)
         if value is not None and value not in EFFORTS:
             raise HTTPException(400, f"unknown {field} {value!r}")
-    if body.scope_max_rounds is not None and not 1 <= body.scope_max_rounds <= 4:
-        raise HTTPException(400, "scope_max_rounds must be between 1 and 4")
+    if body.refine_max_rounds is not None and not 1 <= body.refine_max_rounds <= 4:
+        raise HTTPException(400, "refine_max_rounds must be between 1 and 4")
 
     await asyncio.to_thread(
         settings.set_models,
         models=body.models, analyst_effort=body.analyst_effort,
-        scoper_effort=body.scoper_effort, scope_max_rounds=body.scope_max_rounds,
+        refiner_effort=body.refiner_effort, refine_max_rounds=body.refine_max_rounds,
         complexity_models=body.complexity_models,
     )
     db.audit("models.update", actor=admin["username"], detail=json.dumps(body.model_dump(
@@ -480,13 +480,13 @@ async def patch_models(body: ModelsBody, admin: dict = Depends(auth.require_admi
 def _models_payload() -> dict:
     return {
         "analyst": settings.analyst_model,
-        "scoper": settings.scoper_model,
-        "scoper_configured": settings.configured_model("scoper"),
+        "refiner": settings.refiner_model,
+        "refiner_configured": settings.configured_model("refiner"),
         "carder": settings.carder_model,
         "verifier": settings.verifier_model,
         "effort": settings.analyst_effort,
-        "scoper_effort": settings.scoper_effort,
-        "scope_max_rounds": settings.scope_max_rounds,
+        "refiner_effort": settings.refiner_effort,
+        "refine_max_rounds": settings.refine_max_rounds,
         "complexity_models": settings.complexity_models,
         "env_pinned": settings.model_overrides,
         "available": [
@@ -1275,10 +1275,69 @@ async def api_search(
     }
 
 
+@app.get("/api/corpus/folders")
+async def api_folders():
+    """The folder tree a question can be scoped to, with per-folder counts.
+
+    Signed in, not admin: choosing what a question may see is part of asking one.
+    """
+    roots = [r["path"] for r in storage.known_roots()]
+    return {"folders": search.folder_tree(roots), "roots": roots}
+
+
+def validated_scope(scope: list[str]) -> list[str]:
+    """Every prefix must sit inside a root the app knows about.
+
+    A scope is only ever a filter over paths already in the database, so an
+    unknown prefix cannot leak anything — it would simply match nothing. It is
+    rejected anyway, because a silently empty corpus reads as an empty data room,
+    and that is the one thing this feature exists to keep the reader from
+    concluding by accident.
+    """
+    roots = [Path(r["path"]) for r in storage.known_roots()]
+    out: list[str] = []
+    for raw in scope:
+        prefix = (raw or "").strip()
+        if not prefix:
+            continue
+        # No resolve(): these are paths recorded at ingest, and a root that has
+        # since been unmounted must still be selectable in the question log's terms.
+        target = Path(prefix)
+        if not any(target == r or security.is_within(target, r) for r in roots):
+            raise HTTPException(
+                400, f"folder is outside every known corpus root: {prefix}"
+            )
+        out.append(str(target))
+    return out
+
+
 @app.get("/api/manifest")
-async def api_manifest(full: bool = False):
-    m = manifest.build()
-    out = {k: m[k] for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed", "rollup")}
+async def api_manifest(full: bool = False, scope: str | None = None):
+    # `scope` is a JSON array so the estimate shown next to the folder picker is
+    # the same figure the question will actually pay for.
+    prefixes: list[str] = []
+    if scope:
+        try:
+            parsed = json.loads(scope)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "scope must be a JSON array of paths") from exc
+        if not isinstance(parsed, list):
+            raise HTTPException(400, "scope must be a JSON array of paths")
+        prefixes = validated_scope([str(p) for p in parsed])
+    m = manifest.build(prefixes)
+    out = {
+        k: m[k]
+        for k in ("mode", "chars", "approx_tokens", "n_indexed", "n_unindexed",
+                  "n_indexed_total", "scope", "rollup")
+    }
+    # The standing per-turn cost of carrying this map, priced the same way the
+    # Indexing tab prices the full one — so the saving from a scope is visible at
+    # the moment of choosing it rather than a week later on the bill.
+    out["cost_per_turn_usd"] = round(
+        m["approx_tokens"] * pricing.PRICES.get(settings.analyst_model, (5, 25))[0]
+        * pricing.CACHE_READ_MULTIPLIER / 1_000_000,
+        4,
+    )
     if full:
         out["text"] = m["text"]
     return out
@@ -1293,14 +1352,23 @@ class AskBody(BaseModel):
     verify: bool = True
     effort: str | None = None
     model: str | None = None
-    scope_id: str | None = None
+    scope: list[str] = []
+    refine_id: str | None = None
 
 
 @app.post("/api/ask")
 async def ask(body: AskBody, request: Request):
+    # Validated before the stream opens: an SSE body cannot carry a 400, and a
+    # rejected scope inside the stream would surface as a failed answer. Before
+    # the credentials gate too — a request this app would refuse whatever its
+    # configuration should be told which of the two problems is its own.
+    scope = validated_scope(body.scope)
     if not credentials.available():
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
-    db.audit("ask", actor=actor(request), detail=body.question[:300])
+    db.audit(
+        "ask", actor=actor(request),
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
 
     who = actor(request)
     model = _checked_model(body.model, "model")
@@ -1309,7 +1377,7 @@ async def ask(body: AskBody, request: Request):
     async def gen():
         async for event in agent.ask(
             body.question, history=body.history, do_verify=body.verify, effort=effort,
-            model=model, actor=who, scope_id=body.scope_id,
+            model=model, actor=who, scope=scope, refine_id=body.refine_id,
         ):
             yield sse(event)
 
@@ -1320,33 +1388,39 @@ async def ask(body: AskBody, request: Request):
     )
 
 
-# --- scope --------------------------------------------------------------
+# --- question refinement -------------------------------------------------
 
 
-class ScopeBody(BaseModel):
+class RefineBody(BaseModel):
     question: str = Field(min_length=2)
-    scope_id: str | None = None
+    refine_id: str | None = None
     answers: list[dict] = []
+    scope: list[str] = []
 
 
-@app.post("/api/scope")
-async def api_scope(body: ScopeBody, request: Request):
-    """Refine a question before the analyst is paid to answer it.
+@app.post("/api/refine")
+async def api_refine(body: RefineBody, request: Request):
+    """Sharpen a question before the analyst is paid to answer it.
 
-    The scope transcript is deliberately not on the wire: it holds tool results
-    derived from document text and is replayed into a model whose output becomes
-    the analyst's instructions, so a client-supplied one would be an injection
-    path straight into the brief. The client carries only the id.
+    The refinement transcript is deliberately not on the wire: it holds tool
+    results derived from document text and is replayed into a model whose output
+    becomes the analyst's instructions, so a client-supplied one would be an
+    injection path straight into the brief. The client carries only the id.
     """
+    scope = validated_scope(body.scope)
     if not credentials.available():
         raise HTTPException(400, "no API key configured — add one under Admin → API keys")
-    db.audit("scope", actor=actor(request), detail=body.question[:300])
+    db.audit(
+        "refine", actor=actor(request),
+        detail=body.question[:300] + (f" · scope: {', '.join(scope)}"[:200] if scope else ""),
+    )
 
     who = actor(request)
 
     async def gen():
-        async for event in scope.run(
-            body.question, scope_id=body.scope_id, answers=body.answers, actor=who,
+        async for event in refine.run(
+            body.question, refine_id=body.refine_id, answers=body.answers, actor=who,
+            scope=scope,
         ):
             yield sse(event)
 
@@ -1357,11 +1431,11 @@ async def api_scope(body: ScopeBody, request: Request):
     )
 
 
-@app.get("/api/scope/{scope_id}")
-async def api_scope_session(scope_id: str, request: Request):
-    found = await asyncio.to_thread(scope.load, scope_id, actor(request))
+@app.get("/api/refine/{refine_id}")
+async def api_refine_session(refine_id: str, request: Request):
+    found = await asyncio.to_thread(refine.load, refine_id, actor(request))
     if not found:
-        raise HTTPException(404, "no such scoping session")
+        raise HTTPException(404, "no such refinement session")
     return found
 
 
@@ -1369,12 +1443,16 @@ async def api_scope_session(scope_id: str, request: Request):
 async def qa_log(limit: int = 50):
     out = []
     for r in db.rows(
-        "SELECT id, question, answer, citations, verdicts, usage, duration_s, created_at"
-        " FROM qa_log ORDER BY created_at DESC LIMIT ?",
+        "SELECT q.id, q.question, q.answer, q.citations, q.verdicts, q.usage, q.duration_s,"
+        " q.created_at, s.scope FROM qa_log q"
+        " LEFT JOIN qa_scopes s ON s.qa_id = q.id"
+        " ORDER BY q.created_at DESC LIMIT ?",
         (min(limit, 200),),
     ):
         d = dict(r)
-        for k in ("citations", "verdicts", "usage"):
+        # A past "not in the data room" is uninterpretable without knowing what the
+        # question was allowed to see, so the scope travels with the log entry.
+        for k in ("citations", "verdicts", "usage", "scope"):
             try:
                 d[k] = json.loads(d[k] or "[]")
             except (json.JSONDecodeError, TypeError):
