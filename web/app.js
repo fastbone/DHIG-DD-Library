@@ -1895,12 +1895,22 @@ function renderBriefText(brief) {
   return lines.join("\n");
 }
 
+function storedScopeId() {
+  try { return sessionStorage.getItem("dd-scope-id"); } catch { return null; }
+}
+
 async function restoreScope() {
-  let id = null;
-  try { id = sessionStorage.getItem("dd-scope-id"); } catch { /* private mode */ }
-  if (!id || scope.id) return;
-  let s;
-  try { s = await api(`/api/scope/${encodeURIComponent(id)}`); } catch { return resetScope(); }
+  const id = storedScopeId();
+  if (!id || scope.id || state.running) return;
+  let s = null;
+  try { s = await api(`/api/scope/${encodeURIComponent(id)}`); } catch { /* gone */ }
+  // Fetching the session is a round trip, and the user can start asking during
+  // it. Landing a restored round on top of a live one would replace it with a
+  // stale session, so anything that started while we were away wins — including
+  // the failure path, which must not clear an id that is no longer the one we
+  // went to fetch.
+  if (scope.id || state.running || storedScopeId() !== id) return;
+  if (!s) return resetScope();
   scope.id = s.scope_id;
   scope.original = s.question;
   scope.round = s.round;

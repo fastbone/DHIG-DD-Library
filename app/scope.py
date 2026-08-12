@@ -503,9 +503,15 @@ def _findings_digest(findings: list[dict], probed: dict) -> str:
                 f"[{d.get('id')}] {d.get('workstream')}/{d.get('doc_type')}"
                 f" · “{d.get('title') or d.get('rel_path')}” · {d.get('rel_path')}"
             )
-        if result.get("anchors") and result.get("title"):
+        # document_card spreads the `documents` row, so its identifier arrives
+        # as `id` — reading `doc_id` here printed [None] and cost the propose
+        # call the one document the scoper had bothered to open.
+        card_id = result.get("id") or result.get("doc_id")
+        if card_id and result.get("anchors") and str(card_id) not in seen:
+            seen.add(str(card_id))
             lines.append(
-                f"[{result.get('doc_id')}] card · “{result.get('title')}” · "
+                f"[{card_id}] card · {result.get('workstream')}/{result.get('doc_type')}"
+                f" · “{result.get('title') or result.get('rel_path')}” · "
                 f"{len(result.get('anchors') or [])} anchors"
             )
     return "\n".join(lines[:120]) or "(no search hits — the corpus may not cover this at all)"

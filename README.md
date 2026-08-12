@@ -761,9 +761,9 @@ Four suites, none of which spend a token, touch your real index, or need a
 network — each uses its own temporary data directory.
 
 ```bash
-python3 tools/api_smoke.py            # 181 checks: auth, CSRF, keys, uploads, access, sync, storage, scoping
-python3 tools/sync_smoke.py           # 68 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 86 checks: the browser front end, end to end
+python3 tools/api_smoke.py            # 199 checks: auth, CSRF, keys, uploads, access, sync, storage, scoping
+python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
+python3 tools/ui_smoke.py             # 118 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 

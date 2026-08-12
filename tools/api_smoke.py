@@ -1059,6 +1059,39 @@ def main() -> int:
               and "FY2024" in str(_resumed[-1]["content"]),
               str(_roles))
 
+    # Stage B never sees the corpus map, so a document the scoper opened reaches
+    # it only through this digest. document_card spreads the `documents` row, so
+    # its identifier is `id` — reading `doc_id` printed [None] and lost the one
+    # document the scoper had bothered to open.
+    # Its own row rather than whatever ingest left behind: the storage section
+    # above resets the index, and relying on a leftover document made this pass
+    # vacuously against an empty id.
+    _known_doc_id = "5c09ed0ca11d0001"
+    _bdb.execute(
+        "INSERT OR REPLACE INTO documents(id, sha256, rel_path, abs_path, filename, ext,"
+        " family, size_bytes, status, n_units, title, doc_type, workstream, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (_known_doc_id, "0" * 64, "financial/audited.pdf", "/tmp/audited.pdf", "audited.pdf",
+         ".pdf", "pdf", 1024, "carded", 1, "Audited accounts", "audited_accounts",
+         "financial", time.time()),
+    )
+    _bdb.execute(
+        "INSERT INTO units(doc_id, ordinal, anchor, kind, char_start, char_end)"
+        " VALUES(?,?,?,?,?,?)",
+        (_known_doc_id, 0, "p1", "page", 0, 100),
+    )
+    _card = _apptools.dispatch("document_card", {"doc_id": _known_doc_id})
+    _digest = _scope._findings_digest(
+        [{"tool": "document_card", "input": {"doc_id": _known_doc_id}, "result": _card}],
+        {"score": 0, "hits": 0, "docs": 0, "workstreams": [], "top": [], "basis": ""},
+    )
+    check("the card the scoper opened is real before the digest is judged",
+          not _card.get("error") and bool(_card.get("anchors")), str(_card)[:160])
+    check("a document the scoper opened reaches the propose call by id",
+          _known_doc_id in _digest and "None" not in _digest, _digest[:200])
+    _bdb.execute("DELETE FROM units WHERE doc_id=?", (_known_doc_id,))
+    _bdb.execute("DELETE FROM documents WHERE id=?", (_known_doc_id,))
+
     # A missing session is a 404, not someone else's brief.
     code, _, _ = admin.get("/api/scope/deadbeefdead")
     check("an unknown scoping session is not found", code == 404, f"got {code}")

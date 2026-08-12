@@ -82,6 +82,29 @@ async def prepare_index() -> None:
              json.dumps(["en"]), json.dumps(flags), time.time(), row["id"]),
         )
     manifest.invalidate_manifest()
+
+    # A finished scoping session on disk, so GET /api/scope/{id} answers for
+    # real: the restore path is the one place the browser reads a session back
+    # rather than being handed it on the stream.
+    db.execute(
+        "INSERT OR REPLACE INTO scope_rounds(id, scope_id, round, question, answers, payload,"
+        " transcript, ready, coverage, usage, model, effort, actor, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("smokeround01", "smokescope01", 1, "What was FY2024 revenue?", "[]",
+         json.dumps({
+             "ready": True, "assessment": "Restored from the server.",
+             "coverage": {"score": 84, "band": "well covered", "reasons": [], "missing": [],
+                          "answer_shape": "a cited figure", "probe": {"basis": "restored"}},
+             "questions": [],
+             "brief": {"question": "Restored: summarise FY2024 revenue.", "scope": [],
+                       "out_of_scope": [], "evidence_plan": [], "deliverable": "prose",
+                       "assumptions": []},
+             "complexity": {"level": "moderate", "drivers": [], "docs_to_read": 4,
+                            "needs_computation": False, "recommended_effort": "high"},
+             "gaps": [],
+         }), "[]", 1, 84, "{}", "claude-opus-5", "low", SMOKE_USER, time.time()),
+    )
+
     print(f"index ready: {db.scalar('SELECT COUNT(*) FROM documents')} documents "
           f"({db.scalar('SELECT COUNT(*) FROM units')} units) in {os.environ['DD_DATA_DIR']}")
 
@@ -541,6 +564,41 @@ async def main() -> int:
         checks["new thread clears the scoping session"] = (
             await page.locator("#scopeCard").count() == 0
             and await page.evaluate("() => sessionStorage.getItem('dd-scope-id') === null"))
+
+        # A stored session is read back from the server, not from the browser —
+        # the questions and the brief quote a confidential data room, so the tab
+        # holds only the id.
+        checks["a stored scoping session restores from the server"] = (
+            await page.evaluate(
+                """async () => {
+                  sessionStorage.setItem('dd-scope-id', 'smokescope01');
+                  await restoreScope();
+                  const ok = !!document.getElementById('briefCard')
+                    && document.getElementById('briefText').value.startsWith('Restored:');
+                  scope.id = ''; sessionStorage.removeItem('dd-scope-id');
+                  return ok;
+                }"""))
+        await page.click("#newThread")
+
+        # And a restore in flight must lose to whatever the user started while it
+        # was away, or it drops a stale round on top of a live one. Driven
+        # directly rather than by racing the browser, so it is deterministic:
+        # start the restore, then start "asking" before its fetch resolves.
+        checks["a restore in flight loses to a question started meanwhile"] = (
+            await page.evaluate(
+                """async () => {
+                  sessionStorage.setItem('dd-scope-id', 'smokescope01');
+                  const before = document.querySelectorAll('#thread .msg.brief').length;
+                  const pending = restoreScope();
+                  state.running = true;          // the user hit Ask mid-flight
+                  await pending;
+                  state.running = false;
+                  const after = document.querySelectorAll('#thread .msg.brief').length;
+                  const kept = sessionStorage.getItem('dd-scope-id');
+                  sessionStorage.removeItem('dd-scope-id');
+                  return after === before && kept === 'smokescope01';
+                }"""))
+        await page.click("#newThread")
 
         # Admin tab: keys, accounts, storage, audit all render from live data.
         await page.click('button[data-tab="admin"]')
