@@ -203,14 +203,22 @@ if (( DO_EDIT )); then
         if command -v "$candidate" >/dev/null 2>&1; then editor="$candidate"; break; fi
       done
     fi
-    if [[ -z "$editor" ]]; then
+    # Split on whitespace: $EDITOR carries flags often enough ("code --wait",
+    # "emacs -nw") that treating the whole value as one command name would fail
+    # to launch exactly the editors people configure by hand.
+    read -r -a editor_cmd <<< "$editor"
+    if (( ${#editor_cmd[@]} == 0 )); then
       warn "no editor found (set \$EDITOR) — edit $ENV_FILE by hand if the new values need changing"
+    elif ! command -v "${editor_cmd[0]}" >/dev/null 2>&1; then
+      warn "\$EDITOR is set to '${editor_cmd[0]}', which is not on PATH — edit $ENV_FILE by hand"
     else
       step "Opening $ENV_FILE in $editor"
       info "the new block is at the bottom; save and quit to continue"
-      # Not `run`-wrapped and not silenced: a full-screen editor needs the real
-      # terminal, and a failure to launch should be visible rather than fatal.
-      "$editor" "$ENV_FILE" </dev/tty >/dev/tty 2>&1 || warn "editor exited non-zero — continuing with $ENV_FILE as it stands"
+      # Not silenced and not fatal: a full-screen editor needs the real terminal,
+      # and one that fails to launch should say so without taking the deploy with
+      # it — the appended defaults are valid on their own.
+      "${editor_cmd[@]}" "$ENV_FILE" </dev/tty >/dev/tty 2>&1 \
+        || warn "editor exited non-zero — continuing with $ENV_FILE as it stands"
     fi
   fi
 fi

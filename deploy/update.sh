@@ -152,13 +152,19 @@ container_state() {
   printf '%s' "${s:-absent}"
 }
 
+port_listening() {
+  # Anything at all listening on $1, our own container's published port
+  # included.
+  command -v ss >/dev/null 2>&1 || return 1  # can't tell; let docker complain
+  local out
+  out="$(ss -Hltnp "sport = :${1}" 2>/dev/null || true)"
+  [[ -n "$out" ]]
+}
+
 port_conflict() {
   # Something else on our port would make `up` fail with a confusing bind
   # error. Our own container holding it is expected, so ignore that case.
-  command -v ss >/dev/null 2>&1 || return 1  # can't tell; let docker complain
-  local out
-  out="$(ss -Hltnp "sport = :${HOST_PORT}" 2>/dev/null || true)"
-  [[ -z "$out" ]] && return 1
+  port_listening "$HOST_PORT" || return 1
   [[ "$(container_state)" != "absent" ]] && return 1
   return 0
 }
@@ -306,14 +312,19 @@ sync_env() {
   "$script" ${args[@]+"${args[@]}"} || rc=$?
   case "$rc" in
     0)  ;;
-    10) if (( DRY_RUN )); then
-          info "would append those and open .env before building"
-        else
-          ENV_CHANGED=1
-        fi ;;
+    # Set on a dry run too, so the plan that follows is the plan a real run
+    # would carry out: appending to .env is a reason to recreate the container
+    # even when the commit does not change.
+    10) ENV_CHANGED=1 ;;
     *)  die "the .env check failed (exit $rc) — fix .env or pass --no-env-sync" ;;
   esac
-  (( ENV_CHANGED )) || return 0
+  if (( ! ENV_CHANGED )); then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    info "would append those and open .env before building"
+    return 0  # nothing was appended or edited, so there is nothing to re-check
+  fi
 
   # The editor is a free hand on the file the deploy depends on, so re-check the
   # two things preflight checked before it was opened.
@@ -323,9 +334,14 @@ sync_env() {
   read_env_addressing
   if [[ "${BIND_ADDR}:${HOST_PORT}" != "$before" ]]; then
     info "published address is now ${BIND_ADDR}:${HOST_PORT} — the reverse proxy needs to agree"
-    if port_conflict; then
-      die "${HOST_PORT} is already in use by something other than $SERVICE. \
-Pick another port with DD_HOST_PORT in .env and update the reverse proxy."
+    # port_conflict is the wrong test here: it forgives a busy port when our own
+    # container exists, which during an update it does — on the *old* port. The
+    # new one is nobody's yet, so anything listening on it is a conflict, and
+    # finding out at `up` time means a failed swap and a rollback onto a .env
+    # that still names the busy port.
+    if port_listening "$HOST_PORT"; then
+      die "${HOST_PORT} is already in use. Pick another port with DD_HOST_PORT \
+in .env and update the reverse proxy."
     fi
   fi
   return 0
@@ -454,7 +470,7 @@ sync_env
 
 if (( UP_TO_DATE )); then
   if (( ENV_CHANGED )); then
-    info "no new commits, but .env gained variables — recreating the container so they take effect"
+    info "no new commits, but .env needs new variables — recreating the container so they take effect"
   elif [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
     ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
     exit 0
