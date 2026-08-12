@@ -43,7 +43,7 @@ from . import (
     sync,
     uploads,
 )
-from .config import SUPPORTED_EXTS, WORKSTREAMS, settings
+from .config import CONFIG_WARNINGS, SUPPORTED_EXTS, WORKSTREAMS, settings
 from .events import broker, sse
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -109,6 +109,11 @@ async def lifespan(app: FastAPI):
     auth.bootstrap()
     storage.housekeeping()
     sync.reset_interrupted()
+    # A setting that could not be parsed has silently reverted to its default, and
+    # the only symptom is a limit that does not match what .env says. Say so once,
+    # here, where it lands in the persisted activity log.
+    for warning in CONFIG_WARNINGS:
+        broker.log(warning, level="warn")
     if security.secret_key_source() == "file":
         broker.log(
             "DD_SECRET_KEY is not set — using data/secret.key. Set it explicitly in production; "

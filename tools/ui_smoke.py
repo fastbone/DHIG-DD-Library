@@ -550,6 +550,12 @@ async def main() -> int:
         await page.click('button[data-tab="corpus"]')
         await page.evaluate("() => loadConnections()")
         await page.wait_for_timeout(700)
+        # A failed run leaves "synced" at the last clean one, so the row has to date
+        # the attempt too — otherwise a stored error reads as though it were current,
+        # including one quoting a limit that has since been raised.
+        checks["sync: a row dates its last attempt, not only its last sync"] = (
+            "last attempt" in (await page.inner_text("#syncList"))
+        )
         await page.click("#syncList .rowitem .actions button:nth-child(2)")
         await page.wait_for_timeout(700)
         cx_label = conn_rows[0]["label"]

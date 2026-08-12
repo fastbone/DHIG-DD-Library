@@ -476,6 +476,27 @@ Grant-PnPAzureADAppSitePermission `
       rather than the one-line summary.
     </p>
 
+    <div class="note warn">
+      <span class="tag">If a sync is refused on size</span>
+      <p>
+        <em>over the N GB limit</em> is <code>DD_MAX_SYNC_GB</code>, and the figure it
+        compares is what this connection would fetch — the indexable types, each under the
+        per-file ceiling — not the library's headline size in SharePoint. <em>needs another
+        N GB</em> is the data volume instead: the mirror is a second full copy of those
+        files, so the volume has to hold them alongside the index.
+      </p>
+      <p>
+        Raising the limit in <code>.env</code> takes effect when the container is
+        <em>recreated</em> (<code>docker compose up -d</code>), not on
+        <code>docker compose restart</code>, which keeps the old values. The
+        <em>up to N GB</em> figure above the connections is the running app's own limit, so
+        compare it with the refusal: the same number means the limit really was reached,
+        a lower one means the new value has not been picked up yet. A stored failure also
+        outlives the config that caused it — check <em>last attempt</em> on the row before
+        acting on the message.
+      </p>
+    </div>
+
     <h2 id="renew">Before it expires</h2>
 
     <p>
