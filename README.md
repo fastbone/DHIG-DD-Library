@@ -309,16 +309,39 @@ diagnosable the next morning rather than being a red tag with no detail. The las
 
 Then *sync now*, or set an interval. What happens on each sync:
 
-- the library's size is checked first: one over `DD_MAX_SYNC_GB` is refused
-  outright, and so is one whose *not yet mirrored* bytes would not fit the free
-  space — what the mirror already holds is credited, or a library that only just
-  fitted the first time could never be synced again;
+- the size is checked first: over `DD_MAX_SYNC_GB` is refused outright, and so is
+  one whose *not yet mirrored* bytes would not fit the free space — what the mirror
+  already holds is credited, or a library that only just fitted the first time
+  could never be synced again. Both figures are measured over what this connection
+  would actually fetch, not over the library's headline size: the type filter and
+  `DD_MAX_FILE_MB` below both apply, so a 200 GB library whose indexable files
+  under the size ceiling come to 40 GB is a 40 GB sync and is judged as one;
 - only the eleven indexable extensions are fetched by default — a data room is
   full of `.msg`, images and video that ingest would ignore anyway;
 - deletions are mirrored, bounded by `DD_MAX_SYNC_DELETE` so a connection pointed
   at the wrong library cannot empty the mirror in one run;
 - the mirror is then indexed, and documents whose files disappeared are dropped
   from the catalogue.
+
+An interval applies to retries as well as to successes: a connection that failed
+is tried again one interval after the attempt, not on the next tick. The row shows
+*last attempt* beside *synced* whenever there has been one since the last clean
+sync, because a stored failure otherwise reads as though it had just happened —
+including one quoting a limit that has since been raised.
+
+Raising a limit in `.env` reaches the app only when the container is **recreated**:
+
+```bash
+./deploy/update.sh        # recreates when .env has drifted; --status just reports
+docker compose up -d      # re-reads .env
+docker compose restart    # does NOT — the old values stay
+```
+
+The heading above the connections (*up to N GB*) is the running process's own view
+of `DD_MAX_SYNC_GB`, so it is the thing to read when a refusal quotes a number
+you thought you had changed. A value that cannot be parsed as a number — `500 GB`
+rather than `500` — falls back to the default and says so in the activity log at
+startup.
 
 The client secret is encrypted at rest with `DD_SECRET_KEY` and is never returned
 to the browser — editing a connection leaves the field blank, meaning "keep it".
@@ -503,7 +526,7 @@ choice is persisted to `data/settings.json` and takes effect without a restart.
 | `DD_MAX_EXTRACT_GB` | `20` | Total uncompressed size ceiling |
 | `DD_MAX_ARCHIVE_MEMBERS` | `100000` | Member-count ceiling |
 | `DD_MAX_COMPRESSION_RATIO` | `200` | Above this an archive is treated as a decompression bomb |
-| `DD_MAX_SYNC_GB` | `50` | Refuse to mirror a library larger than this |
+| `DD_MAX_SYNC_GB` | `50` | Refuse to mirror a library larger than this, measured over what the connection would fetch (indexable types under `DD_MAX_FILE_MB`) |
 | `DD_MAX_SYNC_DELETE` | `500` | Abort a sync that would delete more than this many mirrored files |
 | `DD_SYNC_TIMEOUT` | `21600` | Give up on one sync after this many seconds |
 | `DD_SYNC_RUNS_KEEP` | `50` | Sync runs kept per connection for the detail view |
@@ -635,17 +658,76 @@ cd /opt/dd-library
 ./deploy/update.sh --status     # what is running now
 ./deploy/update.sh --dry-run    # print the plan, change nothing
 ./deploy/update.sh --rollback   # back to the previous commit
+./deploy/update.sh --recreate   # recreate the container even with no new commit
+./deploy/update.sh --no-env-sync  # leave .env alone even if it lacks variables
 ```
 
 What it does, in order: takes a `flock` so two runs can't overlap; refuses to
 start without `.env` and a non-empty `DD_SECRET_KEY`, with a dirty checkout
 (unless `--force`), or if the port belongs to someone else; fast-forwards the
-branch (never merges) and prints the changelog; warns if `.env.example` gained a
-variable; snapshots the index and secrets; builds the new image **while the old
-container still serves**; swaps; then polls `/api/health` for up to three
-minutes. If the new version doesn't come up healthy it restores the previous
-commit, brings the old one back and exits non-zero — a failed update leaves the
-service running.
+branch (never merges) and prints the changelog; reconciles `.env` with the new
+`.env.example` (below); snapshots the index and secrets; builds the new image
+**while the old container still serves**; swaps; then polls `/api/health` for up
+to three minutes. If the new version doesn't come up healthy it restores the
+previous commit, brings the old one back and exits non-zero — a failed update
+leaves the service running.
+
+### Keeping .env in step with .env.example
+
+`.env` is the host's file and is never in git, so an update that documents a new
+variable in `.env.example` cannot add it for you. `deploy/env-sync.sh` closes
+that gap:
+
+```bash
+./deploy/env-sync.sh            # append what is missing to the bottom of .env
+./deploy/env-sync.sh --check    # report only; exit 10 if something is missing
+./deploy/env-sync.sh --dry-run  # print the block it would append
+./deploy/env-sync.sh --edit     # append, then open .env in $EDITOR
+```
+
+It only ever appends, in one timestamped block, with the example's default as the
+value — nothing already in `.env` is rewritten, reordered or removed, so a
+hand-tuned file stays byte-for-byte what you made it. Comments are not synced,
+which has two deliberate consequences: a variable that exists in `.env` only as a
+commented-out line is reported and **left alone** (commenting one out is a
+decision; re-adding it with the example's default would quietly undo it — delete
+the commented line if you want it back), and variables `.env` sets that the
+example no longer mentions are reported but kept, which is also how a typo'd
+name surfaces.
+
+`update.sh` runs it after the fetch and *before* the build, so a variable an
+update introduces is in the container that same run. On a terminal it opens
+`.env` in `$EDITOR` (`$VISUAL`, else nano/vim/vi) — fill the new values in, save,
+and the build and swap continue with the finished file, no second restart. Since
+that editor can change the secret and the published port, `DD_SECRET_KEY` and the
+port conflict are re-checked afterwards and the health check follows the new
+address. If `.env` gained variables when there were no new commits, the container
+is recreated anyway so they take effect.
+
+Unattended (cron, no terminal) there is no editor: the example defaults are
+appended, the run says which variables it added, and the deploy continues. A
+genuinely new *required* value is then empty until you fill it in — the health
+check and the automatic rollback are the backstop.
+
+**An `.env` edit is a deploy too** — the other half of the same problem: the sync
+above handles a variable `.env` is *missing*, this handles one whose value you
+changed by hand. `env_file` values are read when a container is *created*, so
+`docker compose restart` keeps the old ones — a raised limit then looks like the
+app ignoring it. The script compares the running container's
+environment against `.env` and recreates the container when they differ, even
+with no new commit, naming the variables that were not in effect (names only,
+never values). Deleting or commenting out a line counts as a difference too —
+the old value stays in the container until it is replaced, which is how
+`DD_ADMIN_RESET_PASSWORD=1` outlives being removed. `--status` reports the same
+comparison, and is the first thing to check when the app is not honouring what
+`.env` says:
+
+```
+$ ./deploy/update.sh --status
+     env       .env has been edited since the container was created
+               not yet in effect: DD_MAX_SYNC_GB
+               apply with: ./deploy/update.sh  (or docker compose up -d)
+```
 
 Nightly, unattended:
 
@@ -762,8 +844,8 @@ network — each uses its own temporary data directory.
 
 ```bash
 python3 tools/api_smoke.py            # 199 checks: auth, CSRF, keys, uploads, access, sync, storage, scoping
-python3 tools/sync_smoke.py           # 79 checks: connected libraries, end to end
-python3 tools/ui_smoke.py             # 118 checks: the browser front end, end to end
+python3 tools/sync_smoke.py           # 84 checks: connected libraries, end to end
+python3 tools/ui_smoke.py             # 122 checks: the browser front end, end to end
 tools/container_check.sh              # 6 checks plus a sync-engine note
 ```
 
@@ -859,6 +941,7 @@ Dockerfile        non-root, read-only /app, /data and /inbox volumes
 docker-compose.yml  hardened runtime, localhost-published on 8412
 deploy/
   update.sh       host-side update: pull, build, swap, health-check, roll back
+  env-sync.sh     append variables .env.example gained to the bottom of .env
   nginx/ddlib.dhig.net.conf   the production vhost
 ```
 

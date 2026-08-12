@@ -766,6 +766,11 @@ async function loadArchives() {
 /* ── connected SharePoint libraries ──────────────────────────────────── */
 const INTERVALS = { 0: "manual", 60: "hourly", 240: "every 4h", 720: "every 12h", 1440: "daily" };
 
+const SYNC_LIMIT_HINT =
+  "DD_MAX_SYNC_GB as this process has it — a refusal quoting another number means " +
+  ".env was edited without recreating the container. Measured over the files a " +
+  "connection would fetch: the indexable types, each under the per-file ceiling.";
+
 async function loadConnections() {
   // Admin-only route: for an analyst this 403s, and the section stays hidden.
   let r;
@@ -773,8 +778,11 @@ async function loadConnections() {
   $("syncSection").classList.remove("hidden");
   const engine = r.rclone || {};
   $("syncHint").innerHTML = engine.available
+    // The limit is the running process's own value, which is the point of showing
+    // it: a refusal quoting a different number means .env has been edited without
+    // the container being recreated.
     ? `Mirrored into <code>${esc(r.sync_root)}</code>, then indexed like any other folder ·
-       up to ${r.max_sync_gb} GB`
+       up to <span title="${SYNC_LIMIT_HINT}">${r.max_sync_gb} GB</span> per library`
     : `<span class="tag bad">rclone not installed</span> the sync engine is missing
        (<code>${esc(engine.bin || "rclone")}</code>), so syncing will fail — rebuild the image`;
 
@@ -799,6 +807,11 @@ async function loadConnections() {
         secret …${esc(c.secret_last4)} ·
         ${INTERVALS[c.interval_minutes] || `every ${c.interval_minutes} min`}
         ${c.last_sync_at ? "· synced " + new Date(c.last_sync_at * 1000).toLocaleString() : ""}
+        ${/* A failed run leaves "synced" at the last good one, so without the time of
+              the attempt an old error reads as if it had just happened — including one
+              quoting a limit that has since been raised. */
+          c.last_attempt_at && c.last_attempt_at > (c.last_sync_at || 0)
+            ? "· last attempt " + new Date(c.last_attempt_at * 1000).toLocaleString() : ""}
         ${c.bytes_total ? "· " + bytes(c.bytes_total) : ""}
         ${c.n_deleted ? `· <span class="tag flag">${c.n_deleted} removed remotely</span>` : ""}
       </div>
@@ -1611,6 +1624,12 @@ async function scopeStream(body) {
   // as the record of how the question got here.
   for (const old of thread.querySelectorAll("#scopeCard")) old.removeAttribute("id");
   card.id = "scopeCard";
+  // A new round supersedes the brief that came with the last one. Leaving that
+  // card on screen leaves a live Run button whose textarea belongs to the old
+  // brief while `scope.brief` has already moved on — one click and the analyst
+  // gets the old question wrapped in the new round's scope and assumptions.
+  scope.briefCard?.remove();
+  scope.briefCard = null;
   thread.append(card);
   thread.scrollTop = thread.scrollHeight;
   scope.card = card;
@@ -1759,10 +1778,16 @@ function renderBrief() {
   field.append(ta, edited);
   body.append(field);
 
+  // Three separate lists, because they are three separate promises to the
+  // reader: what the run will cover, what it will leave out, and what was taken
+  // on faith. render_brief sends them under IN SCOPE / OUT OF SCOPE /
+  // ASSUMPTIONS, and folding scope into "Assumed" told the reader the run had
+  // guessed at something it had actually been told.
   const lists = el("div", "brieflists");
   for (const [title, items, id] of [
-    ["Assumed", [...(scope.brief.assumptions || []), ...(scope.brief.scope || [])], "briefAssumed"],
+    ["In scope", scope.brief.scope || [], "briefScope"],
     ["Excluded", scope.brief.out_of_scope || [], "briefExcluded"],
+    ["Assumed", scope.brief.assumptions || [], "briefAssumed"],
   ]) {
     const col = el("div");
     col.append(el("h4", null, title));

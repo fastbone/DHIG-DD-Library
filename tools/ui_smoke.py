@@ -441,7 +441,25 @@ async def main() -> int:
         scope_checks["scope: progress is counted"] = (
             "3 of 3 answered" in await page.inner_text("#scopeCard .scopemeta"))
 
+        # The draft is runnable at any point, so a brief card can already be on
+        # screen when the next round starts. It has to go: its Run button would
+        # send the old textarea wrapped in the new round's scope and assumptions.
+        await page.click("#scopeDraft")
+        await page.wait_for_selector("#briefCard", timeout=20_000)
+        scope_checks["scope: the draft is runnable before the questions are answered"] = (
+            await page.locator("#thread .msg.brief").count() == 1)
+
         await page.click("#scopeSubmit")
+        # Asserted while the next round is still in flight, which is the whole
+        # window: renderBrief drops the old card too, so checking after the new
+        # brief lands would pass whether or not the round cleared it. The round's
+        # card is appended synchronously, so two of them means we are inside it.
+        await page.wait_for_function(
+            "() => document.querySelectorAll('#thread .msg.scope').length === 2",
+            timeout=20_000)
+        scope_checks["brief: a new round clears the stale brief before it lands"] = (
+            await page.locator("#thread .msg.brief").count() == 0)
+
         try:
             await page.wait_for_selector("#briefCard", timeout=20_000)
         except Exception as exc:  # noqa: BLE001
@@ -454,9 +472,17 @@ async def main() -> int:
         scope_checks["brief: the rewritten question is editable"] = (
             len(await page.input_value("#briefText")) > 40
             and await page.get_attribute("#briefText", "readonly") is None)
-        scope_checks["brief: assumptions and exclusions are listed"] = (
-            await page.locator("#briefAssumed li").count() >= 1
-            and await page.locator("#briefExcluded li").count() >= 1)
+        scope_checks["brief: exactly one brief is live once the round settles"] = (
+            await page.locator("#thread .msg.brief").count() == 1)
+        # Three separate promises: what it will cover, what it will leave out,
+        # and what was taken on faith. Folding scope into "Assumed" told the
+        # reader the run had guessed at something it had been told.
+        scope_checks["brief: scope, exclusions and assumptions are listed apart"] = (
+            await page.locator("#briefScope li").count() >= 1
+            and await page.locator("#briefExcluded li").count() >= 1
+            and await page.locator("#briefAssumed li").count() >= 1
+            and "pre-restructuring" in await page.inner_text("#briefAssumed")
+            and "pre-restructuring" not in await page.inner_text("#briefScope"))
         scope_checks["brief: the documents it starts from are clickable"] = (
             await page.locator("#briefFocus .cite").count() >= 1)
         scope_checks["brief: a model and an effort are proposed"] = (
@@ -868,6 +894,12 @@ async def main() -> int:
         await page.click('button[data-tab="corpus"]')
         await page.evaluate("() => loadConnections()")
         await page.wait_for_timeout(700)
+        # A failed run leaves "synced" at the last clean one, so the row has to date
+        # the attempt too — otherwise a stored error reads as though it were current,
+        # including one quoting a limit that has since been raised.
+        checks["sync: a row dates its last attempt, not only its last sync"] = (
+            "last attempt" in (await page.inner_text("#syncList"))
+        )
         await page.click("#syncList .rowitem .actions button:nth-child(2)")
         await page.wait_for_timeout(700)
         cx_label = conn_rows[0]["label"]

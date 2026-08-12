@@ -10,12 +10,28 @@
 #   ./deploy/update.sh --branch main   # deploy a different branch
 #   ./deploy/update.sh --keep 10       # keep 10 backups instead of 5
 #   ./deploy/update.sh --force         # deploy even with local modifications
+#   ./deploy/update.sh --recreate      # recreate the container even with no new commit
+#   ./deploy/update.sh --no-env-sync   # do not touch .env, even if it lacks variables
 #
-# Order matters. The new image is built while the old container is still
+# Order matters. After the fetch and before the build, deploy/env-sync.sh appends
+# any variable the new .env.example documents and .env is missing, and — on a
+# terminal — opens .env so you can fill the values in. That happens *before* the
+# image is built and the container swapped, so a variable added by an update
+# takes effect in this run instead of needing a second restart.
+#
+# The new image is built while the old container is still
 # serving, so the only downtime is the container swap (seconds). If the new
 # container fails its health check the script restores the previous commit,
 # rebuilds and brings the old version back up, then exits non-zero — a failed
 # update leaves the service running, not down.
+#
+# An .env edited by hand is a deploy too — the other half of the same problem the
+# sync above solves for missing variables. `env_file` values are read when the
+# container is *created*, so a `restart` keeps the old ones and a raised limit
+# silently does not apply. The script compares the running container's
+# environment against .env and recreates when they differ, rather than reporting
+# "nothing to do" for a change that has not taken effect. Deleting a line counts
+# as a difference: the old value stays in the container until it is replaced.
 #
 # Run it as a user in the `docker` group, from the repository checkout. Safe to
 # put in cron: concurrent runs are serialised by a lock and a no-op update
@@ -30,13 +46,21 @@ KEEP_BACKUPS=5
 BRANCH=""
 DO_PULL=1
 DO_BACKUP=1
+DO_ENV_SYNC=1
 DO_PRUNE=0
 FORCE=0
 DRY_RUN=0
 ROLLBACK=0
 STATUS_ONLY=0
 BACKUP_ONLY=0
+RECREATE=0
 HEALTH_TIMEOUT=180
+# How the running container's environment differs from .env, filled in by
+# env_drift(): DRIFTED for a changed value, REMOVED for a key the container still
+# carries that .env no longer declares. Names only — the file holds the admin
+# password and the API key.
+DRIFTED=()
+REMOVED=()
 
 # --- output --------------------------------------------------------------
 
@@ -67,9 +91,11 @@ while (( $# )); do
     --rollback)   ROLLBACK=1 ;;
     --no-pull)    DO_PULL=0 ;;
     --no-backup)  DO_BACKUP=0 ;;
+    --no-env-sync) DO_ENV_SYNC=0 ;;
     --backup-only) BACKUP_ONLY=1 ;;
     --prune)      DO_PRUNE=1 ;;
     --force)      FORCE=1 ;;
+    --recreate)   RECREATE=1 ;;
     --branch)     BRANCH="${2:?--branch needs a name}"; shift ;;
     --keep)       KEEP_BACKUPS="${2:?--keep needs a number}"; shift ;;
     --timeout)    HEALTH_TIMEOUT="${2:?--timeout needs seconds}"; shift ;;
@@ -116,14 +142,19 @@ without it every key in the database becomes undecryptable."
 fi
 
 # Read the published port the way compose does, so the health check probes the
-# same address the reverse proxy talks to.
-HOST_PORT="$(grep -E '^DD_HOST_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
-HOST_PORT="${HOST_PORT:-8412}"
-BIND_ADDR="$(grep -E '^DD_BIND_ADDR=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
-BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-PROBE_HOST="$BIND_ADDR"
-[[ "$PROBE_HOST" == "0.0.0.0" ]] && PROBE_HOST="127.0.0.1"
-HEALTH_URL="http://${PROBE_HOST}:${HOST_PORT}/api/health"
+# same address the reverse proxy talks to. A function, not straight-line code:
+# the .env sync below may open an editor, and whatever comes back out of it is
+# what the container will actually be published on.
+read_env_addressing() {
+  HOST_PORT="$(grep -E '^DD_HOST_PORT=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+  HOST_PORT="${HOST_PORT:-8412}"
+  BIND_ADDR="$(grep -E '^DD_BIND_ADDR=' .env | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+  BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+  PROBE_HOST="$BIND_ADDR"
+  [[ "$PROBE_HOST" == "0.0.0.0" ]] && PROBE_HOST="127.0.0.1"
+  HEALTH_URL="http://${PROBE_HOST}:${HOST_PORT}/api/health"
+}
+read_env_addressing
 
 STATE_DIR="$REPO_DIR/.deploy"
 mkdir -p "$STATE_DIR"
@@ -138,13 +169,116 @@ container_state() {
   printf '%s' "${s:-absent}"
 }
 
+env_drift() {
+  # Is the running container carrying the current .env? Compose reads env_file
+  # when it *creates* a container, so an edit plus `docker compose restart` keeps
+  # the old values — the app then goes on enforcing a limit that .env says was
+  # raised, with nothing anywhere to say why. `up -d` normally notices, but only
+  # if it is reached at all, and a no-op update used to exit before it.
+  #
+  # Sets DRIFTED to the keys whose value differs and REMOVED to the keys the
+  # container still carries that .env no longer declares, and returns 0 when
+  # either is non-empty. Names only, never values: .env holds DD_ADMIN_PASSWORD
+  # and the API key, and this output goes to a terminal, a cron mail and whatever
+  # log collects it.
+  DRIFTED=()
+  REMOVED=()
+  [[ -f .env ]] || return 1
+  local created created_epoch env_epoch
+  created="$(docker inspect -f '{{.Created}}' "$SERVICE" 2>/dev/null || true)"
+  [[ -n "$created" ]] || return 1
+  # Cheap gate: an .env untouched since the container was created cannot have
+  # drifted, and this keeps a quoting difference we parse differently from
+  # compose from swapping the container on every cron run.
+  created_epoch="$(date -d "$created" +%s 2>/dev/null || echo 0)"
+  env_epoch="$(stat -c %Y .env 2>/dev/null || echo 0)"
+  (( created_epoch > 0 && env_epoch > created_epoch )) || return 1
+
+  local -a live
+  mapfile -t live < <(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SERVICE" 2>/dev/null || true
+  )
+  local line key want got entry
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    key="${key#export }"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    want="${line#*=}"
+    # Compose strips one layer of matching quotes from an env_file value.
+    if [[ "$want" == \"*\" || "$want" == \'*\' ]] && (( ${#want} >= 2 )); then
+      want="${want:1:${#want}-2}"
+    fi
+    got=""
+    for entry in "${live[@]}"; do
+      if [[ "$entry" == "$key="* ]]; then
+        got="${entry#*=}"
+        break
+      fi
+    done
+    [[ "$want" == "$got" ]] || DRIFTED+=("$key")
+  done < .env
+
+  # The other direction. Deleting a line — or commenting it out — leaves the value
+  # in the running container, so the app goes on using a setting the file no longer
+  # mentions. DD_ADMIN_RESET_PASSWORD is the one that bites: removing it is exactly
+  # how you stop resetting the admin password on every restart.
+  #
+  # Only the app's own variables, and only where .env is the source. The image sets
+  # DD_DATA_DIR, DD_HOST and DD_PORT, and docker-compose.yml's `environment:` block
+  # sets three more of its own; neither is .env's business, so a key either file
+  # supplies is left alone.
+  local -a image_env=()
+  local image
+  image="$(docker inspect -f '{{.Config.Image}}' "$SERVICE" 2>/dev/null || true)"
+  if [[ -n "$image" ]]; then
+    mapfile -t image_env < <(
+      docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$image" 2>/dev/null || true
+    )
+  fi
+  for entry in "${live[@]}"; do
+    key="${entry%%=*}"
+    [[ "$key" == DD_* || "$key" == ANTHROPIC_* ]] || continue
+    # Still declared in .env? Then the loop above has already judged it. An
+    # anchored match, so a commented-out line does not count as declared.
+    if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" .env; then
+      continue
+    fi
+    # Set by compose itself? Matched as a YAML mapping key, not anywhere in the
+    # file: DD_HOST_PORT and DD_BIND_ADDR appear only in `${...}` interpolation on
+    # the ports line, so a substring match called them compose-managed and stopped
+    # noticing when they were deleted — and it matched DD_HOST inside DD_HOST_PORT
+    # too, which skipped the image comparison below for a different variable.
+    if grep -Eq "^[[:space:]]+${key}:" docker-compose.yml; then
+      continue
+    fi
+    # Exactly what the image bakes in, rather than merely the same name: a value
+    # deleted from .env that shadowed an image default is still a change.
+    if [[ ${#image_env[@]} -gt 0 ]] && printf '%s\n' "${image_env[@]}" | grep -qxF "$entry"; then
+      continue
+    fi
+    REMOVED+=("$key")
+  done
+
+  (( ${#DRIFTED[@]} > 0 || ${#REMOVED[@]} > 0 ))
+}
+
+port_listening() {
+  # Anything at all listening on $1, our own container's published port
+  # included.
+  command -v ss >/dev/null 2>&1 || return 1  # can't tell; let docker complain
+  local out
+  out="$(ss -Hltnp "sport = :${1}" 2>/dev/null || true)"
+  [[ -n "$out" ]]
+}
+
 port_conflict() {
   # Something else on our port would make `up` fail with a confusing bind
   # error. Our own container holding it is expected, so ignore that case.
-  command -v ss >/dev/null 2>&1 || return 1  # can't tell; let docker complain
-  local out
-  out="$(ss -Hltnp "sport = :${HOST_PORT}" 2>/dev/null || true)"
-  [[ -z "$out" ]] && return 1
+  port_listening "$HOST_PORT" || return 1
   [[ "$(container_state)" != "absent" ]] && return 1
   return 0
 }
@@ -161,6 +295,18 @@ show_status() {
     ok "responding"
   else
     warn "not responding"
+  fi
+  # The question this answers is "why is the app not honouring what .env says",
+  # and it is the first thing to rule out before going looking in the app.
+  if [[ "$(container_state)" == "absent" ]]; then
+    info "env       no container to compare .env against"
+  elif env_drift; then
+    warn "env       .env has been edited since the container was created"
+    (( ${#DRIFTED[@]} )) && warn "          not yet in effect: ${DRIFTED[*]}"
+    (( ${#REMOVED[@]} )) && warn "          still set in the container, gone from .env: ${REMOVED[*]}"
+    warn "          apply with: ./deploy/update.sh  (or docker compose up -d)"
+  else
+    info "env       matches .env"
   fi
   if [[ -f "$PREV_SHA_FILE" ]]; then
     info "rollback  $(cat "$PREV_SHA_FILE")"
@@ -260,6 +406,76 @@ if (( BACKUP_ONLY )); then
   exit 0
 fi
 
+# --- .env ----------------------------------------------------------------
+# Run after the fetch (so .env.example is the new one) and before the build, so
+# a variable an update introduces is in place for the container that update
+# starts. Interactively that includes filling the value in: an editor here costs
+# nothing, whereas noticing afterwards costs a second build and swap.
+
+ENV_CHANGED=0
+
+sync_env() {
+  if (( ! DO_ENV_SYNC )); then
+    info "skipping the .env check (--no-env-sync)"
+    return 0
+  fi
+  local script="$REPO_DIR/deploy/env-sync.sh"
+  if [[ ! -x "$script" ]]; then
+    warn "deploy/env-sync.sh missing or not executable — skipping the .env check"
+    return 0
+  fi
+
+  local -a args=()
+  if (( DRY_RUN )); then
+    args+=(--dry-run)
+  elif [[ -t 0 && -t 1 ]]; then
+    args+=(--edit)
+  fi
+  # Unattended (cron), the appended defaults stand: they are the same values the
+  # example documents, and env-sync.sh says on stdout what it added.
+
+  local rc=0
+  "$script" ${args[@]+"${args[@]}"} || rc=$?
+  case "$rc" in
+    0)  ;;
+    # Set on a dry run too, so the plan that follows is the plan a real run
+    # would carry out: appending to .env is a reason to recreate the container
+    # even when the commit does not change.
+    10) ENV_CHANGED=1 ;;
+    *)  die "the .env check failed (exit $rc) — fix .env or pass --no-env-sync" ;;
+  esac
+  if (( ! ENV_CHANGED )); then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    info "would append those and open .env before building"
+    return 0  # nothing was appended or edited, so there is nothing to re-check
+  fi
+
+  # The editor is a free hand on the file the deploy depends on, so re-check the
+  # two things preflight checked before it was opened.
+  grep -Eq '^DD_SECRET_KEY=.+' .env \
+    || die "DD_SECRET_KEY is empty in .env — refusing to deploy without it."
+  local addr_before="${BIND_ADDR}:${HOST_PORT}" port_before="$HOST_PORT"
+  read_env_addressing
+  if [[ "${BIND_ADDR}:${HOST_PORT}" != "$addr_before" ]]; then
+    info "published address is now ${BIND_ADDR}:${HOST_PORT} — the reverse proxy needs to agree"
+  fi
+  # Only a *changed port* gets the strict test, and it has to be the strict one:
+  # port_conflict forgives a busy port when our own container exists, which during
+  # an update it does — on the old port. A port nobody held before is nobody's, so
+  # anything listening on it is a real conflict, and finding out at `up` time means
+  # a failed swap and a rollback onto a .env that still names the busy port.
+  # An unchanged port is ours already, bind address edited or not: `up` releases
+  # and rebinds it, so port_listening seeing our own docker-proxy there is not a
+  # conflict.
+  if [[ "$HOST_PORT" != "$port_before" ]] && port_listening "$HOST_PORT"; then
+    die "${HOST_PORT} is already in use. Pick another port with DD_HOST_PORT \
+in .env and update the reverse proxy."
+  fi
+  return 0
+}
+
 # --- health --------------------------------------------------------------
 
 wait_healthy() {
@@ -290,7 +506,14 @@ deploy_current_tree() {
   run compose "${build_args[@]}"
 
   step "Swapping the container"
-  run compose up -d --remove-orphans
+  # `up -d` recreates a container whose resolved config has changed, env_file
+  # contents included. --force-recreate when we already know the environment has
+  # drifted, or were asked to: it costs the same few seconds and does not depend
+  # on the compose version agreeing with us about what counts as a change. A
+  # container that only reads .env at creation is not worth being subtle about.
+  local up_args=(up -d --remove-orphans)
+  (( RECREATE )) && up_args+=(--force-recreate)
+  run compose "${up_args[@]}"
 }
 
 # --- rollback ------------------------------------------------------------
@@ -364,22 +587,50 @@ nothing you need."
 fi
 
 NEW_SHA="$(git rev-parse HEAD)"
+UP_TO_DATE=0
 if [[ "$NEW_SHA" == "$OLD_SHA" ]]; then
-  if [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
-    ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
-    exit 0
-  fi
-  warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
+  UP_TO_DATE=1
 else
   step "Changes to deploy"
   git --no-pager log --oneline --no-decorate "$OLD_SHA..$NEW_SHA" | sed 's/^/    /'
+  # New variables are added to .env by sync_env below; a *changed default* for a
+  # variable .env already sets is not, because .env wins and its value is yours.
+  # The diff is the only place that shows up.
+  if git diff --name-only "$OLD_SHA" "$NEW_SHA" | grep -q '^\.env\.example$'; then
+    warn ".env.example changed in this update — review it for changed defaults:"
+    git --no-pager diff "$OLD_SHA" "$NEW_SHA" -- .env.example | sed 's/^/    /' >&2 || true
+  fi
 fi
 
-# .env.example gaining a variable is the usual cause of a working directory
-# that starts but misbehaves, so say so rather than letting it surprise later.
-if git diff --name-only "$OLD_SHA" "$NEW_SHA" | grep -q '^\.env\.example$'; then
-  warn ".env.example changed in this update — check .env for new variables:"
-  git --no-pager diff "$OLD_SHA" "$NEW_SHA" -- .env.example | sed 's/^/    /' >&2 || true
+sync_env
+
+# After sync_env rather than before it: appending a variable is itself a
+# difference between .env and the running container, so checking first would
+# report the state of a file the script is about to change — and the sync may have
+# opened an editor, whose result is what the container has to be built from.
+if env_drift; then
+  warn "the running container's environment differs from .env — it will be recreated"
+  (( ${#DRIFTED[@]} )) && warn "changed: ${DRIFTED[*]}"
+  (( ${#REMOVED[@]} )) && warn "no longer in .env: ${REMOVED[*]}"
+  RECREATE=1
+fi
+# Variables the sync appended are the same kind of change, and get the same
+# treatment — a forced swap rather than trusting `up -d` to spot it.
+(( ENV_CHANGED )) && RECREATE=1
+
+if (( UP_TO_DATE )); then
+  # No new commit is not the same as nothing to do: exiting here on a changed
+  # .env is what makes a raised limit look like a limit the app is ignoring.
+  if (( ENV_CHANGED )); then
+    info "no new commits, but .env needs new variables — recreating the container so they take effect"
+  elif (( RECREATE )); then
+    step "No new commit, but the container needs replacing"
+  elif [[ "$(container_state)" == "running" ]] && curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+    ok "already up to date at ${OLD_SHA:0:12} and healthy — nothing to do"
+    exit 0
+  else
+    warn "already at ${OLD_SHA:0:12} but the service is not healthy — redeploying"
+  fi
 fi
 
 (( DO_BACKUP )) && backup

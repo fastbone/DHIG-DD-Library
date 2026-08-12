@@ -389,6 +389,9 @@ async def main() -> int:
     sync.update(cid, interval_minutes=60)
     db.execute("UPDATE sync_connections SET status='syncing', last_sync_at=NULL WHERE id=?",
                (cid,))
+    # The schedule counts from the last attempt as well as the last success, so an
+    # interval has to have elapsed since the runs above for this to be due at all.
+    db.execute("UPDATE sync_runs SET started_at=started_at-7200 WHERE conn_id=?", (cid,))
     check("a connection stuck mid-sync is not due", sync.due_connections() == [])
     cleared = sync.reset_interrupted()
     check("startup clears the leftover status", cleared == 1 and
@@ -416,6 +419,30 @@ async def main() -> int:
     err = sync.get(cid)["error"] or ""
     check("a library over DD_MAX_SYNC_GB is refused before any transfer",
           "over the" in err and "GB limit" in err, err)
+
+    # The preflight has to measure what the transfer would actually move. rclone is
+    # given --max-size on the transfer, so sizing without it counts bytes that will
+    # never be fetched and refuses libraries that would have fitted. The refusal
+    # above means only `size` ran, so the dump is that call.
+    sized = json.loads(env_dump.read_text()).get("_argv", "")
+    check("the size probe is scoped like the transfer, not to the whole library",
+          sized.startswith("size ") and f"--max-size {sync.settings.max_file_mb}M" in sized,
+          sized[:200])
+    check("and to the same extensions the transfer fetches",
+          "--include *.pdf" in sized, sized[:200])
+
+    # A failed run leaves last_sync_at at the last good sync, so scheduling off that
+    # alone made a failing connection due on every 60s tick — an hourly library
+    # re-listing its whole remote once a minute to reach the same error.
+    sync.update(cid, interval_minutes=60)
+    check("a connection that just failed waits for its interval before retrying",
+          sync.due_connections() == [],
+          str([c["label"] for c in sync.due_connections()]))
+    db.execute("UPDATE sync_runs SET started_at=started_at-7200 WHERE conn_id=?", (cid,))
+    check("and is retried once the interval has elapsed", len(sync.due_connections()) == 1)
+    check("the row carries when it was last attempted, not only when it last synced",
+          (sync.get(cid)["last_attempt_at"] or 0) > 0)
+    sync.update(cid, interval_minutes=0)
 
     # The free-space check must credit what the mirror already holds. A library
     # that only just fitted the first time would otherwise be refused on every
