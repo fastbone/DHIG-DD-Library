@@ -1161,8 +1161,30 @@ async def document_original(doc_id: str, request: Request):
 
 
 @app.get("/api/search")
-async def api_search(q: str, limit: int = 25, workstream: str | None = None):
-    return {"query": q, "hits": search.search(q, limit=min(limit, 100), workstream=workstream)}
+async def api_search(
+    q: str,
+    limit: int = 25,
+    workstream: str | None = None,
+    doc_type: str | None = None,
+    family: str | None = None,
+):
+    """Passage search over every extracted page, slide and sheet.
+
+    The filters are the ones `search.search` already applies for the agent; they
+    were simply never reachable over HTTP. Document count as well as hit count,
+    because "38 passages in 9 documents" is the useful shape of that answer — one
+    document matching forty times is a different finding from forty documents
+    matching once.
+    """
+    hits = search.search(
+        q, limit=min(limit, 100), workstream=workstream, doc_type=doc_type, family=family
+    )
+    return {
+        "query": q,
+        "hits": hits,
+        "n_hits": len(hits),
+        "n_documents": len({h["doc_id"] for h in hits if h.get("doc_id")}),
+    }
 
 
 @app.get("/api/corpus/folders")

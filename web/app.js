@@ -91,6 +91,8 @@ $("tabs").addEventListener("click", (e) => {
   if (btn.dataset.tab === "deliverables") { loadArtifacts(); loadQaLog(); }
   if (btn.dataset.tab === "sweep") loadManifestPreview();
   if (btn.dataset.tab === "admin") loadAdmin();
+  // Land in the box, since arriving on this tab means you came to type in it.
+  if (btn.dataset.tab === "search") searchMounts.full?.focus();
 });
 
 /* ── status ──────────────────────────────────────────────────────────── */
@@ -158,6 +160,10 @@ async function refreshStatus() {
   if (wsSel.options.length <= 1) {
     for (const w of s.workstreams) wsSel.append(new Option(w, w));
   }
+  // Same refill-if-empty rule for the search filters. They are mounted after the
+  // first status call, but that call can fail — and then the taxonomy has to
+  // arrive with a later poll or the filter stays permanently empty.
+  for (const panel of Object.values(searchMounts)) panel?.fillWorkstreams?.();
 
   $("manifestStats").innerHTML = [
     ["mode", s.manifest.mode],
@@ -2118,8 +2124,138 @@ async function loadAudit() {
 }
 $("refreshAudit").onclick = loadAudit;
 
+/* ── full-text search ────────────────────────────────────────────────── */
+/* The index has always been there — FTS5 over every page, slide and sheet, which
+   is what the analyst's search_corpus tool runs. Only the agent could reach it, so
+   finding a word cost a question. This is the same index, for people.
+
+   One component, mounted three times. Three copies of one endpoint is how a small
+   feature turns into three sets of bugs. `compact` drops the filters and shortens
+   the list; everything else is shared. */
+
+const SEARCH_LIMITS = { compact: 10, full: 40 };
+
+function searchPanel(mount, { compact = false } = {}) {
+  const box = $(mount);
+  if (!box) return null;
+  box.innerHTML = `
+    <div class="row gap wrap">
+      <input type="search" class="search-q" placeholder="a word or a &quot;quoted phrase&quot;"
+             autocomplete="off" spellcheck="false">
+      ${compact ? "" : `
+        <select class="search-ws"><option value="">all workstreams</option></select>
+        <select class="search-family">
+          <option value="">any file type</option>
+          <option value="pdf">PDF</option>
+          <option value="xlsx">spreadsheet</option>
+          <option value="pptx">deck</option>
+          <option value="docx">Word</option>
+          <option value="text">text / CSV</option>
+        </select>`}
+    </div>
+    <div class="search-note muted small"></div>
+    <div class="search-hits"></div>`;
+
+  const input = qs(".search-q", box);
+  const note = qs(".search-note", box);
+  const hits = qs(".search-hits", box);
+  const ws = qs(".search-ws", box);
+  const fam = qs(".search-family", box);
+
+  // Populated from whatever the corpus actually contains, like the docs filter.
+  // Re-callable, and a no-op once filled, because the first status call can fail.
+  function fillWorkstreams() {
+    if (!ws || ws.options.length > 1) return;
+    for (const w of state.status?.workstreams || []) {
+      const o = el("option", null, w);
+      o.value = w;
+      ws.append(o);
+    }
+  }
+  fillWorkstreams();
+
+  // Every keystroke starts a request and they do not come back in order. Only the
+  // newest one may write to the DOM, or a slow response for "ind" lands on top of
+  // the hits for "indemnity" — or on top of the cleared box.
+  let issued = 0;
+
+  async function run() {
+    const mine = ++issued;
+    const q = input.value.trim();
+    if (q.length < 2) {
+      // "Nothing typed yet" and "nothing matched" are different states, and telling
+      // them apart is the difference between a working box and a broken-looking one.
+      note.textContent = "";
+      hits.innerHTML = `<span class="muted small">Type at least two characters.</span>`;
+      return;
+    }
+    const p = new URLSearchParams({ q, limit: String(compact ? SEARCH_LIMITS.compact : SEARCH_LIMITS.full) });
+    if (ws?.value) p.set("workstream", ws.value);
+    if (fam?.value) p.set("family", fam.value);
+    note.textContent = "searching…";
+    try {
+      const r = await api(`/api/search?${p}`);
+      if (mine !== issued) return;
+      const first = r.hits[0];
+      if (first?.error) {
+        note.textContent = "";
+        hits.innerHTML = `<div class="notice err">${esc(first.error)}</div>`;
+        return;
+      }
+      note.textContent = r.n_hits
+        ? `${nfmt(r.n_hits)} passage${r.n_hits === 1 ? "" : "s"} in ${nfmt(r.n_documents)} document${r.n_documents === 1 ? "" : "s"}`
+        : "";
+      hits.innerHTML = "";
+      if (!r.n_hits) {
+        hits.innerHTML = `<span class="muted small">No passage matches “${esc(q)}”.</span>`;
+        return;
+      }
+      for (const h of r.hits) hits.append(searchHit(h, compact));
+    } catch (e) {
+      if (mine !== issued) return;
+      note.textContent = "";
+      hits.innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+    }
+  }
+
+  let timer = null;
+  input.oninput = () => { clearTimeout(timer); timer = setTimeout(run, 250); };
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); clearTimeout(timer); run(); } };
+  if (ws) ws.onchange = run;
+  if (fam) fam.onchange = run;
+  run();
+  return { run, focus: () => input.focus(), fillWorkstreams };
+}
+
+function searchHit(h, compact) {
+  const row = el("div", "search-hit");
+  // FTS5 marks the matched terms with «…»; turn them into <mark> after escaping,
+  // never before — the snippet is document text and must not become markup.
+  const snippet = esc(h.snippet || "")
+    .replaceAll("«", '<mark>').replaceAll("»", "</mark>");
+  row.innerHTML = `
+    <div class="t">${esc(h.title || h.rel_path || h.doc_id)}
+      <span class="tag dupe">${esc(h.anchor)}</span>
+      ${!compact && h.workstream ? `<span class="tag">${esc(h.workstream)}</span>` : ""}
+      ${!compact && h.doc_type ? `<span class="tag dupe">${esc(h.doc_type)}</span>` : ""}</div>
+    ${compact ? "" : `<div class="doc-path">${esc(h.rel_path || "")}</div>`}
+    <div class="snip">${snippet}</div>`;
+  // The same drawer a citation opens, at the same anchor. Reading a hit is a
+  // solved problem; this only has to hand it the right two values.
+  row.onclick = () => openDoc(h.doc_id, h.anchor);
+  return row;
+}
+
+const searchMounts = {};
+
 /* ── boot ────────────────────────────────────────────────────────────── */
-refreshStatus();
+// Mounted after the first status load, because the workstream filter is populated
+// from the taxonomy that call returns.
+refreshStatus().then(() => {
+  searchMounts.full = searchPanel("searchFullMount");
+  searchMounts.corpus = searchPanel("searchCorpusMount", { compact: true });
+  searchMounts.ask = searchPanel("searchAskMount", { compact: true });
+});
 // A scope restored from the session has paths but no counts; the chip needs the
 // counts to say how much of the library the next question can actually see.
 if (state.scope.length) {

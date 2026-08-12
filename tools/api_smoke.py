@@ -475,6 +475,40 @@ def main() -> int:
     code, body, _ = admin.post("/api/archives", payload, raw=True, content_type=ctype)
     check("a non-archive upload is refused", code == 400, str(body)[:120])
 
+    print("\n— full-text search —")
+    # The index has always existed; only the agent could reach it. These are the
+    # filters search() already applied, now reachable over HTTP.
+    code, body, _ = admin.get("/api/search?q=revenue")
+    hits = body.get("hits", []) if code == 200 else []
+    check("passage search returns citable hits",
+          code == 200 and hits and all(h.get("doc_id") and h.get("anchor") for h in hits),
+          f"got {code}: {str(body)[:200]}")
+    check("hits carry a snippet with the match marked",
+          any("\u00ab" in (h.get("snippet") or "") for h in hits),
+          str([h.get("snippet") for h in hits][:1])[:200])
+    check("passages and documents are counted separately",
+          body.get("n_hits") == len(hits)
+          and body.get("n_documents") == len({h["doc_id"] for h in hits}),
+          str({k: body.get(k) for k in ("n_hits", "n_documents")}))
+
+    code, body, _ = admin.get("/api/search?q=revenue&family=text")
+    check("the family filter narrows to one file type",
+          code == 200 and all(h.get("family") == "text" for h in body["hits"]),
+          str({h.get("family") for h in body.get("hits", [])}))
+    code, body, _ = admin.get("/api/search?q=revenue&limit=2")
+    check("the limit is honoured", code == 200 and len(body["hits"]) <= 2,
+          str(len(body.get("hits", []))))
+    code, body, _ = admin.get("/api/search?q=zzzzqqqxnotinthecorpus")
+    check("a query that matches nothing is an empty list, not an error",
+          code == 200 and body["hits"] == [] and body["n_hits"] == 0, str(body)[:160])
+    # FTS5 MATCH syntax is hostile; db.fts_query sanitises it, and the route must
+    # not turn a stray operator into a 500.
+    code, body, _ = admin.get("/api/search?q=%22unbalanced%20AND%20OR%20*")
+    check("punctuation in a query does not 500", code == 200, f"got {code}: {str(body)[:160]}")
+    anon2 = Client()
+    code, _, _ = anon2.get("/api/search?q=revenue")
+    check("search needs a session", code == 401, f"got {code}")
+
     print("\n— folder browsing is fenced —")
     code, body, _ = admin.get("/api/browse?path=/etc")
     check("browsing outside the permitted roots is refused", code == 403, f"got {code}")
